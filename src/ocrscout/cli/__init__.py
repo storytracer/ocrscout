@@ -14,6 +14,7 @@ app = typer.Typer(
 
 # Side-effect imports register the sub-commands on `app`.
 from ocrscout.cli import apply as _apply  # noqa: E402, F401
+from ocrscout.cli import inspect as _inspect  # noqa: E402, F401
 from ocrscout.cli import report as _report  # noqa: E402, F401
 from ocrscout.cli import run as _run  # noqa: E402, F401
 from ocrscout.cli import sync as _sync  # noqa: E402, F401

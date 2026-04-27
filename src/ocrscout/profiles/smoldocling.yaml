@@ -1,8 +1,8 @@
 name: smoldocling
 source: docling
 model_id: ds4sd/SmolDocling-256M-preview
-output_format: doctags
-normalizer: doctags
+output_format: docling_document
+normalizer: passthrough
 has_bboxes: true
 has_layout: true
 model_size: 256M
@@ -13,3 +13,5 @@ metadata:
     Ultra-compact (~256M) VLM. Run via the full Docling pipeline (which
     natively supports SmolDocling as a VLM stage) rather than the upstream
     uv-scripts/ocr smoldocling-ocr.py. Requires the `docling` extra.
+    DoclingBackend yields a fully-built DoclingDocument (serialized to JSON),
+    so this profile uses the `passthrough` normalizer rather than `doctags`.

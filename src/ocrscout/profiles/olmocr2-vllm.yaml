@@ -1,0 +1,46 @@
+name: olmocr2-vllm
+source: hf_scripts
+script: uv-scripts/ocr/olmocr2-vllm.py
+repo: uv-scripts/ocr
+model_id: allenai/olmOCR-2-7B-1025-FP8
+output_format: markdown
+normalizer: markdown
+has_bboxes: false
+has_layout: false
+model_size: 7B
+backend_args:
+  max_model_len: 16384
+  max_tokens: 8192
+  gpu_memory_utilization: 0.8
+  batch_size: 16
+  temperature: 0.1
+uv_args:
+  - --with
+  - vllm==0.11.2
+  - --extra-index-url
+  - https://download.pytorch.org/whl/cu129
+  - --index-strategy
+  - unsafe-best-match
+env:
+  # vllm 0.11.2 pins flashinfer==0.5.2 but uv resolves flashinfer-cubin to its
+  # own latest (0.6.8.post1) since cubin isn't pinned. Engine startup then
+  # refuses to launch over the version mismatch. The bypass knob is upstream-
+  # provided; no patching of either package is needed.
+  FLASHINFER_DISABLE_VERSION_CHECK: "1"
+tier: curated
+metadata:
+  notes: |
+    The upstream uv-scripts/ocr/olmocr2-vllm.py script imports
+    `from vllm.sampling_params import GuidedDecodingParams`, which was removed
+    in vLLM 0.13.0+. We pin vLLM to 0.11.2 (the last release that exposes
+    that name and ships an aarch64 wheel) and route torch through the
+    pytorch cu129 index so it picks up CUDA-enabled wheels on aarch64.
+    Drop or relax this pin once upstream migrates off the deprecated import.
+
+    Known broken on GB10 / DGX Spark (CUDA capability sm_121a): vLLM 0.11.2's
+    bundled Triton ptxas doesn't recognize sm_121a, so engine init crashes
+    during profile_run on the rotary kernel. Excluded from the recommended
+    invocation until either (a) `TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas`
+    proves sufficient (and the rest of vLLM 0.11.2's compiled kernels also
+    handle sm_121a) or (b) a per-profile shim patches the deprecated import
+    so we can use a current vLLM that natively supports Blackwell-Ultra.

@@ -55,7 +55,7 @@ class RawOutput(BaseModel):
     """Raw output from a model backend, before normalization."""
 
     page_id: str
-    output_format: Literal["markdown", "doctags", "layout_json"]
+    output_format: Literal["markdown", "doctags", "layout_json", "docling_document"]
     payload: str
     tokens: int | None = None
     error: str | None = None
@@ -74,6 +74,10 @@ class BackendInvocation(BaseModel):
     cwd: str | None = None
     profile: ModelProfile
     pages: list[str] = Field(default_factory=list)
+    # Runtime-only state shared between prepare() and run() — temp HF repo IDs,
+    # page-id-to-row-index maps, PIL image lists for in-process backends, etc.
+    # Not serialized to pipeline.yaml.
+    extra: dict[str, Any] = Field(default_factory=dict)
 
 
 class ExportRecord(BaseModel):

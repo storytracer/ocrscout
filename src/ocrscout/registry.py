@@ -59,6 +59,7 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
             "markdown": "ocrscout.normalizers.markdown:MarkdownNormalizer",
             "doctags": "ocrscout.normalizers.doctags:DocTagsNormalizer",
             "layout_json": "ocrscout.normalizers.layout_json:LayoutJsonNormalizer",
+            "passthrough": "ocrscout.normalizers.passthrough:PassthroughNormalizer",
         },
         "exports": {
             "parquet": "ocrscout.exports.parquet:ParquetExportAdapter",

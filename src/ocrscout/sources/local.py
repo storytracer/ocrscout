@@ -11,7 +11,10 @@ from ocrscout.errors import ScoutError
 from ocrscout.interfaces.source import SourceAdapter
 from ocrscout.types import PageImage
 
-_SUPPORTED_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"})
+# Pillow reads .jp2/.j2k via the JPEG 2000 plugin (OpenJPEG); commonly available.
+_SUPPORTED_SUFFIXES = frozenset(
+    {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp", ".jp2", ".j2k", ".jpx"}
+)
 
 
 class LocalSourceAdapter(SourceAdapter):
@@ -24,7 +27,7 @@ class LocalSourceAdapter(SourceAdapter):
     name = "local"
 
     def __init__(self, path: str | Path, *, recursive: bool = True) -> None:
-        self.root = Path(path)
+        self.root = Path(path).expanduser()
         self.recursive = recursive
 
     def _iter_files(self) -> Iterator[Path]:

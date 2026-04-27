@@ -12,7 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from ocrscout.errors import ProfileError
 
 ProfileSource = Literal["hf_scripts", "openai_api", "tesseract", "docling", "custom"]
-OutputFormat = Literal["markdown", "doctags", "layout_json"]
+OutputFormat = Literal["markdown", "doctags", "layout_json", "docling_document"]
 ProfileTier = Literal["curated", "auto", "fallback"]
 
 
@@ -39,6 +39,18 @@ class ModelProfile(BaseModel):
     model_size: str | None = None
     category_mapping: dict[str, str] = Field(default_factory=dict)
     backend_args: dict[str, Any] = Field(default_factory=dict)
+    # Raw extra args inserted between `uv run` and the script path when invoking
+    # subprocess backends. Use to pin packages declared by the upstream script's
+    # PEP 723 block, add an index URL, change the index strategy, etc. — e.g.
+    # `["--with", "vllm==0.11.2", "--extra-index-url",
+    #   "https://download.pytorch.org/whl/cu129", "--index-strategy",
+    #   "unsafe-best-match"]`.
+    uv_args: list[str] = Field(default_factory=list)
+    # Extra environment variables merged into the subprocess for hf_scripts
+    # backends. Use for upstream-provided bypass knobs like
+    # FLASHINFER_DISABLE_VERSION_CHECK that would otherwise need a per-script
+    # patch.
+    env: dict[str, str] = Field(default_factory=dict)
     tier: ProfileTier = "curated"
     metadata: dict[str, Any] = Field(default_factory=dict)
 

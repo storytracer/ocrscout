@@ -24,10 +24,16 @@ category_mapping:
 backend_args:
   max_model_len: 24000
   max_tokens: 24000
-  gpu_memory_utilization: 0.9
+  gpu_memory_utilization: 0.8
   batch_size: 16
   temperature: 0.1
   top_p: 0.9
+env:
+  # Insurance against the GB10/sm_121a Triton-bundled-ptxas issue we hit on
+  # olmocr2 (vLLM 0.11.2). Latest vLLM (used here) probably already supports
+  # sm_121a, but pointing Triton at the system CUDA 13.0 ptxas costs nothing
+  # and avoids a repeat. Remove once upstream Triton wheels catch up.
+  TRITON_PTXAS_PATH: /usr/local/cuda/bin/ptxas
 tier: curated
 metadata:
   prompt_modes:
