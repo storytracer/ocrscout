@@ -50,7 +50,7 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
             "plain_text": "ocrscout.references.plain_text:PlainTextReferenceAdapter",
         },
         "backends": {
-            "hf_scripts": "ocrscout.backends.hf_scripts:HfScriptsBackend",
+            "vllm": "ocrscout.backends.vllm:VllmBackend",
             "openai_api": "ocrscout.backends.openai_api:OpenAIApiBackend",
             "tesseract": "ocrscout.backends.tesseract:TesseractBackend",
             "docling": "ocrscout.backends.docling:DoclingBackend",

@@ -27,7 +27,7 @@ uv add 'ocrscout[pdf,docling]'
 
 ```bash
 # Run multiple models on a folder of images
-uv run ocrscout run --source ./images/ --models dots-mocr,falcon-ocr --sample 20
+uv run ocrscout run --source ./images/ --models dots-mocr,smoldocling --sample 20
 
 # Compare against existing reference OCR
 uv run ocrscout run --source ./images/ \

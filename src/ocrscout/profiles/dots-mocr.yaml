@@ -1,14 +1,13 @@
 name: dots-mocr
-source: hf_scripts
-script: uv-scripts/ocr/dots-mocr.py
-repo: uv-scripts/ocr
+source: vllm
 model_id: rednote-hilab/dots.mocr
+model_size: 3B
+upstream_script: uv-scripts/ocr/dots-mocr.py
+
 output_format: layout_json
 normalizer: layout_json
-preferred_prompt_mode: layout-all
 has_bboxes: true
 has_layout: true
-model_size: 3B
 category_mapping:
   Title: title
   Section-header: section_header
@@ -21,27 +20,66 @@ category_mapping:
   Page-header: page_header
   Page-footer: page_footer
   Formula: formula
-backend_args:
+
+# Prompts copied verbatim from the upstream dots-mocr.py PROMPT_TEMPLATES
+# (see uv-scripts/ocr/dots-mocr.py:67). The "svg" mode supplies {width} and
+# {height} placeholders that VllmBackend fills in per page.
+preferred_prompt_mode: layout-all
+prompt_templates:
+  ocr: |
+    Extract the text content from this image.
+  layout-all: |
+    Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
+
+    1. Bbox format: [x1, y1, x2, y2]
+
+    2. Layout Categories: The possible categories are ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'].
+
+    3. Text Extraction & Formatting Rules:
+        - Picture: For the 'Picture' category, the text field should be omitted.
+        - Formula: Format its text as LaTeX.
+        - Table: Format its text as HTML.
+        - All Others (Text, Title, etc.): Format their text as Markdown.
+
+    4. Constraints:
+        - The output text must be the original text from the image, with no translation.
+        - All layout elements must be sorted according to human reading order.
+
+    5. Final Output: The entire output must be a single JSON object.
+  layout-only: |
+    Please output the layout information from this PDF image, including each layout's bbox and its category. The bbox should be in the format [x1, y1, x2, y2]. The layout categories for the PDF document include ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title']. Do not output the corresponding text. The layout result should be in JSON format.
+  web-parsing: |
+    Parsing the layout info of this webpage image with format json:
+  scene-spotting: |
+    Detect and recognize the text in the image.
+  grounding-ocr: |
+    Extract text from the given bounding box on the image (format: [x1, y1, x2, y2]).
+    Bounding Box:
+  svg: |
+    Please generate the SVG code based on the image. viewBox="0 0 {width} {height}"
+  general: " "
+
+# dots.mocr requires "string" content format for chat (upstream dots-mocr.py:371).
+chat_template_content_format: string
+
+# vLLM engine knobs. max_model_len=24000 is the upstream default and is
+# necessary for dense pages (8192 truncates layout JSON mid-string).
+vllm_engine_args:
+  trust_remote_code: true
   max_model_len: 24000
-  max_tokens: 24000
   gpu_memory_utilization: 0.8
-  batch_size: 16
+sampling_args:
   temperature: 0.1
   top_p: 0.9
-env:
-  # Insurance against the GB10/sm_121a Triton-bundled-ptxas issue we hit on
-  # olmocr2 (vLLM 0.11.2). Latest vLLM (used here) probably already supports
-  # sm_121a, but pointing Triton at the system CUDA 13.0 ptxas costs nothing
-  # and avoids a repeat. Remove once upstream Triton wheels catch up.
-  TRITON_PTXAS_PATH: /usr/local/cuda/bin/ptxas
-tier: curated
+  max_tokens: 24000
+vllm_version: ">=0.15.1"
+
+backend_args:
+  batch_size: 16
+
 metadata:
-  prompt_modes:
-    - ocr
-    - layout-all
-    - layout-only
-    - web-parsing
-    - scene-spotting
-    - grounding-ocr
-    - svg
-    - general
+  notes: |
+    Curated from upstream uv-scripts/ocr/dots-mocr.py. The SVG prompt mode
+    benefits from temperature=0.9 / top_p=1.0 per the upstream script's
+    inline note (dots-mocr.py:338). Override sampling_args at the profile
+    level if you switch to that mode.

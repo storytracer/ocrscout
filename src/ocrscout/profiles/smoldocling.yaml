@@ -7,7 +7,6 @@ has_bboxes: true
 has_layout: true
 model_size: 256M
 backend_args: {}
-tier: curated
 metadata:
   notes: |
     Ultra-compact (~256M) VLM. Run via the full Docling pipeline (which

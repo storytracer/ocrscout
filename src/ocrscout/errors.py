@@ -11,6 +11,10 @@ class ProfileError(ScoutError):
     """Raised when a model profile cannot be loaded, parsed, or resolved."""
 
 
+class ProfileNotFound(ProfileError):
+    """Raised when no curated profile exists for the requested model name."""
+
+
 class RegistryError(ScoutError):
     """Raised when registry lookup or registration fails."""
 

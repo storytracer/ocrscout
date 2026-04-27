@@ -1,4 +1,9 @@
-"""Model profiles: schema, YAML I/O, and three-tier resolution."""
+"""Model profiles: schema, YAML I/O, and curated-only resolution.
+
+Profiles are hand-curated YAMLs shipped at ``src/ocrscout/profiles/``. The
+upstream HF uv-scripts/ocr scripts are reference material we read with
+Claude Code when authoring a new profile — they are no longer executed.
+"""
 
 from __future__ import annotations
 
@@ -9,49 +14,93 @@ from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ocrscout.errors import ProfileError
+from ocrscout.errors import ProfileError, ProfileNotFound
 
-ProfileSource = Literal["hf_scripts", "openai_api", "tesseract", "docling", "custom"]
+ProfileSource = Literal["vllm", "openai_api", "tesseract", "docling", "custom"]
 OutputFormat = Literal["markdown", "doctags", "layout_json", "docling_document"]
-ProfileTier = Literal["curated", "auto", "fallback"]
 
 
 class ModelProfile(BaseModel):
     """Describes how to invoke an OCR model and what to expect back.
 
-    Three tiers exist (see ``resolve``): curated YAMLs ship with the package,
-    auto YAMLs are written by ``ocrscout sync``, and a synthetic fallback is
-    constructed when neither is found.
+    All profiles are curated. Fields are grouped by concern:
+
+    Identity
+        ``name``, ``model_id``, ``model_size``, ``upstream_script``
+    Output
+        ``output_format``, ``normalizer``, ``has_bboxes``, ``has_layout``,
+        ``category_mapping``
+    Prompting
+        ``prompt_templates`` (mode → template), ``preferred_prompt_mode``,
+        ``chat_template_content_format``
+    vLLM
+        ``vllm_engine_args``, ``sampling_args``, ``vllm_version``,
+        ``server_url``
+    Free-form
+        ``backend_args`` (anything a custom backend might need),
+        ``metadata`` (informational notes, prompt-mode catalogs, etc.)
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    # Identity
     name: str
     source: ProfileSource
-    script: str | None = None
-    repo: str | None = None
     model_id: str
+    model_size: str | None = None
+    upstream_script: str | None = None
+    """Informational reference, e.g. ``"uv-scripts/ocr/dots-mocr.py"``.
+
+    Never executed; recorded so ``ocrscout introspect`` can re-fetch the source
+    when revisiting the curation.
+    """
+
+    # Output
     output_format: OutputFormat
     normalizer: str
-    preferred_prompt_mode: str | None = None
     has_bboxes: bool = False
     has_layout: bool = False
-    model_size: str | None = None
     category_mapping: dict[str, str] = Field(default_factory=dict)
+
+    # Prompting
+    prompt_templates: dict[str, str] = Field(default_factory=dict)
+    """Mode name → prompt string. The chosen mode is ``preferred_prompt_mode``.
+
+    Values may contain ``{width}``/``{height}`` placeholders that the backend
+    fills in per page.
+    """
+    preferred_prompt_mode: str | None = None
+    chat_template_content_format: str | None = None
+    """Passed to ``vllm.LLM.chat(chat_template_content_format=...)``.
+
+    Some models (notably ``dots.mocr``) need ``"string"``; default ``None``
+    lets vLLM auto-detect.
+    """
+
+    # vLLM
+    vllm_engine_args: dict[str, Any] = Field(default_factory=dict)
+    """kwargs passed to ``vllm.LLM(...)``.
+
+    Examples: ``max_model_len``, ``gpu_memory_utilization``,
+    ``trust_remote_code``, ``dtype``, ``limit_mm_per_prompt``.
+    """
+    sampling_args: dict[str, Any] = Field(default_factory=dict)
+    """kwargs passed to ``vllm.SamplingParams(...)``.
+
+    Examples: ``temperature``, ``top_p``, ``max_tokens``.
+    """
+    vllm_version: str = ">=0.15.0"
+    """Version specifier used by ``uv run --with "vllm{vllm_version}"`` for
+    subprocess mode. Ignored in server mode."""
+    server_url: str | None = None
+    """Optional OpenAI-compatible base URL (e.g. ``http://localhost:8000/v1``).
+
+    If set (or the ``OCRSCOUT_VLLM_URL`` env var is set at run time), the
+    backend prefers HTTP server mode over spawning a vLLM subprocess.
+    """
+
+    # Free-form
     backend_args: dict[str, Any] = Field(default_factory=dict)
-    # Raw extra args inserted between `uv run` and the script path when invoking
-    # subprocess backends. Use to pin packages declared by the upstream script's
-    # PEP 723 block, add an index URL, change the index strategy, etc. — e.g.
-    # `["--with", "vllm==0.11.2", "--extra-index-url",
-    #   "https://download.pytorch.org/whl/cu129", "--index-strategy",
-    #   "unsafe-best-match"]`.
-    uv_args: list[str] = Field(default_factory=list)
-    # Extra environment variables merged into the subprocess for hf_scripts
-    # backends. Use for upstream-provided bypass knobs like
-    # FLASHINFER_DISABLE_VERSION_CHECK that would otherwise need a per-script
-    # patch.
-    env: dict[str, str] = Field(default_factory=dict)
-    tier: ProfileTier = "curated"
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -97,38 +146,24 @@ def _curated_path(name: str) -> Path | None:
     return Path(str(anchor))
 
 
-def _auto_path(name: str, *, cache_dir: Path | None = None) -> Path:
-    from ocrscout.sync.cache import profiles_cache_dir
+def resolve(name: str) -> ModelProfile:
+    """Resolve a curated profile by name.
 
-    base = cache_dir if cache_dir is not None else profiles_cache_dir()
-    return base / f"{name}.yaml"
-
-
-def resolve(name: str, *, cache_dir: Path | None = None) -> ModelProfile:
-    """Resolve a profile by name across all three tiers.
-
-    Order: curated (shipped with the package) → auto (in user cache) → fallback
-    (synthesized: assumes markdown output, model_id == name).
+    Curated profiles are the only kind that exist; if the YAML isn't shipped
+    in ``src/ocrscout/profiles/``, raise ``ProfileNotFound`` with a hint
+    pointing at ``ocrscout introspect`` for drafting a new one.
     """
     curated = _curated_path(name)
-    if curated is not None:
-        profile = load_profile(curated)
-        # tier defaults to "curated"; honor whatever the file says.
-        return profile
-
-    auto = _auto_path(name, cache_dir=cache_dir)
-    if auto.is_file():
-        profile = load_profile(auto)
-        return profile
-
-    return ModelProfile(
-        name=name,
-        source="hf_scripts",
-        model_id=name,
-        output_format="markdown",
-        normalizer="markdown",
-        tier="fallback",
-    )
+    if curated is None:
+        available = list_curated()
+        raise ProfileNotFound(
+            f"No curated profile for {name!r}. "
+            f"Available: {available or '(none)'}.\n"
+            f"To draft a new profile from an upstream HF script, run "
+            f"`ocrscout introspect {name}` and refine the output before "
+            f"saving it under src/ocrscout/profiles/."
+        )
+    return load_profile(curated)
 
 
 def list_curated() -> list[str]:
