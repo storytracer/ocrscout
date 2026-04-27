@@ -1,0 +1,84 @@
+name: dots-ocr
+source: vllm
+model_id: rednote-hilab/dots.ocr
+model_size: 1.7B
+upstream_script: uv-scripts/ocr/dots-ocr.py
+
+output_format: layout_json
+normalizer: layout_json
+has_bboxes: true
+has_layout: true
+category_mapping:
+  Title: title
+  Section-header: section_header
+  Text: text
+  List-item: list_item
+  Picture: picture
+  Table: table
+  Caption: caption
+  Footnote: footnote
+  Page-header: page_header
+  Page-footer: page_footer
+  Formula: formula
+
+# Prompts copied verbatim from upstream dots-ocr.py PROMPT_TEMPLATES
+# (uv-scripts/ocr/dots-ocr.py:59). dots-ocr ships only three modes vs
+# dots-mocr's eight; same layout-JSON output schema, same category set.
+preferred_prompt_mode: layout-all
+prompt_templates:
+  ocr: |
+    Extract the text content from this image.
+  layout-all: |
+    Please output the layout information from the PDF image, including each layout element's bbox, its category, and the corresponding text content within the bbox.
+
+    1. Bbox format: [x1, y1, x2, y2]
+
+    2. Layout Categories: The possible categories are ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title'].
+
+    3. Text Extraction & Formatting Rules:
+        - Picture: For the 'Picture' category, the text field should be omitted.
+        - Formula: Format its text as LaTeX.
+        - Table: Format its text as HTML.
+        - All Others (Text, Title, etc.): Format their text as Markdown.
+
+    4. Constraints:
+        - The output text must be the original text from the image, with no translation.
+        - All layout elements must be sorted according to human reading order.
+
+    5. Final Output: The entire output must be a single JSON object.
+  layout-only: |
+    Please output the layout information from this PDF image, including each layout's bbox and its category. The bbox should be in the format [x1, y1, x2, y2]. The layout categories for the PDF document include ['Caption', 'Footnote', 'Formula', 'List-item', 'Page-footer', 'Page-header', 'Picture', 'Section-header', 'Table', 'Text', 'Title']. Do not output the corresponding text. The layout result should be in JSON format.
+
+# Unlike dots-mocr, dots-ocr calls llm.chat() with no chat_template_content_format
+# kwarg (uv-scripts/ocr/dots-ocr.py:329), so let vLLM auto-detect.
+chat_template_content_format: null
+
+# vLLM engine knobs. max_model_len bumped from the script's default of 8192
+# (which truncates layout JSON mid-string on dense pages) to 24000, matching
+# dots-mocr. limit_mm_per_prompt comes from the script's LLM(...) call
+# (line 302) — dots-ocr restricts to one image per request.
+vllm_engine_args:
+  trust_remote_code: true
+  max_model_len: 24000
+  gpu_memory_utilization: 0.8
+  limit_mm_per_prompt:
+    image: 1
+
+# Upstream uses temperature=0.0 (deterministic OCR) and no top_p
+# (uv-scripts/ocr/dots-ocr.py:305). max_tokens kept strictly below
+# max_model_len so the OpenAI-compatible server doesn't reject (the
+# offline LLM.chat API auto-clips, the server validates strictly).
+sampling_args:
+  temperature: 0.0
+  max_tokens: 20000
+vllm_version: ">=0.15.1"
+
+backend_args:
+  batch_size: 16
+
+metadata:
+  notes: |
+    Curated from upstream uv-scripts/ocr/dots-ocr.py. dots-ocr is the
+    smaller (1.7B) sibling of dots-mocr (3B): same output schema, same
+    layout categories, but only three prompt modes and a simpler
+    deterministic sampling regime.
