@@ -45,24 +45,44 @@ A profile records:
 
 ### vLLM backend modes
 
-Profiles with `source: vllm` can run in two modes:
+Profiles with `source: vllm` can run in three modes:
 
-- **Subprocess mode (default)** — `VllmBackend` spawns `uv run --with "vllm{vllm_version}" --with pillow runners/vllm_runner.py manifest.json out.jsonl`. The subprocess loads the model, processes the manifest, and writes per-page outputs to JSONL. The parent process never imports vLLM. Best for one-off runs and when the model is small enough that startup cost (~30–60s) is acceptable.
-- **Server mode** — set the `--server-url` flag on `ocrscout run` (or the `OCRSCOUT_VLLM_URL` env var, or `server_url:` in the profile YAML; precedence: env > profile). The backend POSTs to the OpenAI-compatible `/chat/completions` endpoint of an externally-running `vllm serve` process. No vLLM dep in the parent or any subprocess. Best when iterating on the same model — pay startup cost once, then drive many runs.
+| Mode | Trigger | Lifecycle | Use case |
+| --- | --- | --- | --- |
+| **runner** | default (no flag) | per ocrscout invocation: `uv run --with vllm runner.py` subprocess; killed when the run exits | one-off scout, single model, no warm server available |
+| **external-server** | `--server-url URL` | nothing — user/operator manages the server | a `vllm serve` you started by hand, or any OpenAI-compatible endpoint (incl. a LiteLLM proxy you started) |
+| **managed** | `ocrscout serve` (long-lived) **or** `ocrscout run --managed` (inline) | ocrscout owns N `vllm serve` + 1 LiteLLM proxy (when N≥2); torn down on exit/Ctrl-C | comparing multiple models with warm servers; one URL fronting many models |
 
-  Example workflow:
-  ```bash
-  # Terminal 1 — start the server (one-time, leave running)
-  vllm serve rednote-hilab/dots.mocr \
-    --max-model-len 24000 --gpu-memory-utilization 0.8 \
-    --trust-remote-code --port 8000
+Examples of each:
 
-  # Terminal 2 — drive runs against it
-  uv run ocrscout run --source ./images/ --models dots-mocr \
-    --server-url http://localhost:8000/v1
-  ```
+```bash
+# runner (default)
+uv run ocrscout run --source ./images/ --models dots-mocr
 
-  The base URL must include the OpenAI prefix (`/v1`); we don't auto-append because some deployments live behind a custom proxy path. Concurrency is controlled by `backend_args.concurrent_requests` on the profile (default 8 parallel POSTs); per-request timeout by `backend_args.request_timeout` (default 300s).
+# external-server (user starts vllm serve in another terminal)
+uv run ocrscout run --source ./images/ --models dots-mocr \
+  --server-url http://localhost:8000/v1
+
+# managed, inline (ocrscout spawns + tears down for this single run)
+uv run ocrscout run --source ./images/ --models dots-mocr,dots-ocr,glm-ocr \
+  --managed
+
+# managed, long-lived (ocrscout serves; another terminal drives runs)
+uv run ocrscout serve --models dots-mocr,dots-ocr,glm-ocr
+# in another terminal:
+uv run ocrscout run --source ./images/ --models dots-mocr \
+  --server-url http://localhost:4000/v1
+```
+
+`--managed` and `--server-url` are mutually exclusive — you'd be telling ocrscout to both manage its own server and connect to someone else's.
+
+**Server-mode notes.** The base URL must include the OpenAI prefix (`/v1`); we don't auto-append because some deployments live behind a custom proxy path. Concurrency is controlled by `backend_args.concurrent_requests` on the profile (default 8 parallel POSTs); per-request timeout by `backend_args.request_timeout` (default 300s). Precedence for the server URL: `--server-url` flag → `OCRSCOUT_VLLM_URL` env var → `server_url:` in the profile YAML.
+
+**Managed-mode lifecycle.** ocrscout owns the subprocess tree: the vllm-serve PIDs and (when N≥2) the LiteLLM proxy PID live until the run exits or the user hits Ctrl-C. Logs land in `/tmp/ocrscout-managed-<uuid>/<model>.log` and `litellm.log` and survive teardown for debugging. Teardown signals each child's process group with SIGTERM (10s grace), then SIGKILL fallback. Children are spawned with `PR_SET_PDEATHSIG=SIGTERM`, so they die promptly even on abnormal ocrscout exit (SIGKILL, OOM, screen `-X quit`). When only one vllm-source model is requested, the proxy is skipped (no routing benefit) and the single vllm-serve port is the endpoint.
+
+**GPU budget.** `--gpu-budget` (default 0.85) is the *ceiling* fraction of total VRAM the managed stack will collectively claim. ocrscout additionally clamps to 95% of currently-free VRAM via NVML, so a partly-busy GPU degrades gracefully rather than rejecting the run. The N managed models split the resulting effective budget equally; per-model `--gpu-memory-utilization` is logged on startup. If the per-model fraction would fall below vLLM's practical floor (0.1), the run is rejected with a clear "free up GPU memory or reduce model count" message.
+
+**When to pick which mode.** Runner is right when you're scouting one model on a fresh dataset; the startup cost amortizes across the run. External-server is right when you're iterating on prompts/inputs against a single model and want to avoid paying startup per ocrscout invocation. Managed is right when you're comparing multiple models in one go (the proxy lets a single ocrscout run drive all of them) or when you want the convenience of "one command spins everything up and tears it down."
 
 ### Authoring a new profile (Claude-Code-assisted)
 

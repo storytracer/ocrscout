@@ -23,6 +23,15 @@ class BackendError(ScoutError):
     """Raised when a model backend fails to prepare or execute."""
 
 
+class ManagedServerError(ScoutError):
+    """Raised when ocrscout's managed multi-server orchestration fails.
+
+    Covers GPU-budget rejection, vllm-serve startup timeout/failure, and
+    LiteLLM proxy startup failure. Teardown of any partially-started subprocesses
+    happens before this is raised.
+    """
+
+
 class NormalizerError(ScoutError):
     """Raised when normalizing a raw model output to DoclingDocument fails."""
 

@@ -14,7 +14,8 @@ from rich.table import Table
 
 from ocrscout import registry
 from ocrscout.cli import app
-from ocrscout.errors import BackendError, NormalizerError
+from ocrscout.errors import BackendError, ManagedServerError, NormalizerError, ProfileNotFound
+from ocrscout.managed import managed_servers
 from ocrscout.metrics import MetricsCollector
 from ocrscout.profile import resolve
 from ocrscout.types import AdapterRef, ExportRecord, PipelineConfig
@@ -59,12 +60,37 @@ def run(
         help="OpenAI-compatible vLLM server URL (e.g. http://localhost:8000/v1). "
              "When set, vllm-source profiles use HTTP server mode instead of "
              "spawning a `uv run --with vllm` subprocess. Equivalent to setting "
-             "OCRSCOUT_VLLM_URL.",
+             "OCRSCOUT_VLLM_URL. Mutually exclusive with --managed.",
+    ),
+    managed: bool = typer.Option(
+        False, "--managed",
+        help="Spin up one vllm-serve per vllm-source profile (and a LiteLLM "
+             "proxy when there are 2+) for the duration of this run, then tear "
+             "it down. For long-lived servers, use `ocrscout serve` instead.",
+    ),
+    gpu_budget: float = typer.Option(
+        0.85, "--gpu-budget",
+        help="Total GPU memory fraction available to managed vllm-serves "
+             "(equally split). Only used with --managed.",
+    ),
+    base_port: int = typer.Option(
+        8000, "--base-port",
+        help="First port for managed vllm-serves. Only used with --managed.",
+    ),
+    proxy_port: int = typer.Option(
+        4000, "--proxy-port",
+        help="LiteLLM proxy port (only used when --managed and N>=2).",
     ),
 ) -> None:
     """Run multiple OCR models against a source and emit a comparison."""
     if benchmark is None and source is None:
         raise typer.BadParameter("--source or --benchmark is required")
+
+    if managed and server_url:
+        raise typer.BadParameter(
+            "--managed and --server-url are mutually exclusive: --managed "
+            "spawns its own server stack and sets the env var itself."
+        )
 
     if server_url:
         # Set the env var so backends pick it up (and so it propagates to
@@ -104,7 +130,36 @@ def run(
         rprint(f"[yellow](stub) would run benchmark {benchmark!r}[/yellow]")
 
     text_dir = (output_dir / "text") if text else None
-    _execute(cfg, text_dir=text_dir)
+
+    if managed:
+        try:
+            profiles = [resolve(name) for name in cfg.models]
+        except ProfileNotFound as e:
+            raise typer.BadParameter(str(e)) from e
+        try:
+            with managed_servers(
+                profiles,
+                gpu_budget=gpu_budget,
+                base_port=base_port,
+                proxy_port=proxy_port,
+            ) as handle:
+                if handle.proxy_url:
+                    os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+                    rprint(
+                        f"[dim]Managed vLLM endpoint: {handle.proxy_url}  "
+                        f"(logs: {handle.log_dir})[/dim]"
+                    )
+                else:
+                    rprint(
+                        "[dim]Managed mode requested but no vllm-source profiles; "
+                        "running docling/other backends in-process.[/dim]"
+                    )
+                _execute(cfg, text_dir=text_dir)
+        except ManagedServerError as e:
+            rprint(f"[red]Managed stack failed: {e}[/red]")
+            raise typer.Exit(code=1) from e
+    else:
+        _execute(cfg, text_dir=text_dir)
 
 
 def _execute(cfg: PipelineConfig, *, text_dir: Path | None = None) -> None:
