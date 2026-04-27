@@ -120,7 +120,7 @@ class AdapterRef(BaseModel):
 
 class PipelineConfig(BaseModel):
     """Top-level shape of a ``pipeline.yaml`` (and the dump produced by
-    ``ocrscout scout`` for reproducibility)."""
+    ``ocrscout run`` for reproducibility)."""
 
     name: str
     source: AdapterRef

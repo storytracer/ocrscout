@@ -12,7 +12,7 @@ from ocrscout.cli import app
 
 @app.command("report")
 def report(
-    results_dir: Path = typer.Argument(..., help="Directory of `ocrscout scout` results."),
+    results_dir: Path = typer.Argument(..., help="Directory of `ocrscout run` results."),
     fmt: str = typer.Option(
         "html", "--format", "-f", help="Reporter name (html|markdown|terminal)."
     ),

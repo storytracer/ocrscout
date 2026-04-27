@@ -60,7 +60,7 @@ The project is in rapid-prototyping mode. The previous test suite was deleted (r
 3. **Multi-model scouting**: parallel runs, per-model metrics, side-by-side report.
 4. **Reference comparison**: ALTO/hOCR adapters, `EditDistanceEvaluator`, improvement/regression rates.
 5. **Benchmarks**: MDPBench plugin (source + reference + evaluator + canonical score).
-6. **Pipeline-mode YAML**: `ocrscout run pipeline.yaml` with full DAG of stages.
+6. **Pipeline-mode YAML**: `ocrscout apply pipeline.yaml` with full DAG of stages.
 7. **Additional backends**: vLLM API server, OpenAI-compatible (Ollama, LM Studio, Gemini, Claude), Tesseract, full Docling pipeline.
 8. **Ecosystem**: HF Hub publishing of results, VLM judge evaluator with ELO, more reporters (HTML, terminal, web).
 

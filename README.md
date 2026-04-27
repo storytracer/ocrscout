@@ -26,19 +26,19 @@ uv add 'ocrscout[pdf,docling]'
 ## Quick start
 
 ```bash
-# Scout multiple models on a folder of images
-uv run ocrscout scout --source ./images/ --models dots-mocr,falcon-ocr --sample 20
+# Run multiple models on a folder of images
+uv run ocrscout run --source ./images/ --models dots-mocr,falcon-ocr --sample 20
 
 # Compare against existing reference OCR
-uv run ocrscout scout --source ./images/ \
-                       --reference plain_text --reference-path ./txt/ \
-                       --models dots-mocr
+uv run ocrscout run --source ./images/ \
+                     --reference plain_text --reference-path ./txt/ \
+                     --models dots-mocr
 
 # Refresh auto-generated profiles from uv-scripts/ocr
 uv run ocrscout sync
 
-# Run a full pipeline from a YAML config
-uv run ocrscout run pipeline.yaml
+# Apply a full pipeline from a YAML config
+uv run ocrscout apply pipeline.yaml
 ```
 
 See [CLAUDE.md](CLAUDE.md) for the implementation roadmap, design decisions, and contributor guide.
