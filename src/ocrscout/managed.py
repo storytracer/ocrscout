@@ -27,6 +27,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterator, Sequence
@@ -34,6 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import IO
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
@@ -41,6 +43,7 @@ import yaml
 from nvitop import Device
 
 from ocrscout.errors import ManagedServerError
+from ocrscout.log import VERBOSE
 from ocrscout.profile import ModelProfile
 
 log = logging.getLogger(__name__)
@@ -87,6 +90,10 @@ class _ManagedChild:
     proc: subprocess.Popen
     log_path: Path
     port: int
+    # Background reader that tees the child's combined stdout to its log file
+    # and (when verbose) to the ocrscout logger. Daemon thread; exits when the
+    # child's stream closes after teardown.
+    tee_thread: threading.Thread | None = None
 
 
 @dataclass
@@ -195,6 +202,68 @@ def managed_servers(
 # --- subprocess spawning ---------------------------------------------------
 
 
+def _spawn_with_tee(
+    *, cmd: list[str], label: str, log_path: Path, port: int
+) -> _ManagedChild:
+    """Spawn a managed child and tee its combined stdout to (file, logger).
+
+    The child's stdout+stderr is captured via a pipe and read by a daemon
+    thread that writes every line to ``log_path`` (always, for post-mortem
+    debugging) and emits it on the ocrscout logger at VERBOSE (visible at
+    ``-v`` and ``-vv``, suppressed at default and ``-q``). Each line is
+    prefixed with ``[label]`` so concurrent children stay distinguishable.
+
+    Same lifecycle protections as the previous direct-to-file spawn:
+    ``start_new_session`` for clean `killpg` teardown, ``PR_SET_PDEATHSIG``
+    so the child dies with ocrscout on abnormal exit.
+    """
+    log_fh = open(log_path, "w", encoding="utf-8", buffering=1)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        start_new_session=True,
+        preexec_fn=_set_pdeathsig,
+    )
+    tee_thread = threading.Thread(
+        target=_tee_loop,
+        args=(proc.stdout, log_fh, label),
+        name=f"tee[{label}]",
+        daemon=True,
+    )
+    tee_thread.start()
+    return _ManagedChild(
+        label=label, proc=proc, log_path=log_path, port=port, tee_thread=tee_thread
+    )
+
+
+def _tee_loop(src: IO[str], log_fh: IO[str], label: str) -> None:
+    """Read lines from ``src``; write each to ``log_fh`` and emit at VERBOSE.
+
+    Runs in a daemon thread per managed child. Exits when ``src`` closes
+    (i.e. when the child terminates). The logger emit is gated by level so
+    at default verbosity we pay only the file write — no terminal flooding.
+    """
+    try:
+        for line in src:
+            try:
+                log_fh.write(line)
+                log_fh.flush()
+            except Exception:  # noqa: BLE001
+                pass  # don't crash the tee on file-side issues
+            if log.isEnabledFor(VERBOSE):
+                log.log(VERBOSE, "[%s] %s", label, line.rstrip("\n"))
+    finally:
+        try:
+            log_fh.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _spawn_vllm_serve(
     *,
     profile: ModelProfile,
@@ -232,21 +301,8 @@ def _spawn_vllm_serve(
     # defaults; if a profile needs them, surface them through vllm_engine_args
     # in a follow-up.
 
-    log.info("Spawning %s on port %d -> %s", label, port, log_path)
-    log_fh = open(log_path, "wb", buffering=0)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        # New session so the child doesn't share our terminal; teardown sends
-        # signals to the leader, which propagates to its descendants.
-        start_new_session=True,
-        # PR_SET_PDEATHSIG: the kernel SIGTERMs us when ocrscout dies, so an
-        # abnormal exit (SIGKILL, screen quit, OOM) doesn't strand orphans
-        # holding GPU memory.
-        preexec_fn=_set_pdeathsig,
-    )
-    return _ManagedChild(label=label, proc=proc, log_path=log_path, port=port)
+    log.debug("Spawning %s on port %d -> %s", label, port, log_path)
+    return _spawn_with_tee(cmd=cmd, label=label, log_path=log_path, port=port)
 
 
 def _spawn_litellm_proxy(
@@ -291,20 +347,9 @@ def _spawn_litellm_proxy(
         "1",
     ]
 
-    log.info("Spawning litellm-proxy on port %d -> %s", proxy_port, log_path)
-    log_fh = open(log_path, "wb", buffering=0)
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_fh,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
-        preexec_fn=_set_pdeathsig,
-    )
-    return _ManagedChild(
-        label="litellm-proxy",
-        proc=proc,
-        log_path=log_path,
-        port=proxy_port,
+    log.debug("Spawning litellm-proxy on port %d -> %s", proxy_port, log_path)
+    return _spawn_with_tee(
+        cmd=cmd, label="litellm-proxy", log_path=log_path, port=proxy_port
     )
 
 
@@ -530,9 +575,14 @@ def gpu_state_lines() -> list[str]:
 
 
 def log_gpu_state() -> None:
-    """Log lines from :func:`gpu_state_lines` at INFO level."""
+    """Log GPU state at VERBOSE level (-v).
+
+    Per-process listings are noisy enough that they shouldn't appear at the
+    default verbosity — the allocation summary is the load-bearing line; this
+    is "what's actually allocated right now" telemetry for when you want it.
+    """
     for line in gpu_state_lines():
-        log.info(line)
+        log.log(VERBOSE, line)
 
 
 # --- helpers ---------------------------------------------------------------

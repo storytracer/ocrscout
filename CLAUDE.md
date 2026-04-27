@@ -101,6 +101,23 @@ Introspection is purely static (`ast.parse`) — the upstream script is never ex
 - **`uv`** for environment management throughout. The CLI and the `VllmBackend` runner subprocesses both use it.
 - **Entry points** are the extensibility contract. Downstream packages add sources, normalizers, evaluators, etc., without touching ocrscout's source tree.
 
+## Logging
+
+All status output flows through Python's stdlib `logging` module under the `ocrscout` namespace, rendered by a plain `StreamHandler` configured via [src/ocrscout/log.py:setup_logging](src/ocrscout/log.py). No Rich, no markup parsing, no width-based wrapping — one logical line per record so the output is grep-friendly and pastes cleanly into bug reports. CLI commands accept `-v` / `-vv` / `-q` to control verbosity:
+
+| Flag | Level | Format | What appears |
+| --- | --- | --- | --- |
+| `-q` | WARNING | bare message | Errors, warnings, summary table, ready banners |
+| (default) | INFO | bare message | + per-page progress, per-model start/done, GPU allocation summary |
+| `-v` | VERBOSE (15) | `HH:MM:SS LEVEL message` | + timestamps and level names, full URLs/paths, GPU per-process telemetry |
+| `-vv` | DEBUG | `HH:MM:SS LEVEL name:line  message` | + source paths, subprocess argvs, every nvitop probe |
+
+**When to log vs. rprint.** Use `log.info(...)` (or `log.debug` / `log.log(VERBOSE, ...)`) for events — anything with a level that should be filterable. Reserve `rich.print` for *presentation* artifacts that should always render regardless of verbosity: the ready banner from `ocrscout serve`, the per-model summary table from `ocrscout run`. The rule of thumb: if a user's `--quiet` invocation should still see it, it's presentation and uses `rich.print`; otherwise, it's an event and goes through the logger. Don't put Rich markup tags (`[bold]`, `[red]`, etc.) in log messages — the stdlib formatter won't parse them and they'd appear as literal characters.
+
+**Per-model prefix.** When a backend processes pages for a model, prefix every log line with `[{profile.name}]`. This is the contract that lets parallel-model output (`--parallel-models > 1`) interleave readably. See [src/ocrscout/backends/vllm.py](src/ocrscout/backends/vllm.py) for the pattern.
+
+**Subprocess output.** `VllmBackend` runner mode streams the vllm child's stdout to the parent terminal at INFO level (via `log.isEnabledFor` — the firehose is suppressed at `-q`). The `managed.py` lifecycle writes each child's output to a per-model log file under `/tmp/ocrscout-managed-<uuid>/` regardless of verbosity, so post-mortem debugging always has the full picture.
+
 ## Tests are paused
 
 The project is in rapid-prototyping mode. The previous test suite was deleted (recoverable from git history if needed) and `pytest` is removed from the `dev` extras. Do not write new tests or run pytest until the user explicitly re-enables them.

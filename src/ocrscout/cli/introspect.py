@@ -19,6 +19,7 @@ import yaml
 
 from ocrscout.cli import app
 from ocrscout.errors import IntrospectionError
+from ocrscout.log import setup_logging
 from ocrscout.sync.cache import scripts_cache_dir
 from ocrscout.sync.fetch import fetch_scripts
 from ocrscout.sync.introspect import HfScriptInfo, introspect_hf_script
@@ -38,12 +39,19 @@ def introspect(
     revision: str | None = typer.Option(
         None, "--revision", help="HF Hub revision/commit to pin when fetching."
     ),
+    verbose: int = typer.Option(
+        0, "-v", "--verbose", count=True, help="Increase log verbosity."
+    ),
+    quiet: bool = typer.Option(
+        False, "-q", "--quiet", help="Suppress informational logging."
+    ),
 ) -> None:
     """Print a draft curated YAML for an upstream uv-scripts/ocr script.
 
     Pipe to a file under ``src/ocrscout/profiles/<name>.yaml`` and refine
     the TODO markers by reading the upstream script source.
     """
+    setup_logging(verbosity=verbose, quiet=quiet)
     script_path = _locate_script(name=name, fetch=not no_fetch, revision=revision)
     try:
         info = introspect_hf_script(script_path)

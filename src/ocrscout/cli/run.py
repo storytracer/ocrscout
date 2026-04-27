@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import time
@@ -15,6 +16,7 @@ from rich.table import Table
 from ocrscout import registry
 from ocrscout.cli import app
 from ocrscout.errors import BackendError, ManagedServerError, NormalizerError, ProfileNotFound
+from ocrscout.log import VERBOSE, setup_logging
 from ocrscout.managed import managed_servers
 from ocrscout.metrics import MetricsCollector
 from ocrscout.profile import resolve
@@ -81,8 +83,27 @@ def run(
         4000, "--proxy-port",
         help="LiteLLM proxy port (only used when --managed and N>=2).",
     ),
+    parallel_models: int | None = typer.Option(
+        None, "--parallel-models", "-P",
+        help="Number of models to run concurrently against shared infrastructure. "
+             "Default: auto — equals len(--models) when --managed or --server-url is "
+             "set (the proxy / external server can multiplex), otherwise 1 (runner "
+             "subprocess mode would thrash the GPU if multiple models loaded at once).",
+    ),
+    verbose: int = typer.Option(
+        0, "-v", "--verbose", count=True,
+        help="Increase log verbosity. -v shows VERBOSE-level events (timings, "
+             "URLs); -vv shows DEBUG (subprocess argvs, full GPU process listings, "
+             "module paths).",
+    ),
+    quiet: bool = typer.Option(
+        False, "-q", "--quiet",
+        help="Suppress informational logging; only warnings/errors and the "
+             "final summary table are shown.",
+    ),
 ) -> None:
     """Run multiple OCR models against a source and emit a comparison."""
+    setup_logging(verbosity=verbose, quiet=quiet)
     if benchmark is None and source is None:
         raise typer.BadParameter("--source or --benchmark is required")
 
@@ -96,7 +117,7 @@ def run(
         # Set the env var so backends pick it up (and so it propagates to
         # any subprocess invoked downstream).
         os.environ["OCRSCOUT_VLLM_URL"] = server_url
-        rprint(f"[dim]Using vLLM server at {server_url}[/dim]")
+        log.info("vLLM server: %s", server_url)
 
     cfg = PipelineConfig(
         name="run",
@@ -115,8 +136,19 @@ def run(
         output_dir=output_dir,
     )
 
-    rprint("[bold]Resolved pipeline config:[/bold]")
-    rprint(cfg.model_dump(mode="json"))
+    # Concise one-liner at default verbosity; dump the full dict only at -v+.
+    log.info(
+        "ocrscout run: %d model(s) [%s] · source=%s · output=%s",
+        len(cfg.models),
+        ",".join(cfg.models),
+        cfg.source.args.get("path", "?"),
+        cfg.export.args.get("dest", "?"),
+    )
+    log.log(
+        VERBOSE,
+        "Resolved pipeline config:\n%s",
+        yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False),
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     pipeline_yaml = output_dir / "pipeline.yaml"
@@ -124,12 +156,21 @@ def run(
         yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False),
         encoding="utf-8",
     )
-    rprint(f"[dim]Wrote {pipeline_yaml} for reproducibility.[/dim]")
+    log.log(VERBOSE, "Wrote pipeline.yaml: %s", pipeline_yaml)
 
     if benchmark:
-        rprint(f"[yellow](stub) would run benchmark {benchmark!r}[/yellow]")
+        log.warning("(stub) would run benchmark %r", benchmark)
 
     text_dir = (output_dir / "text") if text else None
+
+    # Resolve parallelism. Smart default: auto-parallel when there's shared
+    # infrastructure to multiplex over, else sequential to avoid GPU thrash
+    # in runner-subprocess mode.
+    if parallel_models is None:
+        parallel_models = len(cfg.models) if (managed or server_url) else 1
+    parallel_models = max(1, min(parallel_models, len(cfg.models)))
+    if parallel_models > 1:
+        log.info("Running up to %d model(s) concurrently", parallel_models)
 
     if managed:
         try:
@@ -145,37 +186,42 @@ def run(
             ) as handle:
                 if handle.proxy_url:
                     os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
-                    rprint(
-                        f"[dim]Managed vLLM endpoint: {handle.proxy_url}  "
-                        f"(logs: {handle.log_dir})[/dim]"
+                    log.info(
+                        "Managed endpoint: %s  (logs: %s)",
+                        handle.proxy_url, handle.log_dir,
                     )
                 else:
-                    rprint(
-                        "[dim]Managed mode requested but no vllm-source profiles; "
-                        "running docling/other backends in-process.[/dim]"
+                    log.info(
+                        "--managed requested but no vllm profiles; running "
+                        "docling/in-process backends only."
                     )
-                _execute(cfg, text_dir=text_dir)
+                _execute(cfg, text_dir=text_dir, parallel_models=parallel_models)
         except ManagedServerError as e:
-            rprint(f"[red]Managed stack failed: {e}[/red]")
+            log.error("Managed stack failed: %s", e)
             raise typer.Exit(code=1) from e
     else:
-        _execute(cfg, text_dir=text_dir)
+        _execute(cfg, text_dir=text_dir, parallel_models=parallel_models)
 
 
-def _execute(cfg: PipelineConfig, *, text_dir: Path | None = None) -> None:
+def _execute(
+    cfg: PipelineConfig,
+    *,
+    text_dir: Path | None = None,
+    parallel_models: int = 1,
+) -> None:
     source_cls = registry.get("sources", cfg.source.name)
     source = source_cls(**cfg.source.args)
     pages = list(source.iter_pages())
     if cfg.sample is not None:
         pages = pages[: cfg.sample]
     page_by_id = {p.page_id: p for p in pages}
-    rprint(f"[bold]Loaded {len(pages)} page(s) from {cfg.source.args.get('path')!r}.[/bold]")
+    log.info("Loaded %d page(s) from %r", len(pages), cfg.source.args.get("path"))
     if not pages:
         from ocrscout.sources.local import _SUPPORTED_SUFFIXES
 
-        rprint(
-            f"[red]No images found at {cfg.source.args.get('path')!r}. "
-            f"LocalSourceAdapter recognizes {sorted(_SUPPORTED_SUFFIXES)}.[/red]"
+        log.error(
+            "No images found at %r. LocalSourceAdapter recognizes %s.",
+            cfg.source.args.get("path"), sorted(_SUPPORTED_SUFFIXES),
         )
         raise typer.Exit(code=1)
 
@@ -188,27 +234,42 @@ def _execute(cfg: PipelineConfig, *, text_dir: Path | None = None) -> None:
     exporter.open(cfg.export.args["dest"])
 
     metrics = MetricsCollector(pipeline_id=cfg.name)
-    summary_rows: list[tuple[str, int, int, float]] = []
+    # results[model_name] -> (ok, failed, run_seconds). We collect into a dict
+    # to preserve cfg.models order for the summary table even when models
+    # complete out-of-order under parallelism.
+    results: dict[str, tuple[int, int, float]] = {}
+
+    def _run(name: str) -> tuple[str, int, int, float]:
+        ok, failed, run_seconds = _run_one_model(
+            model_name=name,
+            pages=pages,
+            page_by_id=page_by_id,
+            normalizer_overrides=cfg.normalizer_overrides,
+            exporter=exporter,
+            metrics=metrics,
+            text_dir=text_dir,
+        )
+        return name, ok, failed, run_seconds
 
     try:
-        for model_name in cfg.models:
-            ok, failed, run_seconds = _run_one_model(
-                model_name=model_name,
-                pages=pages,
-                page_by_id=page_by_id,
-                normalizer_overrides=cfg.normalizer_overrides,
-                exporter=exporter,
-                metrics=metrics,
-                text_dir=text_dir,
-            )
-            summary_rows.append((model_name, ok, failed, run_seconds))
+        if parallel_models <= 1:
+            for model_name in cfg.models:
+                _, ok, failed, run_seconds = _run(model_name)
+                results[model_name] = (ok, failed, run_seconds)
+        else:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_models) as ex:
+                futures = [ex.submit(_run, name) for name in cfg.models]
+                for fut in concurrent.futures.as_completed(futures):
+                    name, ok, failed, run_seconds = fut.result()
+                    results[name] = (ok, failed, run_seconds)
     finally:
         exporter.close()
         metrics.finish()
 
+    summary_rows = [(m, *results[m]) for m in cfg.models if m in results]
     _print_summary(summary_rows, dest=cfg.export.args["dest"])
     if text_dir is not None:
-        rprint(f"[dim]Wrote per-(page, model) markdown to {text_dir}[/dim]")
+        log.info("Wrote per-(page, model) markdown to %s", text_dir)
 
 
 def _run_one_model(
@@ -227,12 +288,12 @@ def _run_one_model(
         normalizer_name = normalizer_overrides.get(model_name, profile.normalizer)
         normalizer = registry.get("normalizers", normalizer_name)()
     except Exception as e:
-        rprint(f"[red]{model_name}: setup failed: {e}[/red]")
+        log.error("[%s] setup failed: %s", model_name, e)
         return 0, len(pages), 0.0
 
-    rprint(
-        f"[bold cyan]\n=== {model_name} "
-        f"(backend={profile.source}, normalizer={normalizer_name}) ===[/bold cyan]"
+    log.info(
+        "[%s] starting (backend=%s, normalizer=%s)",
+        model_name, profile.source, normalizer_name,
     )
 
     try:
@@ -241,7 +302,7 @@ def _run_one_model(
         with metrics.stage(f"{model_name}.run"):
             raws = list(backend.run(inv))
     except BackendError as e:
-        rprint(f"[red]{model_name} backend failed: {e}[/red]")
+        log.error("[%s] backend failed: %s", model_name, e)
         return 0, len(pages), metrics.stage_seconds.get(f"{model_name}.run", 0.0)
 
     prepare_seconds = metrics.stage_seconds.get(f"{model_name}.prepare", 0.0)
@@ -297,9 +358,9 @@ def _run_one_model(
 
     metrics.add_pages(ok=ok, failed=failed)
     run_seconds = metrics.stage_seconds.get(f"{model_name}.run", 0.0)
-    rprint(
-        f"[green]{model_name}:[/green] {ok}/{ok + failed} ok in "
-        f"{run_seconds:.1f}s"
+    log.info(
+        "[%s] done: %d/%d ok in %.1fs",
+        model_name, ok, ok + failed, run_seconds,
     )
     return ok, failed, run_seconds
 
@@ -307,6 +368,8 @@ def _run_one_model(
 def _print_summary(
     summary_rows: list[tuple[str, int, int, float]], *, dest: str
 ) -> None:
+    # Summary table is the *deliverable*, not status — always rprinted, never
+    # gated by log level. Quiet mode still shows it.
     table = Table(title="ocrscout run — per-model summary")
     table.add_column("model", style="bold")
     table.add_column("pages_ok", justify="right")
@@ -317,7 +380,7 @@ def _print_summary(
         per_page = f"{secs / ok:.2f}" if ok > 0 else "—"
         table.add_row(name, str(ok), str(failed), f"{secs:.1f}", per_page)
     rprint(table)
-    rprint(f"[dim]Wrote {dest}[/dim]")
+    log.info("Wrote %s", dest)
 
 
 def _doc_stats(doc) -> tuple[int, int, str]:

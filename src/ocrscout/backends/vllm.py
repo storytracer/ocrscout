@@ -149,8 +149,10 @@ class VllmBackend(ModelBackend):
         output_jsonl = Path(invocation.extra["output_jsonl"])
 
         tail_buffer: deque[str] = deque(maxlen=400)
+        prefix = f"[{invocation.profile.name}]"
         try:
-            print(f"  $ {' '.join(invocation.argv)}", flush=True)
+            log.info("%s spawning vllm-runner subprocess", prefix)
+            log.debug("%s argv: %s", prefix, " ".join(invocation.argv))
             proc = subprocess.Popen(
                 invocation.argv,
                 stdout=subprocess.PIPE,
@@ -160,10 +162,12 @@ class VllmBackend(ModelBackend):
                 bufsize=1,
             )
             assert proc.stdout is not None
+            forward_stdout = log.isEnabledFor(logging.INFO)
             for line in proc.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
                 tail_buffer.append(line)
+                if forward_stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
             returncode = proc.wait()
             if returncode != 0:
                 raise BackendError(
@@ -260,11 +264,13 @@ class VllmBackend(ModelBackend):
             )
 
         url = f"{endpoint}/chat/completions"
+        prefix = f"[{profile.name}]"
 
-        print(
-            f"  POST {url}  ({len(pages)} pages, {concurrent_requests}-way concurrent)",
-            flush=True,
+        log.info(
+            "%s starting %d page(s) against %s (%d-way concurrent)",
+            prefix, len(pages), endpoint, concurrent_requests,
         )
+        log.debug("%s POST URL: %s", prefix, url)
 
         def _post_one(page: PageImage) -> RawOutput:
             return _post_page(
@@ -295,11 +301,16 @@ class VllmBackend(ModelBackend):
                     )
                 results[page.page_id] = raw
                 completed += 1
-                status = "FAIL" if raw.error else "ok"
-                print(
-                    f"  server [{completed}/{total}] {page.page_id} {status}",
-                    flush=True,
-                )
+                if raw.error:
+                    log.warning(
+                        "%s page %d/%d %s FAIL: %s",
+                        prefix, completed, total, page.page_id, raw.error,
+                    )
+                else:
+                    log.info(
+                        "%s page %d/%d %s ok",
+                        prefix, completed, total, page.page_id,
+                    )
 
         elapsed = time.perf_counter() - t0
         log.info("server mode finished %d pages in %.1fs", total, elapsed)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -16,6 +17,11 @@ class MetricsCollector:
 
     Designed to be picklable across subprocess boundaries — internal state is a
     plain dict of JSON-friendly values; no file handles, no logger references.
+
+    Thread-safe: all mutating methods serialize on an internal lock so that
+    parallel ``_run_one_model`` calls (when --parallel-models > 1 in the CLI)
+    don't race on counter or stage-seconds updates. The lock is excluded from
+    pickling — it's recreated lazily on first use after unpickling.
     """
 
     def __init__(self, pipeline_id: str) -> None:
@@ -27,6 +33,7 @@ class MetricsCollector:
         self.pages_failed = 0
         self.tokens = 0
         self.gpu_peak_mb: float | None = None
+        self._lock = threading.Lock()
 
     @contextmanager
     def stage(self, name: str) -> Iterator[None]:
@@ -36,18 +43,22 @@ class MetricsCollector:
             yield
         finally:
             elapsed = time.perf_counter() - t0
-            self._stage_seconds[name] = self._stage_seconds.get(name, 0.0) + elapsed
+            with self._lock:
+                self._stage_seconds[name] = self._stage_seconds.get(name, 0.0) + elapsed
 
     def add_pages(self, *, ok: int = 0, failed: int = 0) -> None:
-        self.pages_ok += ok
-        self.pages_failed += failed
+        with self._lock:
+            self.pages_ok += ok
+            self.pages_failed += failed
 
     def add_tokens(self, n: int) -> None:
-        self.tokens += n
+        with self._lock:
+            self.tokens += n
 
     def record_gpu_peak(self, mb: float) -> None:
-        if self.gpu_peak_mb is None or mb > self.gpu_peak_mb:
-            self.gpu_peak_mb = mb
+        with self._lock:
+            if self.gpu_peak_mb is None or mb > self.gpu_peak_mb:
+                self.gpu_peak_mb = mb
 
     def finish(self) -> None:
         self.finished_at = datetime.now(UTC)
@@ -119,3 +130,4 @@ class MetricsCollector:
         self.pages_failed = int(state.get("pages_failed", 0))
         self.tokens = int(state.get("tokens", 0))
         self.gpu_peak_mb = state.get("gpu_peak_mb")
+        self._lock = threading.Lock()

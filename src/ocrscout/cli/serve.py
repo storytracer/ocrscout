@@ -10,6 +10,7 @@ drive runs against warm models without paying startup cost per run.
 
 from __future__ import annotations
 
+import logging
 import signal
 import time
 
@@ -18,8 +19,11 @@ from rich import print as rprint
 
 from ocrscout.cli import app
 from ocrscout.errors import ManagedServerError, ProfileNotFound
+from ocrscout.log import setup_logging
 from ocrscout.managed import gpu_state_lines, managed_servers
 from ocrscout.profile import resolve
+
+log = logging.getLogger(__name__)
 
 
 @app.command("serve")
@@ -49,8 +53,19 @@ def serve(
         "--ready-timeout",
         help="Per-server seconds to wait for /v1/models to return 200.",
     ),
+    verbose: int = typer.Option(
+        0, "-v", "--verbose", count=True,
+        help="Increase log verbosity. -v adds timestamps and per-process GPU "
+             "telemetry; -vv adds DEBUG-level subprocess details.",
+    ),
+    quiet: bool = typer.Option(
+        False, "-q", "--quiet",
+        help="Suppress informational logging; show only warnings/errors and "
+             "the ready-banner.",
+    ),
 ) -> None:
     """Start managed vllm-serves + LiteLLM proxy; print URL; block until Ctrl-C."""
+    setup_logging(verbosity=verbose, quiet=quiet)
     names = [m.strip() for m in models.split(",") if m.strip()]
     if not names:
         raise typer.BadParameter("--models must list at least one profile name")
@@ -69,9 +84,9 @@ def serve(
             f"set has none. Got sources: {sorted({p.source for p in profiles})}"
         )
 
-    rprint(
-        f"[bold]Starting managed stack[/bold] — {len(vllm_profiles)} vllm model(s), "
-        f"GPU budget {gpu_budget:.0%} (~{gpu_budget / len(vllm_profiles):.2f} per model)."
+    log.info(
+        "Starting managed stack: %d vllm model(s), GPU budget %.0f%% (~%.2f per model)",
+        len(vllm_profiles), gpu_budget * 100, gpu_budget / len(vllm_profiles),
     )
 
     try:
@@ -82,6 +97,8 @@ def serve(
             proxy_port=proxy_port,
             ready_timeout=ready_timeout,
         ) as handle:
+            # The ready banner is presentation, like the summary table — always
+            # rprinted, never gated by log level. Quiet mode still shows it.
             rprint("\n[bold green]Managed multi-server stack ready.[/bold green]")
             rprint(f"  proxy:  [bold]{handle.proxy_url}[/bold]"
                    f" ({len(vllm_profiles)} model{'s' if len(vllm_profiles) != 1 else ''})")
@@ -98,9 +115,9 @@ def serve(
             rprint("[dim]Press Ctrl-C to stop.[/dim]")
 
             _block_until_signal()
-            rprint("\n[dim]Tearing down managed stack...[/dim]")
+            log.info("Tearing down managed stack...")
     except ManagedServerError as e:
-        rprint(f"[red]Managed stack failed: {e}[/red]")
+        log.error("Managed stack failed: %s", e)
         raise typer.Exit(code=1) from e
 
 
