@@ -1,0 +1,41 @@
+name: dots-mocr
+source: hf_scripts
+script: uv-scripts/ocr/dots-mocr.py
+repo: uv-scripts/ocr
+model_id: rednote-hilab/dots.mocr
+output_format: layout_json
+normalizer: layout_json
+preferred_prompt_mode: layout-all
+has_bboxes: true
+has_layout: true
+model_size: 3B
+category_mapping:
+  Title: title
+  Section-header: section_header
+  Text: text
+  List-item: list_item
+  Picture: picture
+  Table: table
+  Caption: caption
+  Footnote: footnote
+  Page-header: page_header
+  Page-footer: page_footer
+  Formula: formula
+backend_args:
+  max_model_len: 24000
+  max_tokens: 24000
+  gpu_memory_utilization: 0.9
+  batch_size: 16
+  temperature: 0.1
+  top_p: 0.9
+tier: curated
+metadata:
+  prompt_modes:
+    - ocr
+    - layout-all
+    - layout-only
+    - web-parsing
+    - scene-spotting
+    - grounding-ocr
+    - svg
+    - general

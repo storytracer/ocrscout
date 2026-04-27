@@ -1,0 +1,17 @@
+name: falcon-ocr
+source: hf_scripts
+script: uv-scripts/ocr/falcon-ocr.py
+repo: uv-scripts/ocr
+model_id: tiiuae/Falcon-OCR
+output_format: markdown
+normalizer: markdown
+has_bboxes: false
+has_layout: false
+model_size: 0.3B
+backend_args:
+  max_tokens: 4096
+tier: curated
+metadata:
+  notes: |
+    Smallest model in uv-scripts/ocr (~0.3B). Apache-2.0. Reported #1 on
+    multi-column documents and tables.

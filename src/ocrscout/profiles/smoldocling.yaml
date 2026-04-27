@@ -1,0 +1,20 @@
+name: smoldocling
+# Note: the upstream HF script is named smoldocling-ocr.py; the canonical
+# profile name is the shorter `smoldocling` for ergonomics. The `script` field
+# below points at the real upstream file.
+source: hf_scripts
+script: uv-scripts/ocr/smoldocling-ocr.py
+repo: uv-scripts/ocr
+model_id: ds4sd/SmolDocling-256M-preview
+output_format: doctags
+normalizer: doctags
+has_bboxes: true
+has_layout: true
+model_size: 256M
+backend_args:
+  max_model_len: 8192
+tier: curated
+metadata:
+  notes: |
+    Ultra-compact (~256M) VLM that emits DocTags directly. Supports code
+    blocks, formulas, and tables with bounding boxes via DocTags structure.
