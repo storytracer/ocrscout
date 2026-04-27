@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -53,10 +54,23 @@ def run(
         help="Also write a `text/<page>.<model>.md` rendering of every result "
              "alongside the parquet (uses DoclingDocument.export_to_markdown).",
     ),
+    server_url: str | None = typer.Option(
+        None, "--server-url",
+        help="OpenAI-compatible vLLM server URL (e.g. http://localhost:8000/v1). "
+             "When set, vllm-source profiles use HTTP server mode instead of "
+             "spawning a `uv run --with vllm` subprocess. Equivalent to setting "
+             "OCRSCOUT_VLLM_URL.",
+    ),
 ) -> None:
     """Run multiple OCR models against a source and emit a comparison."""
     if benchmark is None and source is None:
         raise typer.BadParameter("--source or --benchmark is required")
+
+    if server_url:
+        # Set the env var so backends pick it up (and so it propagates to
+        # any subprocess invoked downstream).
+        os.environ["OCRSCOUT_VLLM_URL"] = server_url
+        rprint(f"[dim]Using vLLM server at {server_url}[/dim]")
 
     cfg = PipelineConfig(
         name="run",

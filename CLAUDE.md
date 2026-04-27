@@ -43,6 +43,27 @@ A profile records:
 - **vLLM tuning**: `vllm_engine_args` (passed to `vllm.LLM(...)`), `sampling_args` (passed to `vllm.SamplingParams(...)`), `vllm_version`, `server_url` (for HTTP server mode).
 - **Free-form**: `backend_args`, `metadata`.
 
+### vLLM backend modes
+
+Profiles with `source: vllm` can run in two modes:
+
+- **Subprocess mode (default)** — `VllmBackend` spawns `uv run --with "vllm{vllm_version}" --with pillow runners/vllm_runner.py manifest.json out.jsonl`. The subprocess loads the model, processes the manifest, and writes per-page outputs to JSONL. The parent process never imports vLLM. Best for one-off runs and when the model is small enough that startup cost (~30–60s) is acceptable.
+- **Server mode** — set the `--server-url` flag on `ocrscout run` (or the `OCRSCOUT_VLLM_URL` env var, or `server_url:` in the profile YAML; precedence: env > profile). The backend POSTs to the OpenAI-compatible `/chat/completions` endpoint of an externally-running `vllm serve` process. No vLLM dep in the parent or any subprocess. Best when iterating on the same model — pay startup cost once, then drive many runs.
+
+  Example workflow:
+  ```bash
+  # Terminal 1 — start the server (one-time, leave running)
+  vllm serve rednote-hilab/dots.mocr \
+    --max-model-len 24000 --gpu-memory-utilization 0.8 \
+    --trust-remote-code --port 8000
+
+  # Terminal 2 — drive runs against it
+  uv run ocrscout run --source ./images/ --models dots-mocr \
+    --server-url http://localhost:8000/v1
+  ```
+
+  The base URL must include the OpenAI prefix (`/v1`); we don't auto-append because some deployments live behind a custom proxy path. Concurrency is controlled by `backend_args.concurrent_requests` on the profile (default 8 parallel POSTs); per-request timeout by `backend_args.request_timeout` (default 300s).
+
 ### Authoring a new profile (Claude-Code-assisted)
 
 1. Run `uv run ocrscout introspect <name>` — fetches the upstream HF script (`uv-scripts/ocr/<name>.py`) and prints a draft YAML with TODO markers (model_id, vLLM engine args, sampling params, prompt template selection).

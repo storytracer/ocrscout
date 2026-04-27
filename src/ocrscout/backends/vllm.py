@@ -15,6 +15,7 @@ OpenAI-compatible ``/chat/completions`` endpoint of an externally-running
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import io
 import json
 import logging
@@ -22,6 +23,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 from collections import deque
 from collections.abc import Iterator, Sequence
 from importlib.resources import files
@@ -38,6 +40,7 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_BATCH_SIZE = 16
 _DEFAULT_REQUEST_TIMEOUT = 300.0  # seconds, per HTTP page in server mode
+_DEFAULT_CONCURRENT_REQUESTS = 8  # parallel POSTs in server mode
 
 
 class VllmBackend(ModelBackend):
@@ -47,7 +50,10 @@ class VllmBackend(ModelBackend):
         self, profile: ModelProfile, pages: Sequence[PageImage]
     ) -> BackendInvocation:
         prompt = _resolve_prompt_template(profile)
-        server_url = profile.server_url or os.environ.get("OCRSCOUT_VLLM_URL")
+        # Precedence: env var (typically set by `--server-url`) wins over the
+        # profile's static field, so users can flip a curated profile from
+        # subprocess to server mode without editing the YAML.
+        server_url = os.environ.get("OCRSCOUT_VLLM_URL") or profile.server_url
 
         if server_url:
             # Server mode does no preflight beyond keeping pages in memory; the
@@ -226,7 +232,7 @@ class VllmBackend(ModelBackend):
     # --- server mode -------------------------------------------------------
 
     def _run_server(self, invocation: BackendInvocation) -> Iterator[RawOutput]:
-        endpoint = invocation.endpoint or ""
+        endpoint = _normalize_endpoint(invocation.endpoint or "")
         if not endpoint:
             raise BackendError("VllmBackend: server mode requires endpoint URL")
 
@@ -234,68 +240,161 @@ class VllmBackend(ModelBackend):
         prompt: str = invocation.extra["prompt"]
         pages: list[PageImage] = list(invocation.extra.get("pages_runtime", []))
         timeout = float(profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT))
+        concurrent_requests = max(
+            1,
+            int(profile.backend_args.get("concurrent_requests", _DEFAULT_CONCURRENT_REQUESTS)),
+        )
 
+        # Map our sampling_args (vLLM SamplingParams keys) to the OpenAI
+        # /chat/completions schema. The vLLM server accepts the OpenAI names;
+        # extra vLLM-specific keys (chat_template_content_format) are passed
+        # through as top-level fields, which the server picks up.
         sampling = dict(profile.sampling_args)
-        # Map vLLM SamplingParams keys to the OpenAI chat/completions schema.
-        # vLLM's OpenAI-compatible server accepts the OpenAI names (and ignores
-        # unknown keys), so this is mostly a passthrough with a renamed token cap.
-        request_payload_base: dict = {
-            "model": profile.model_id,
-        }
-        if "max_tokens" in sampling:
-            request_payload_base["max_tokens"] = sampling["max_tokens"]
-        if "temperature" in sampling:
-            request_payload_base["temperature"] = sampling["temperature"]
-        if "top_p" in sampling:
-            request_payload_base["top_p"] = sampling["top_p"]
+        request_payload_base: dict = {"model": profile.model_id}
+        for key in ("max_tokens", "temperature", "top_p"):
+            if key in sampling:
+                request_payload_base[key] = sampling[key]
+        if profile.chat_template_content_format is not None:
+            request_payload_base["chat_template_content_format"] = (
+                profile.chat_template_content_format
+            )
 
         url = f"{endpoint}/chat/completions"
+
+        print(
+            f"  POST {url}  ({len(pages)} pages, {concurrent_requests}-way concurrent)",
+            flush=True,
+        )
+
+        def _post_one(page: PageImage) -> RawOutput:
+            return _post_page(
+                page=page,
+                url=url,
+                prompt=prompt,
+                base_payload=request_payload_base,
+                timeout=timeout,
+                output_format=profile.output_format,
+            )
+
+        results: dict[str, RawOutput] = {}
+        completed = 0
+        total = len(pages)
+        t0 = time.perf_counter()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_requests) as ex:
+            futures = {ex.submit(_post_one, page): page for page in pages}
+            for fut in concurrent.futures.as_completed(futures):
+                page = futures[fut]
+                try:
+                    raw = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    raw = RawOutput(
+                        page_id=page.page_id,
+                        output_format=profile.output_format,
+                        payload="",
+                        error=f"{type(e).__name__}: {e}",
+                    )
+                results[page.page_id] = raw
+                completed += 1
+                status = "FAIL" if raw.error else "ok"
+                print(
+                    f"  server [{completed}/{total}] {page.page_id} {status}",
+                    flush=True,
+                )
+
+        elapsed = time.perf_counter() - t0
+        log.info("server mode finished %d pages in %.1fs", total, elapsed)
+
+        # Yield in the order pages were submitted, matching subprocess mode.
         for page in pages:
-            page_prompt = _per_page_prompt(prompt, page)
-            try:
-                buf = io.BytesIO()
-                page.image.convert("RGB").save(buf, format="PNG")
-                data_uri = (
-                    "data:image/png;base64,"
-                    + base64.b64encode(buf.getvalue()).decode()
-                )
-                payload = {
-                    **request_payload_base,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "image_url", "image_url": {"url": data_uri}},
-                                {"type": "text", "text": page_prompt},
-                            ],
-                        }
-                    ],
-                }
-                req = urlrequest.Request(
-                    url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urlrequest.urlopen(req, timeout=timeout) as resp:
-                    body = resp.read().decode("utf-8")
-                data = json.loads(body)
-                text = data["choices"][0]["message"]["content"]
-                usage = data.get("usage") or {}
-                tokens = usage.get("completion_tokens")
-                yield RawOutput(
-                    page_id=page.page_id,
-                    output_format=profile.output_format,
-                    payload=text or "",
-                    tokens=tokens,
-                )
-            except (urlerror.URLError, json.JSONDecodeError, KeyError) as e:
-                yield RawOutput(
-                    page_id=page.page_id,
-                    output_format=profile.output_format,
-                    payload="",
-                    error=f"{type(e).__name__}: {e}",
-                )
+            yield results[page.page_id]
+
+
+def _normalize_endpoint(endpoint: str) -> str:
+    """Trim trailing slashes from the user-supplied URL.
+
+    Users typically write either ``http://host:port`` or ``http://host:port/v1``;
+    we don't auto-prepend ``/v1`` because some deployments live behind a proxy
+    with a different prefix. The OpenAI convention is that the base URL
+    *includes* ``/v1`` — document that and trust the caller.
+    """
+    return endpoint.rstrip("/")
+
+
+def _post_page(
+    *,
+    page: PageImage,
+    url: str,
+    prompt: str,
+    base_payload: dict,
+    timeout: float,
+    output_format: str,
+) -> RawOutput:
+    """POST one page to the OpenAI-compatible endpoint and return RawOutput."""
+    page_prompt = _per_page_prompt(prompt, page)
+    buf = io.BytesIO()
+    page.image.convert("RGB").save(buf, format="PNG")
+    data_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    payload = {
+        **base_payload,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                    {"type": "text", "text": page_prompt},
+                ],
+            }
+        ],
+    }
+    req = urlrequest.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+    except urlerror.HTTPError as e:
+        # Surface the response body — vLLM returns useful detail under
+        # {"object":"error","message":"..."} on 4xx/5xx.
+        try:
+            err_body = e.read().decode("utf-8")
+        except Exception:  # noqa: BLE001
+            err_body = ""
+        return RawOutput(
+            page_id=page.page_id,
+            output_format=output_format,
+            payload="",
+            error=f"HTTPError {e.code}: {err_body or e.reason}",
+        )
+    except urlerror.URLError as e:
+        return RawOutput(
+            page_id=page.page_id,
+            output_format=output_format,
+            payload="",
+            error=f"URLError: {e.reason}",
+        )
+
+    try:
+        data = json.loads(body)
+        text = data["choices"][0]["message"]["content"]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+        return RawOutput(
+            page_id=page.page_id,
+            output_format=output_format,
+            payload="",
+            error=f"{type(e).__name__} parsing response: {e}",
+        )
+
+    usage = data.get("usage") or {}
+    tokens = usage.get("completion_tokens")
+    return RawOutput(
+        page_id=page.page_id,
+        output_format=output_format,
+        payload=text or "",
+        tokens=tokens,
+    )
 
 
 def _resolve_prompt_template(profile: ModelProfile) -> str:
