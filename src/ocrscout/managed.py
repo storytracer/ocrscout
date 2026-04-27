@@ -140,31 +140,32 @@ def managed_servers(
         return
 
     try:
-        per_model_util, alloc_summary = _compute_allocation(gpu_budget, len(vllm_profiles))
-        log.info(alloc_summary)
+        # Each profile declares its own absolute KV cache budget via
+        # vllm_engine_args.kv_cache_memory_bytes. We preflight the sum (plus
+        # a per-model overhead estimate) against available VRAM, then spawn
+        # all vllm-serve children in parallel — KV cache size is set
+        # absolutely so the cudaMemGetInfo race that previously plagued
+        # sibling spawns is gone. We *do* still pass --gpu-memory-utilization
+        # as a per-engine cap (sized to that engine's actual footprint, not
+        # split equally) so vLLM's startup free-memory check passes; without
+        # it, vLLM defaults to 0.9+ and rejects the second engine to spawn.
+        summary, engine_caps = _preflight_kv_budgets(vllm_profiles, gpu_budget)
+        log.info(summary)
 
-        # Spawn each vllm-serve sequentially from the main thread. We do NOT
-        # parallelize via ThreadPoolExecutor here: PR_SET_PDEATHSIG (set in
-        # preexec_fn) triggers when the *thread* that called fork() dies, not
-        # the parent process. From a worker thread, the death signal would
-        # fire as soon as the worker returns — instantly killing the child
-        # we just spawned. Forking is fast; only the model-load that follows
-        # is slow, and we already parallelize *that* via the readiness probes.
         for i, profile in enumerate(vllm_profiles):
             port = base_port + i
             children.append(
                 _spawn_vllm_serve(
                     profile=profile,
                     port=port,
-                    gpu_memory_utilization=per_model_util,
+                    gpu_memory_utilization=engine_caps[profile.name],
                     log_dir=log_dir,
                 )
             )
 
         log.info(
             "Spawned %d vllm-serve children; waiting up to %.0fs for ready...",
-            len(children),
-            ready_timeout,
+            len(children), ready_timeout,
         )
         _wait_all_ready(children, timeout=ready_timeout)
         log.info("All vllm-serves ready.")
@@ -264,6 +265,43 @@ def _tee_loop(src: IO[str], log_fh: IO[str], label: str) -> None:
             pass
 
 
+_ENGINE_ARG_OWNED_BY_MANAGED = frozenset({"gpu_memory_utilization", "port"})
+
+
+def _engine_args_to_cli(engine_args: dict) -> list[str]:
+    """Translate a profile's ``vllm_engine_args`` dict into ``vllm serve`` flags.
+
+    Each key becomes ``--<kebab-key>``. Booleans are bare flags (omitted when
+    false). Scalars (int/float/str) become ``--flag value``. Dicts are
+    JSON-encoded (vLLM accepts a single JSON string for args like
+    ``limit_mm_per_prompt``). Lists are splatted as separate positional values
+    (``--flag v1 v2 v3``), matching argparse ``nargs='+'`` flags like
+    ``--cudagraph-capture-sizes``. ``gpu_memory_utilization`` and ``port``
+    are skipped because managed mode owns both (cap is computed per-engine
+    from the profile's KV bytes; port is assigned by base_port + i).
+    """
+    out: list[str] = []
+    for key, value in engine_args.items():
+        if key in _ENGINE_ARG_OWNED_BY_MANAGED or value is None:
+            continue
+        flag = f"--{key.replace('_', '-')}"
+        if isinstance(value, bool):
+            if value:
+                out.append(flag)
+        elif isinstance(value, (int, float, str)):
+            out += [flag, str(value)]
+        elif isinstance(value, list):
+            out += [flag, *(str(v) for v in value)]
+        elif isinstance(value, dict):
+            out += [flag, json.dumps(value)]
+        else:
+            log.warning(
+                "Ignoring vllm_engine_args[%r] of unsupported type %s",
+                key, type(value).__name__,
+            )
+    return out
+
+
 def _spawn_vllm_serve(
     *,
     profile: ModelProfile,
@@ -274,10 +312,6 @@ def _spawn_vllm_serve(
     label = f"vllm:{profile.model_id}"
     safe = _safe_filename(profile.model_id)
     log_path = log_dir / f"vllm-{safe}.log"
-
-    engine = profile.vllm_engine_args or {}
-    max_model_len = engine.get("max_model_len")
-    trust_remote_code = bool(engine.get("trust_remote_code", False))
 
     cmd: list[str] = [
         "uv",
@@ -293,13 +327,7 @@ def _spawn_vllm_serve(
         "--gpu-memory-utilization",
         f"{gpu_memory_utilization:.4f}",
     ]
-    if max_model_len is not None:
-        cmd += ["--max-model-len", str(max_model_len)]
-    if trust_remote_code:
-        cmd.append("--trust-remote-code")
-    # dtype, served-model-name, etc. are intentionally left to vllm-serve
-    # defaults; if a profile needs them, surface them through vllm_engine_args
-    # in a follow-up.
+    cmd += _engine_args_to_cli(profile.vllm_engine_args or {})
 
     log.debug("Spawning %s on port %d -> %s", label, port, log_path)
     return _spawn_with_tee(cmd=cmd, label=label, log_path=log_path, port=port)
@@ -369,11 +397,7 @@ def _wait_all_ready(children: Sequence[_ManagedChild], *, timeout: float) -> Non
             try:
                 fut.result(timeout=max(1.0, deadline - time.monotonic()))
             except Exception as e:  # noqa: BLE001
-                raise ManagedServerError(
-                    f"{child.label}: failed to become ready: {e}\n"
-                    f"--- last 50 lines of {child.log_path} ---\n"
-                    + _tail_log(child.log_path, 50)
-                ) from e
+                raise ManagedServerError(f"{child.label}: {e}") from e
 
 
 def _wait_one_ready(child: _ManagedChild, *, timeout: float) -> None:
@@ -385,7 +409,9 @@ def _wait_one_ready(child: _ManagedChild, *, timeout: float) -> None:
         rc = child.proc.poll()
         if rc is not None:
             raise ManagedServerError(
-                f"{child.label} exited (code {rc}) before becoming ready"
+                f"{child.label} exited (code {rc}) before becoming ready\n"
+                f"--- last 50 lines of {child.log_path} ---\n"
+                + _tail_log(child.log_path, 50)
             )
         try:
             with urlrequest.urlopen(url, timeout=2.0) as resp:
@@ -396,7 +422,9 @@ def _wait_one_ready(child: _ManagedChild, *, timeout: float) -> None:
         time.sleep(2.0)
     raise ManagedServerError(
         f"{child.label} did not respond at {url} within {timeout:.0f}s "
-        f"(last error: {last_error})"
+        f"(last error: {last_error})\n"
+        f"--- last 50 lines of {child.log_path} ---\n"
+        + _tail_log(child.log_path, 50)
     )
 
 
@@ -443,78 +471,233 @@ def _teardown(children: Sequence[_ManagedChild]) -> None:
 
 
 _FREE_HEADROOM = 0.95  # never reserve more than this fraction of currently-free VRAM
-_PER_MODEL_FLOOR = 0.1  # vLLM's practical minimum for --gpu-memory-utilization
+_OVERHEAD_PER_MODEL_BYTES = 8 * 1024 ** 3  # fallback when model_size is missing/unparseable
+
+_BYTE_SUFFIX_MULTIPLIERS = {
+    "": 1,
+    "k": 1_000, "K": 1024,
+    "m": 1_000_000, "M": 1024 ** 2,
+    "g": 1_000_000_000, "G": 1024 ** 3,
+    "t": 1_000_000_000_000, "T": 1024 ** 4,
+}
+
+# Decimal suffixes for parameter counts (these are not byte sizes — model
+# parameter counts use SI conventions: "3B" means 3 × 10⁹ params).
+_PARAM_COUNT_SUFFIXES = {
+    "K": 1_000, "M": 1_000_000,
+    "B": 1_000_000_000, "T": 1_000_000_000_000,
+}
+
+# Bytes per parameter for common vLLM `dtype` strings. Default to 2 (BF16)
+# when dtype is unset or unrecognized — matches vLLM's "auto" behavior for
+# most modern models. FP8/INT8 = 1 byte; INT4 = 0.5 byte (rounded up by int()).
+_DTYPE_BYTES_PER_PARAM: dict[str, float] = {
+    "auto": 2,
+    "bfloat16": 2, "bf16": 2,
+    "float16": 2, "fp16": 2, "half": 2,
+    "float32": 4, "fp32": 4, "float": 4,
+    "fp8": 1, "float8": 1, "fp8_e4m3": 1, "fp8_e5m2": 1,
+    "int8": 1,
+    "int4": 0.5, "uint4": 0.5,
+}
 
 
-def _compute_allocation(gpu_budget: float, n_models: int) -> tuple[float, str]:
-    """Decide per-model ``--gpu-memory-utilization`` and return a one-line summary.
+def _parse_bytes(value: int | float | str) -> int:
+    """Parse a byte count from int or string with vLLM-style suffixes.
 
-    Semantics: ``gpu_budget`` is the *ceiling* fraction of total VRAM the
-    managed stack should claim collectively. We additionally clamp to
-    ``_FREE_HEADROOM`` of currently-free VRAM, so a partly-busy GPU degrades
-    gracefully instead of being rejected outright. The N models split the
-    resulting effective budget equally.
+    Lowercase suffixes are decimal SI (``k`` = 1,000); uppercase are binary
+    (``K`` = 1024). Optional trailing ``b``/``B`` is ignored. Decimal
+    multipliers supported (``"1.5G"`` → 1,610,612,736). Plain ints/floats are
+    returned as ``int(value)``.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return int(value)
+    if not isinstance(value, str):
+        raise ValueError(
+            f"cannot parse bytes from {type(value).__name__}: {value!r}"
+        )
+    s = value.strip()
+    if s.endswith(("b", "B")):
+        s = s[:-1]
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([kKmMgGtT]?)$", s)
+    if not m:
+        raise ValueError(f"cannot parse byte value: {value!r}")
+    return int(float(m.group(1)) * _BYTE_SUFFIX_MULTIPLIERS[m.group(2)])
 
-    Raises ``ManagedServerError`` if no devices are visible AND ``gpu_budget``
-    is in range, or if the resulting per-model fraction falls below vLLM's
-    practical floor (~0.1).
+
+def _parse_model_size(s: str) -> int | None:
+    """Parse ``"3B"`` / ``"1.7B"`` / ``"750M"`` to a parameter count.
+
+    Suffixes are decimal SI: ``B`` = 10⁹, ``M`` = 10⁶, ``K`` = 10³, ``T`` =
+    10¹². Suffix is case-insensitive. Bare numbers (no suffix) are treated
+    as ``B`` (the most common case in HF model cards). Returns ``None`` for
+    unrecognized formats.
+    """
+    m = re.match(r"^(\d+(?:\.\d+)?)\s*([KkMmBbTt])?$", s.strip())
+    if not m:
+        return None
+    num = float(m.group(1))
+    suf = (m.group(2) or "B").upper()
+    return int(num * _PARAM_COUNT_SUFFIXES[suf])
+
+
+def _estimate_model_overhead(profile: ModelProfile) -> int:
+    """Estimate per-engine non-KV memory: weights + working + cudagraph slack.
+
+    Weights: ``params × bytes_per_param``, where ``params`` is parsed from
+    ``profile.model_size`` and ``bytes_per_param`` is inferred from
+    ``profile.vllm_engine_args.dtype`` (default 2 bytes for BF16/FP16/auto).
+    Adds a working-memory slack of ``max(1 GiB, weights // 4)`` to cover
+    activations, CUDA graph workspace, and allocator overhead.
+
+    Falls back to ``_OVERHEAD_PER_MODEL_BYTES`` when ``model_size`` is missing
+    or unparseable, so preflight stays conservative for under-specified
+    profiles.
+    """
+    if not profile.model_size:
+        return _OVERHEAD_PER_MODEL_BYTES
+    params = _parse_model_size(profile.model_size)
+    if params is None:
+        log.warning(
+            "profile %r: unparseable model_size %r; falling back to %s overhead",
+            profile.name, profile.model_size,
+            _human_bytes(_OVERHEAD_PER_MODEL_BYTES),
+        )
+        return _OVERHEAD_PER_MODEL_BYTES
+
+    dtype = str((profile.vllm_engine_args or {}).get("dtype", "auto")).lower()
+    bytes_per_param = _DTYPE_BYTES_PER_PARAM.get(dtype, 2)
+    weights = int(params * bytes_per_param)
+    # Working memory + cudagraph workspace + allocator slack. ``model_size``
+    # typically counts only the LLM parameters, but vLLM also loads vision
+    # towers / other modules and reserves transient working memory during
+    # the profile step — so we floor at 2 GiB and scale to 50% of weights
+    # for larger models. Combined with the 1.25× multiplier in the cap
+    # calculation, this keeps us well above observed peak footprints
+    # without massively over-budgeting.
+    working = max(2 * 1024 ** 3, weights // 2)
+    return weights + working
+
+
+# Safety multiplier on each profile's overhead estimate when computing the
+# per-engine --gpu-memory-utilization cap. The cap is what vLLM checks
+# against free VRAM at startup; 1.25× leaves 25% headroom for transient
+# working-memory spikes during vLLM's profile step.
+_ENGINE_CAP_OVERHEAD_MULTIPLIER = 1.25
+
+
+def _preflight_kv_budgets(
+    profiles: Sequence[ModelProfile], gpu_budget: float
+) -> tuple[str, dict[str, float]]:
+    """Validate per-profile ``kv_cache_memory_bytes`` and compute cap fractions.
+
+    Each managed profile must declare ``vllm_engine_args.kv_cache_memory_bytes``
+    (vLLM's absolute KV cache size; suffixes accepted). Per-profile overhead
+    is estimated from ``model_size`` + ``dtype`` via
+    :func:`_estimate_model_overhead` (falls back to a flat 8 GiB when
+    ``model_size`` is missing). Total footprint = sum of (KV + overhead) per
+    profile, checked against ``min(total_VRAM × gpu_budget, free_VRAM ×
+    _FREE_HEADROOM)``.
+
+    Also computes per-profile ``--gpu-memory-utilization`` caps. Even when
+    ``kv_cache_memory_bytes`` is set, vLLM still does a startup check that
+    ``gpu_memory_utilization × total_VRAM <= free_VRAM``; defaulting (vLLM's
+    0.9+) fails when sibling engines are loading. Each cap is sized to the
+    profile's own ``(KV + overhead × 1.25) / total_VRAM``, which is large
+    enough for the engine's actual footprint and small enough to fit free
+    VRAM during parallel spawn.
+
+    Returns ``(summary, caps)`` where ``caps`` maps ``profile.name`` to the
+    cap fraction. Falls back to ``gpu_budget / N`` per engine when NVML is
+    unavailable.
     """
     if not (0.0 < gpu_budget <= 1.0):
         raise ManagedServerError(
             f"--gpu-budget must be in (0, 1]; got {gpu_budget!r}"
         )
-    if n_models <= 0:
+    if not profiles:
         raise ManagedServerError("at least one vllm profile is required")
 
-    devices = _cuda_devices()
-    if not devices:
-        # No NVML / non-CUDA host: we can't enforce anything. Use the budget
-        # as-is and let vLLM fail loudly if the math doesn't work out.
-        per_model = gpu_budget / n_models
-        return per_model, (
-            f"No CUDA devices visible; per-model gpu_memory_utilization="
-            f"{per_model:.3f} (untrusted, no NVML preflight)."
+    declared: list[tuple[str, int, int]] = []  # (name, kv_bytes, overhead_bytes)
+    missing: list[str] = []
+    for p in profiles:
+        raw = (p.vllm_engine_args or {}).get("kv_cache_memory_bytes")
+        if raw is None:
+            missing.append(p.name)
+            continue
+        try:
+            kv = _parse_bytes(raw)
+        except ValueError as e:
+            raise ManagedServerError(
+                f"profile {p.name!r}: invalid kv_cache_memory_bytes: {e}"
+            ) from e
+        declared.append((p.name, kv, _estimate_model_overhead(p)))
+
+    if missing:
+        raise ManagedServerError(
+            f"managed mode requires per-profile "
+            f"vllm_engine_args.kv_cache_memory_bytes; missing on profile(s): "
+            f"{missing}. Add a value like `kv_cache_memory_bytes: 16G` to the "
+            f"profile YAML."
         )
+
+    total_kv = sum(kv for _, kv, _ in declared)
+    total_overhead = sum(o for _, _, o in declared)
+    total_required = total_kv + total_overhead
+
+    devices = _cuda_devices()
+    fallback_cap = gpu_budget / len(declared)
+    if not devices:
+        summary = (
+            f"No CUDA devices visible; trusting per-profile KV budgets "
+            f"({_human_bytes(total_kv)} total, +{_human_bytes(total_overhead)} "
+            f"estimated overhead) without preflight."
+        )
+        return summary, {name: fallback_cap for name, _, _ in declared}
 
     dev = devices[0]
     try:
         free_b = int(dev.memory_free())
         total_b = int(dev.memory_total())
     except Exception as e:  # noqa: BLE001
-        log.warning(
-            "nvitop memory query failed (%s); using --gpu-budget as-is", e
+        log.warning("nvitop memory query failed (%s); skipping preflight", e)
+        summary = (
+            f"NVML query failed; trusting per-profile KV budgets "
+            f"({_human_bytes(total_kv)} total) without preflight."
         )
-        per_model = gpu_budget / n_models
-        return per_model, (
-            f"NVML query failed; per-model gpu_memory_utilization="
-            f"{per_model:.3f} (no preflight)."
+        return summary, {name: fallback_cap for name, _, _ in declared}
+
+    free_cap = int(free_b * _FREE_HEADROOM)
+    budget_cap = int(total_b * gpu_budget)
+    cap = min(free_cap, budget_cap)
+
+    if total_required > cap:
+        per_profile = "\n  ".join(
+            f"{name}: KV {_human_bytes(kv)} + overhead {_human_bytes(o)}"
+            for name, kv, o in declared
         )
-
-    free_fraction = free_b / total_b if total_b > 0 else 0.0
-    free_cap = free_fraction * _FREE_HEADROOM
-    effective = min(gpu_budget, free_cap)
-    per_model = effective / n_models
-
-    if per_model < _PER_MODEL_FLOOR:
         raise ManagedServerError(
-            f"GPU has too little free memory for {n_models} model(s) on "
-            f"{dev.name()}: free {_human_bytes(free_b)} / "
-            f"total {_human_bytes(total_b)} → effective budget "
-            f"{effective:.3f}, per-model {per_model:.3f} which is below "
-            f"vLLM's floor of {_PER_MODEL_FLOOR}. Free up GPU memory or "
-            f"reduce model count."
+            f"per-profile KV budgets exceed available GPU memory on "
+            f"{dev.name()}:\n  {per_profile}\n  total = "
+            f"{_human_bytes(total_required)} > cap {_human_bytes(cap)} "
+            f"(free {_human_bytes(free_b)} × {_FREE_HEADROOM:.0%}, "
+            f"budget {gpu_budget:.2f} × total {_human_bytes(total_b)}).\n"
+            f"Reduce per-profile kv_cache_memory_bytes, free GPU memory, "
+            f"or raise --gpu-budget."
         )
+
+    caps = {
+        name: (kv + int(o * _ENGINE_CAP_OVERHEAD_MULTIPLIER)) / total_b
+        for name, kv, o in declared
+    }
 
     summary = (
-        f"GPU {dev.name()}: free {_human_bytes(free_b)} / "
-        f"total {_human_bytes(total_b)} (free fraction {free_fraction:.2%}). "
-        f"Budget {gpu_budget:.2f} → effective {effective:.3f} → "
-        f"per-model gpu_memory_utilization={per_model:.3f} "
-        f"({n_models} model{'s' if n_models != 1 else ''})."
+        f"GPU {dev.name()}: per-profile KV totals {_human_bytes(total_kv)} + "
+        f"overhead {_human_bytes(total_overhead)} = "
+        f"{_human_bytes(total_required)} (cap {_human_bytes(cap)}; "
+        f"free {_human_bytes(free_b)} / total {_human_bytes(total_b)})"
     )
-    if effective < gpu_budget:
-        summary += f" [clamped from {gpu_budget:.2f} to fit free VRAM]"
-    return per_model, summary
+    return summary, caps
 
 
 def _cuda_devices() -> list[Device]:

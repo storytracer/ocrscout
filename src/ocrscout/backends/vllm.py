@@ -40,7 +40,7 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_BATCH_SIZE = 16
 _DEFAULT_REQUEST_TIMEOUT = 300.0  # seconds, per HTTP page in server mode
-_DEFAULT_CONCURRENT_REQUESTS = 8  # parallel POSTs in server mode
+_DEFAULT_CONCURRENT_REQUESTS = 16  # parallel POSTs in server mode
 
 
 class VllmBackend(ModelBackend):

@@ -34,9 +34,10 @@ def serve(
     gpu_budget: float = typer.Option(
         0.85,
         "--gpu-budget",
-        help="Total fraction of GPU memory available to managed vllm-serves "
-             "(equally split across them). 0.85 leaves 15%% for the OS and "
-             "other processes.",
+        help="Maximum total GPU memory the managed stack will collectively "
+             "claim, as a fraction of total VRAM. Per-model KV cache is set "
+             "by `vllm_engine_args.kv_cache_memory_bytes` in each profile; "
+             "this flag bounds the sum + per-model overhead estimate.",
     ),
     base_port: int = typer.Option(
         8000,
@@ -85,8 +86,9 @@ def serve(
         )
 
     log.info(
-        "Starting managed stack: %d vllm model(s), GPU budget %.0f%% (~%.2f per model)",
-        len(vllm_profiles), gpu_budget * 100, gpu_budget / len(vllm_profiles),
+        "Starting managed stack: %d vllm model(s), GPU budget ceiling %.0f%% "
+        "(per-model KV bytes from each profile)",
+        len(vllm_profiles), gpu_budget * 100,
     )
 
     try:

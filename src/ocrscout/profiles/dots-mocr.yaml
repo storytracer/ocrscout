@@ -67,7 +67,22 @@ chat_template_content_format: string
 vllm_engine_args:
   trust_remote_code: true
   max_model_len: 24000
-  gpu_memory_utilization: 0.8
+  # Trim CUDA graph capture sizes — vLLM's default is [1..512], but with
+  # backend_args.concurrent_requests defaulting to 16 we will never see
+  # batches above ~32. Capturing fewer graphs saves ~1 GiB of GPU memory
+  # (absorbed by KV cache) and ~2s of startup per engine.
+  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
+  # Absolute KV cache budget (vLLM accepts SI suffixes: lowercase k/m/g =
+  # decimal, uppercase K/M/G = binary). 16 GiB → ~25× concurrency at
+  # max_model_len=24000 for this model class. Sized to comfortably exceed
+  # the default 16-way client concurrency. Excludes model weights + working
+  # memory + cudagraphs (~6 GiB more); managed mode adds an 8 GiB per-model
+  # overhead estimate when preflighting against --gpu-budget.
+  kv_cache_memory_bytes: 2G
+# Deterministic decoding for OCR/layout extraction so reruns of the same
+# page produce identical output (matches dots-ocr.yaml). The metadata note
+# below describes when to override this for SVG mode.
+#
 # max_tokens MUST be strictly less than max_model_len: vLLM's OpenAI server
 # enforces prompt_tokens + max_tokens <= max_model_len. The offline LLM.chat()
 # API silently clips max_tokens to the remaining window (which is why the
@@ -75,8 +90,7 @@ vllm_engine_args:
 # server rejects with a 400. Image patches + prompt text typically use 1.5k-3k
 # tokens for a document page, so 20000 leaves a safe headroom of ~4k.
 sampling_args:
-  temperature: 0.1
-  top_p: 0.9
+  temperature: 0.0
   max_tokens: 20000
 vllm_version: ">=0.15.1"
 

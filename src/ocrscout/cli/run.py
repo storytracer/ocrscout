@@ -72,8 +72,11 @@ def run(
     ),
     gpu_budget: float = typer.Option(
         0.85, "--gpu-budget",
-        help="Total GPU memory fraction available to managed vllm-serves "
-             "(equally split). Only used with --managed.",
+        help="Maximum total GPU memory the managed stack will collectively "
+             "claim, as a fraction of total VRAM. Per-model KV cache is set "
+             "by `vllm_engine_args.kv_cache_memory_bytes` in each profile; "
+             "this flag bounds the sum + per-model overhead. Only used with "
+             "--managed.",
     ),
     base_port: int = typer.Option(
         8000, "--base-port",
@@ -85,10 +88,13 @@ def run(
     ),
     parallel_models: int | None = typer.Option(
         None, "--parallel-models", "-P",
-        help="Number of models to run concurrently against shared infrastructure. "
-             "Default: auto — equals len(--models) when --managed or --server-url is "
-             "set (the proxy / external server can multiplex), otherwise 1 (runner "
-             "subprocess mode would thrash the GPU if multiple models loaded at once).",
+        help="Number of models to run concurrently. Default: 1 (sequential), "
+             "which gives each model the full GPU and produces uncontended "
+             "per-model s/page numbers for benchmarking. Total wall-clock is "
+             "~equivalent to running them in parallel on a single GPU since "
+             "the GPU is the bottleneck either way. Raise this only if you "
+             "have separate GPUs per model or genuinely want concurrent "
+             "execution at the cost of comparable per-model timings.",
     ),
     verbose: int = typer.Option(
         0, "-v", "--verbose", count=True,
@@ -163,14 +169,19 @@ def run(
 
     text_dir = (output_dir / "text") if text else None
 
-    # Resolve parallelism. Smart default: auto-parallel when there's shared
-    # infrastructure to multiplex over, else sequential to avoid GPU thrash
-    # in runner-subprocess mode.
+    # Resolve parallelism. Default 1 (sequential): the GPU is the bottleneck
+    # in single-GPU setups, so concurrent model execution just splits compute
+    # and bandwidth and yields slowed, contended per-model s/page numbers
+    # that aren't useful for benchmarking. Sequential gives each model the
+    # full GPU, produces honest per-model numbers, and total wall-clock is
+    # ~equivalent. Override with -P > 1 if you actually have per-model GPUs.
     if parallel_models is None:
-        parallel_models = len(cfg.models) if (managed or server_url) else 1
+        parallel_models = 1
     parallel_models = max(1, min(parallel_models, len(cfg.models)))
     if parallel_models > 1:
         log.info("Running up to %d model(s) concurrently", parallel_models)
+    else:
+        log.info("Running %d model(s) sequentially", len(cfg.models))
 
     if managed:
         try:
