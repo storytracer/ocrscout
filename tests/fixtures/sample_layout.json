@@ -1,7 +1,0 @@
-[
-    {"category": "Title", "bbox": [50, 30, 600, 90], "text": "Annual Report 2024"},
-    {"category": "Section-header", "bbox": [50, 110, 600, 150], "text": "Executive Summary", "level": 2},
-    {"category": "Text", "bbox": [50, 170, 600, 320], "text": "This year we shipped many things. Profits grew. Costs fell. Everyone is delighted."},
-    {"category": "Picture", "bbox": [50, 350, 600, 700]},
-    {"category": "Page-footer", "bbox": [50, 950, 600, 980], "text": "Page 1 of 24"}
-]

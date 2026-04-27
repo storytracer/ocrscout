@@ -49,9 +49,13 @@ Each OCR model has a YAML profile describing how to invoke it and what to expect
 - **`uv`** for environment management throughout. The CLI and any HF-script subprocesses both use it.
 - **Entry points** are the extensibility contract. Downstream packages add sources, normalizers, evaluators, etc., without touching ocrscout's source tree.
 
+## Tests are paused
+
+The project is in rapid-prototyping mode. The previous test suite was deleted (recoverable from git history if needed) and `pytest` is removed from the `dev` extras. Do not write new tests or run pytest until the user explicitly re-enables them.
+
 ## Implementation roadmap
 
-1. **Skeleton** (this commit): public API, ABCs, three normalizers, working sources/references/exports, profile sync, CLI stubs, tests.
+1. **Skeleton** (this commit): public API, ABCs, three normalizers, working sources/references/exports, profile sync, CLI stubs.
 2. **Single-model run end-to-end** with `HfScriptsBackend`: subprocess invocation, output capture, normalization, export to parquet.
 3. **Multi-model scouting**: parallel runs, per-model metrics, side-by-side report.
 4. **Reference comparison**: ALTO/hOCR adapters, `EditDistanceEvaluator`, improvement/regression rates.
