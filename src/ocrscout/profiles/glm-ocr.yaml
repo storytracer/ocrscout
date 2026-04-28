@@ -35,7 +35,6 @@ vllm_engine_args:
   max_model_len: 8192
   limit_mm_per_prompt:
     image: 1
-  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
   kv_cache_memory_bytes: 2G
 
 # Sampling defaults from the GLM-OCR SDK (per upstream comment at

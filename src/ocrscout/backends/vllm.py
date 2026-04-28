@@ -33,7 +33,7 @@ from urllib import request as urlrequest
 
 from ocrscout.errors import BackendError
 from ocrscout.interfaces.backend import ModelBackend
-from ocrscout.profile import ModelProfile
+from ocrscout.profile import ModelProfile, effective_vllm_engine_args
 from ocrscout.types import BackendInvocation, PageImage, RawOutput
 
 log = logging.getLogger(__name__)
@@ -93,7 +93,7 @@ class VllmBackend(ModelBackend):
 
         manifest = {
             "model_id": profile.model_id,
-            "vllm_engine_args": dict(profile.vllm_engine_args),
+            "vllm_engine_args": effective_vllm_engine_args(profile),
             "sampling_args": dict(profile.sampling_args),
             "chat_template_content_format": profile.chat_template_content_format,
             "batch_size": int(profile.backend_args.get("batch_size", _DEFAULT_BATCH_SIZE)),

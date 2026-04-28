@@ -36,7 +36,6 @@ vllm_engine_args:
   max_model_len: 16384
   limit_mm_per_prompt:
     image: 1
-  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
   kv_cache_memory_bytes: 4G
 
 # Upstream: temperature=0.0 (deterministic for OCR — explicit in

@@ -19,6 +19,21 @@ from ocrscout.errors import ProfileError, ProfileNotFound
 ProfileSource = Literal["vllm", "openai_api", "tesseract", "docling", "custom"]
 OutputFormat = Literal["markdown", "doctags", "layout_json", "docling_document"]
 
+DEFAULT_VLLM_ENGINE_ARGS: dict[str, Any] = {
+    # Trim CUDA graph capture sizes — vLLM's default is [1..512], but with
+    # backend_args.concurrent_requests defaulting to ~16 we will never see
+    # batches above ~32. Capturing fewer graphs saves ~1 GiB of GPU memory
+    # (absorbed by KV cache) and ~2s of startup per engine. Override
+    # per-profile by setting ``cudagraph_capture_sizes`` in
+    # ``vllm_engine_args``.
+    "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32],
+}
+
+
+def effective_vllm_engine_args(profile: ModelProfile) -> dict[str, Any]:
+    """Profile's ``vllm_engine_args`` merged on top of ``DEFAULT_VLLM_ENGINE_ARGS``."""
+    return {**DEFAULT_VLLM_ENGINE_ARGS, **(profile.vllm_engine_args or {})}
+
 
 class ModelProfile(BaseModel):
     """Describes how to invoke an OCR model and what to expect back.

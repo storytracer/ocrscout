@@ -44,7 +44,7 @@ from nvitop import Device
 
 from ocrscout.errors import ManagedServerError
 from ocrscout.log import VERBOSE
-from ocrscout.profile import ModelProfile
+from ocrscout.profile import ModelProfile, effective_vllm_engine_args
 
 log = logging.getLogger(__name__)
 
@@ -327,7 +327,7 @@ def _spawn_vllm_serve(
         "--gpu-memory-utilization",
         f"{gpu_memory_utilization:.4f}",
     ]
-    cmd += _engine_args_to_cli(profile.vllm_engine_args or {})
+    cmd += _engine_args_to_cli(effective_vllm_engine_args(profile))
 
     log.debug("Spawning %s on port %d -> %s", label, port, log_path)
     return _spawn_with_tee(cmd=cmd, label=label, log_path=log_path, port=port)

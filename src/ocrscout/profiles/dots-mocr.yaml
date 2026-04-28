@@ -67,11 +67,6 @@ chat_template_content_format: string
 vllm_engine_args:
   trust_remote_code: true
   max_model_len: 24000
-  # Trim CUDA graph capture sizes — vLLM's default is [1..512], but with
-  # backend_args.concurrent_requests defaulting to 16 we will never see
-  # batches above ~32. Capturing fewer graphs saves ~1 GiB of GPU memory
-  # (absorbed by KV cache) and ~2s of startup per engine.
-  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
   # Absolute KV cache budget (vLLM accepts SI suffixes: lowercase k/m/g =
   # decimal, uppercase K/M/G = binary). 16 GiB → ~25× concurrency at
   # max_model_len=24000 for this model class. Sized to comfortably exceed
