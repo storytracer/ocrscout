@@ -37,6 +37,7 @@ from datasets import Features, Value
 
 RESULTS_FEATURES: Features = Features(
     {
+        "file_id": Value("string"),
         "volume_id": Value("string"),
         "sequence": Value("int64"),
         "page_id": Value("string"),

@@ -3,21 +3,26 @@
 Layout — three independently-collapsible zones:
 
     ┌─ Sidebar ─────┬─ Image pane ──────────┬─ Text pane ──────────────┐
-    │ Page picker   │ AnnotatedImage with   │ Dynamic columns rendered │
-    │ Model picker  │ bbox overlay (the     │ via @gr.render — count   │
-    │ View mode     │ first selected model  │ matches selected models. │
-    │ Stats         │ supplies layout)      │ Mode determines content. │
+    │ File list +   │ AnnotatedImage with   │ Dynamic columns rendered │
+    │ search +      │ bbox overlay (the     │ via @gr.render — count   │
+    │ filter chips  │ first selected model  │ matches selected models. │
+    │ + sort        │ supplies layout)      │ Mode determines content. │
     └───────────────┴───────────────────────┴──────────────────────────┘
 
-The text pane has three modes (Single / Side-by-side / Diff); the sidebar
-and image pane each toggle independently so a user comparing many models
-can hide both and get full-bleed text. State (page, models, mode, image
-visible) persists in BrowserState; the same fields can also be supplied via
-URL query params for shareable links.
+The sidebar lists every page in the run (one row per file_id) with
+search/filter/sort. Volume-grouped sections appear when the source is
+volume-aware (BHL etc.); flat sources just get a plain list. Each row
+shows file_id plus indicators for errors, references, and disagreement.
+
+The text pane has three modes (Single / Side-by-side / Compare) and the
+image pane stays visible across all of them. State (page, models, mode,
+sort, filters) persists in BrowserState; URL query params override on
+first load.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from html import escape
 from pathlib import Path
@@ -32,8 +37,8 @@ from ocrscout.viewer.store import BaselineRow, ModelRow, PageRow, ViewerStore
 log = logging.getLogger(__name__)
 
 VIEW_MODES = ["Single", "Side-by-side", "Compare"]
-# Pseudo-model token for the page's reference baseline. Mirrors the
-# inspector's REFERENCE_PSEUDO_MODEL convention.
+SORT_CHOICES = ["file_id", "disagreement", "errors", "chars"]
+# Pseudo-model token for the page's reference baseline.
 REFERENCE_PSEUDO_MODEL = "reference"
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -52,10 +57,8 @@ def build_app(output_dir: Path) -> gr.Blocks:
     js = (STATIC_DIR / "viewer.js").read_text(encoding="utf-8")
     head = f"<script>{js}</script>"
 
-    page_choices = store.page_ids()
-    if not page_choices:
-        # Build a minimal "no data" app rather than crashing — the user can
-        # still see what they pointed at.
+    file_choices = store.file_ids()
+    if not file_choices:
         with gr.Blocks(title="ocrscout viewer") as demo:
             gr.Markdown(
                 f"### No rows in `{output_dir / 'data'}/`.\n\n"
@@ -65,10 +68,15 @@ def build_app(output_dir: Path) -> gr.Blocks:
         demo.ocrscout_head = head
         return demo
 
-    initial_page = page_choices[0]
-    initial_models = store.all_models[: min(2, len(store.all_models))]
-    initial_layout_models = store.layout_models_for(initial_page)
+    initial_file = file_choices[0]
+    # Side-by-side defaults to ALL models — user requested this so that the
+    # full set is visible by default and the user un-checks what they don't
+    # want, rather than the inverse. The CSS grid wraps responsively.
+    initial_models = list(store.all_models)
+    initial_layout_models = store.layout_models_for(initial_file)
     initial_layout_choice = initial_layout_models[0] if initial_layout_models else None
+
+    sidebar_payload = _serialize_sidebar(store)
 
     with gr.Blocks(
         title="ocrscout viewer",
@@ -77,41 +85,27 @@ def build_app(output_dir: Path) -> gr.Blocks:
     ) as demo:
 
         # ----- State -----
-        # BrowserState persists across reloads on the same browser; URL query
-        # params take precedence on first load via `demo.load(...)` below.
         browser_state = gr.BrowserState(
             {
-                "page_id": initial_page,
+                "file_id": initial_file,
                 "models": initial_models,
                 "mode": "Single",
                 "show_image": True,
+                "sidebar_collapsed": False,
+                "sort": "file_id",
+                "filter_has_error": False,
+                "filter_has_reference": False,
+                "filter_disagreement_min": 0.0,
             }
         )
-        # Stable, non-persistent state used by event handlers.
-        current_page = gr.State(initial_page)
+        current_file = gr.State(initial_file)
 
-        # ----- Top bar: three logical groups (page nav | view mode | actions)
+        # ----- Top bar: view mode + layout source + actions -----
         with gr.Row(equal_height=True):
-            # --- Group 1: page navigation (Prev / Page / Next / Sort) ---
-            with gr.Column(scale=5, elem_classes=["ocrscout-control-group"]):
-                gr.HTML('<div class="ocrscout-group-label">Page navigation</div>')
-                with gr.Row(equal_height=True):
-                    with gr.Column(scale=0, min_width=80):
-                        prev_btn = gr.Button("‹ Prev", size="sm")
-                    with gr.Column(scale=4):
-                        page_dd = gr.Dropdown(
-                            choices=page_choices,
-                            value=initial_page,
-                            label=None,
-                            show_label=False,
-                            container=False,
-                            interactive=True,
-                            allow_custom_value=False,
-                        )
-                    with gr.Column(scale=0, min_width=80):
-                        next_btn = gr.Button("Next ›", size="sm")
-
-            # --- Group 2: view mode ---
+            with gr.Column(scale=0, min_width=80):
+                prev_btn = gr.Button("‹ Prev", size="sm")
+            with gr.Column(scale=0, min_width=80):
+                next_btn = gr.Button("Next ›", size="sm")
             with gr.Column(scale=4, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">View mode</div>')
                 view_mode = gr.Radio(
@@ -122,8 +116,6 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     container=False,
                     elem_id="ocrscout-view-mode",
                 )
-
-            # --- Group 3: layout source (which model's bboxes to overlay) ---
             with gr.Column(scale=2, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">Layout source</div>')
                 layout_model_dd = gr.Dropdown(
@@ -133,21 +125,73 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     show_label=False,
                     container=False,
                 )
-
-            # --- Group 4: actions ---
             with gr.Column(scale=2, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">Actions</div>')
                 with gr.Row(equal_height=True):
+                    sidebar_toggle = gr.Button("Toggle list", size="sm")
                     image_toggle = gr.Button("Toggle image", size="sm")
                     help_btn = gr.Button("Help", size="sm")
 
-        # ----- Status strip / page summary -----
-        page_summary = gr.HTML(_render_page_summary(store, initial_page))
+        # ----- Volume / page header -----
+        page_summary = gr.HTML(_render_page_summary(store, initial_file))
 
-        # ----- Two-column body: image | text panes -----
+        # ----- Three-column body: sidebar | image | text panes -----
         with gr.Row(equal_height=False):
+
+            # --- Sidebar: searchable, sortable, filterable file list ---
             with gr.Column(
                 scale=2,
+                min_width=240,
+                visible=True,
+                elem_id="ocrscout-sidebar-col",
+                elem_classes=["ocrscout-sidebar-col"],
+            ) as sidebar_col:
+                with gr.Row(equal_height=True):
+                    sort_dd = gr.Dropdown(
+                        choices=SORT_CHOICES,
+                        value="file_id",
+                        label="Sort",
+                        interactive=True,
+                        scale=2,
+                    )
+                with gr.Row(equal_height=True):
+                    filter_err = gr.Checkbox(
+                        label="errors",
+                        value=False,
+                        scale=1,
+                    )
+                    filter_ref = gr.Checkbox(
+                        label="reference",
+                        value=False,
+                        scale=1,
+                    )
+                disagreement_slider = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=0.0,
+                    label="min disagreement",
+                )
+                # Hidden selection round-trip — the sidebar list is a
+                # plain HTML widget; clicking a row writes the file_id
+                # into this Textbox via JS, whose .change is wired to
+                # _on_file_change on the Python side.
+                sidebar_selected = gr.Textbox(
+                    value="",
+                    visible=False,
+                    elem_id="ocrscout-sidebar-selected",
+                    interactive=True,
+                )
+                # The visible list — populated client-side from
+                # sidebar_payload_state via JS render.
+                sidebar_html = gr.HTML(
+                    _initial_sidebar_html(sidebar_payload, initial_file),
+                    elem_id="ocrscout-sidebar-list",
+                    elem_classes=["ocrscout-sidebar-list"],
+                )
+
+            with gr.Column(
+                scale=3,
                 visible=True,
                 elem_id="ocrscout-image-col",
                 elem_classes=["ocrscout-image-col"],
@@ -159,18 +203,11 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     elem_id="ocrscout-annotated",
                     elem_classes=["ocrscout-annotated"],
                 )
-                # Custom dedup'd legend — Gradio's built-in legend renders
-                # one chip per annotation (so 12 "text" boxes = 12 chips).
-                # We collapse it to one chip per unique label.
                 legend_html = gr.HTML(
                     _render_legend([], store),
                     elem_classes=["ocrscout-legend"],
                 )
-            with gr.Column(scale=5):
-                # Selected models live in this State so the picker and the
-                # text pane can stay in sync even when the picker rebuilds
-                # itself between view-mode changes (radio in Single, checkbox
-                # in Side-by-side, paired dropdowns in Diff).
+            with gr.Column(scale=6):
                 models_state = gr.State(initial_models)
 
                 @gr.render(
@@ -180,20 +217,17 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 def _render_model_picker(mode: str, current: list[str]):
                     _draw_model_picker(store, mode, current, models_state)
 
-                # Re-rendered every time inputs change; column count tracks
-                # the number of selected models (or collapses to a single
-                # diff table in Diff mode).
                 @gr.render(
-                    inputs=[current_page, models_state, view_mode],
+                    inputs=[current_file, models_state, view_mode],
                     triggers=[
                         demo.load,
-                        page_dd.change,
+                        current_file.change,
                         models_state.change,
                         view_mode.change,
                     ],
                 )
-                def _render_text_pane(page_id: str, models: list[str], mode: str):
-                    _draw_text_pane(store, page_id, models, mode)
+                def _render_text_pane(file_id: str, models: list[str], mode: str):
+                    _draw_text_pane(store, file_id, models, mode)
 
         # ----- Help modal -----
         with gr.Group(visible=False) as help_box:
@@ -202,70 +236,68 @@ def build_app(output_dir: Path) -> gr.Blocks:
 
         # ----- Wiring -----
 
-        def _on_page_change(page_id: str) -> tuple:
-            summary = _render_page_summary(store, page_id)
-            layout_models = store.layout_models_for(page_id)
+        def _on_file_change(file_id: str) -> tuple:
+            summary = _render_page_summary(store, file_id)
+            layout_models = store.layout_models_for(file_id)
             layout_choice = layout_models[0] if layout_models else None
-            return page_id, summary, gr.update(
-                choices=layout_models or [""], value=layout_choice
+            return (
+                file_id,
+                summary,
+                gr.update(choices=layout_models or [""], value=layout_choice),
             )
 
-        page_dd.change(
-            _on_page_change,
-            inputs=[page_dd],
-            outputs=[current_page, page_summary, layout_model_dd],
+        sidebar_selected.change(
+            _on_file_change,
+            inputs=[sidebar_selected],
+            outputs=[current_file, page_summary, layout_model_dd],
         )
 
-        def _step(direction: int, page_id: str):
-            ids = store.page_ids()
+        def _step(direction: int, file_id: str):
+            ids = store.file_ids()
             try:
-                idx = ids.index(page_id)
+                idx = ids.index(file_id)
             except ValueError:
                 idx = 0
             new_idx = max(0, min(len(ids) - 1, idx + direction))
-            new_page = ids[new_idx]
-            layout_models = store.layout_models_for(new_page)
+            new_file = ids[new_idx]
+            layout_models = store.layout_models_for(new_file)
             layout_choice = layout_models[0] if layout_models else None
             return (
-                gr.update(value=new_page, choices=ids),
-                new_page,
-                _render_page_summary(store, new_page),
+                new_file,
+                _render_page_summary(store, new_file),
                 gr.update(choices=layout_models or [""], value=layout_choice),
+                new_file,  # write back into hidden sidebar_selected for state
             )
 
         prev_btn.click(
             lambda p: _step(-1, p),
-            inputs=[current_page],
-            outputs=[page_dd, current_page, page_summary, layout_model_dd],
+            inputs=[current_file],
+            outputs=[current_file, page_summary, layout_model_dd, sidebar_selected],
         )
         next_btn.click(
             lambda p: _step(+1, p),
-            inputs=[current_page],
-            outputs=[page_dd, current_page, page_summary, layout_model_dd],
+            inputs=[current_file],
+            outputs=[current_file, page_summary, layout_model_dd, sidebar_selected],
         )
 
-        def _on_layout_change(page_id: str, model: str | None):
-            # No layout model selected (or none exist for this page) — show
-            # the bare source image rather than clearing the pane. Without
-            # this, navigating to a layout-less page (e.g. plain markdown
-            # OCR like lighton-ocr2 or glm-ocr) blanks the source image.
+        def _on_layout_change(file_id: str, model: str | None):
             if not model:
-                img = store.image_for(page_id)
+                img = store.image_for(file_id)
                 value = (img, []) if img is not None else None
                 return value, _render_legend([], store)
-            img, anns = store.annotated_for(page_id, model)
+            img, anns = store.annotated_for(file_id, model)
             if img is None:
                 return None, _render_legend([], store)
             return (img, anns), _render_legend(anns, store)
 
         layout_model_dd.change(
             _on_layout_change,
-            inputs=[current_page, layout_model_dd],
+            inputs=[current_file, layout_model_dd],
             outputs=[annotated, legend_html],
         )
-        page_dd.change(
+        current_file.change(
             _on_layout_change,
-            inputs=[current_page, layout_model_dd],
+            inputs=[current_file, layout_model_dd],
             outputs=[annotated, legend_html],
         )
 
@@ -279,12 +311,17 @@ def build_app(output_dir: Path) -> gr.Blocks:
             outputs=[image_col, image_visible_state],
         )
 
-        # Image stays visible across all view modes; only the user's manual
-        # Toggle image button hides it.
+        sidebar_visible_state = gr.State(True)
 
-        # When the mode changes, normalize the model selection to fit the
-        # new mode's constraints so the text pane gets a usable selection
-        # without the user having to re-pick.
+        def _toggle_sidebar(visible_state: bool):
+            return gr.update(visible=not visible_state), not visible_state
+
+        sidebar_toggle.click(
+            _toggle_sidebar,
+            inputs=[sidebar_visible_state],
+            outputs=[sidebar_col, sidebar_visible_state],
+        )
+
         def _normalize_models_for_mode(mode: str, current: list[str]) -> list[str]:
             current = list(current or [])
             if mode == "Single":
@@ -293,10 +330,6 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 )
             if mode == "Compare":
                 seeded = current[:2]
-                # In Compare mode, B can be either a model or the
-                # `reference` pseudo-model. Default-seed B with reference
-                # if a baseline exists for the run; otherwise pick the
-                # next available model.
                 second_choices = (
                     [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
                 ) + [m for m in store.all_models if m not in seeded]
@@ -305,8 +338,8 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 if len(seeded) < 2 and second_choices:
                     seeded.append(second_choices[0])
                 return seeded[:2]
-            # Side-by-side: keep selection, but ensure non-empty.
-            return current or store.all_models[: min(2, len(store.all_models))]
+            # Side-by-side: default to ALL models if nothing is selected.
+            return current or list(store.all_models)
 
         view_mode.change(
             _normalize_models_for_mode,
@@ -317,33 +350,83 @@ def build_app(output_dir: Path) -> gr.Blocks:
         help_btn.click(lambda: gr.update(visible=True), outputs=[help_box])
         help_close.click(lambda: gr.update(visible=False), outputs=[help_box])
 
-        # Persist UI state to BrowserState whenever it changes.
-        def _save_state(page_id, models, mode, show_image):
+        def _save_state(
+            file_id, models, mode, show_image, sidebar_collapsed,
+            sort, has_error, has_reference, disagreement_min,
+        ):
             return {
-                "page_id": page_id,
+                "file_id": file_id,
                 "models": models,
                 "mode": mode,
                 "show_image": show_image,
+                "sidebar_collapsed": not sidebar_collapsed,
+                "sort": sort,
+                "filter_has_error": has_error,
+                "filter_has_reference": has_reference,
+                "filter_disagreement_min": float(disagreement_min or 0.0),
             }
 
         for trigger in (
-            page_dd.change,
+            current_file.change,
             models_state.change,
             view_mode.change,
             image_visible_state.change,
+            sidebar_visible_state.change,
+            sort_dd.change,
+            filter_err.change,
+            filter_ref.change,
+            disagreement_slider.change,
         ):
             trigger(
                 _save_state,
-                inputs=[current_page, models_state, view_mode, image_visible_state],
+                inputs=[
+                    current_file, models_state, view_mode,
+                    image_visible_state, sidebar_visible_state,
+                    sort_dd, filter_err, filter_ref, disagreement_slider,
+                ],
                 outputs=[browser_state],
+            )
+
+        def _refresh_sidebar(
+            sort: str, has_err: bool, has_ref: bool, min_dis: float, current: str
+        ) -> str:
+            return _render_sidebar_filtered(
+                store,
+                sort=sort,
+                has_error=has_err,
+                has_reference=has_ref,
+                disagreement_min=float(min_dis or 0.0),
+                current_file=current,
+            )
+
+        for trigger in (
+            sort_dd.change,
+            filter_err.change,
+            filter_ref.change,
+            disagreement_slider.change,
+            current_file.change,
+        ):
+            trigger(
+                _refresh_sidebar,
+                inputs=[
+                    sort_dd, filter_err, filter_ref,
+                    disagreement_slider, current_file,
+                ],
+                outputs=[sidebar_html],
             )
 
         # Initial load: read URL query params and BrowserState, settle the UI.
         def _on_load(state: dict[str, Any] | None, request: gr.Request):
             qp = dict(request.query_params) if request else {}
-            page_id = qp.get("page") or (state or {}).get("page_id") or initial_page
-            if page_id not in page_choices:
-                page_id = initial_page
+            # Accept both `?file=` (new) and `?page=` (legacy) for back-compat.
+            requested_id = (
+                qp.get("file") or qp.get("page")
+                or (state or {}).get("file_id")
+                or (state or {}).get("page_id")
+                or initial_file
+            )
+            if requested_id not in file_choices:
+                requested_id = initial_file
             mode = qp.get("mode") or (state or {}).get("mode") or "Single"
             if mode not in VIEW_MODES:
                 mode = "Single"
@@ -355,37 +438,53 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 models = (state or {}).get("models") or initial_models
             models = [m for m in models if m in store.all_models]
             if not models and store.all_models:
-                models = store.all_models[: min(2, len(store.all_models))]
-            layout_models = store.layout_models_for(page_id)
+                models = list(store.all_models)
+            sort_value = (state or {}).get("sort") or "file_id"
+            if sort_value not in SORT_CHOICES:
+                sort_value = "file_id"
+            has_err = bool((state or {}).get("filter_has_error", False))
+            has_ref = bool((state or {}).get("filter_has_reference", False))
+            disagreement_min = float(
+                (state or {}).get("filter_disagreement_min", 0.0) or 0.0
+            )
+            layout_models = store.layout_models_for(requested_id)
             layout_choice = layout_models[0] if layout_models else None
             img, anns = (
-                store.annotated_for(page_id, layout_choice)
+                store.annotated_for(requested_id, layout_choice)
                 if layout_choice
-                else (store.image_for(page_id), [])
+                else (store.image_for(requested_id), [])
             )
             return (
-                gr.update(value=page_id, choices=store.page_ids()),
-                page_id,
+                requested_id,
                 models,
                 gr.update(value=mode),
                 gr.update(choices=layout_models or [""], value=layout_choice),
-                _render_page_summary(store, page_id),
+                _render_page_summary(store, requested_id),
                 (img, anns) if img is not None else None,
                 _render_legend(anns, store),
+                gr.update(value=sort_value),
+                gr.update(value=has_err),
+                gr.update(value=has_ref),
+                gr.update(value=disagreement_min),
+                gr.update(value=requested_id),  # sidebar_selected
             )
 
         demo.load(
             _on_load,
             inputs=[browser_state],
             outputs=[
-                page_dd,
-                current_page,
+                current_file,
                 models_state,
                 view_mode,
                 layout_model_dd,
                 page_summary,
                 annotated,
                 legend_html,
+                sort_dd,
+                filter_err,
+                filter_ref,
+                disagreement_slider,
+                sidebar_selected,
             ],
         )
 
@@ -401,14 +500,6 @@ def _render_legend(
     annotations: list[tuple[tuple[int, int, int, int], str]],
     store: ViewerStore,
 ) -> str:
-    """Render a deduplicated colour legend as HTML.
-
-    Gradio's built-in AnnotatedImage legend renders one chip per annotation,
-    so 12 ``text`` boxes show as 12 chips. We collapse to one chip per
-    unique label, preserving the order in which the labels first appear.
-    Each chip's color matches ``ViewerStore.LABEL_COLORS`` (the same map
-    fed to ``AnnotatedImage.color_map``), so chips and overlays agree.
-    """
     if not annotations:
         return '<div class="ocrscout-legend-empty">no layout for this page</div>'
     seen: dict[str, int] = {}
@@ -421,18 +512,23 @@ def _render_legend(
             f'<span class="ocrscout-legend-chip" '
             f'style="--chip-color:{color}">'
             f'<span class="dot" style="background:{color}"></span>'
-            f'{escape(label)}<span class="count">×{count}</span>'
-            f'</span>'
+            f"{escape(label)}<span class=\"count\">×{count}</span>"
+            f"</span>"
         )
     return f'<div class="ocrscout-legend-row">{"".join(chips)}</div>'
 
 
-def _render_page_summary(store: ViewerStore, page_id: str) -> str:
+def _render_page_summary(store: ViewerStore, file_id: str) -> str:
+    """Top-of-page header. When the page has volume context, shows
+    ``Volume <id> · <title> (<year>) — <author>`` plus ``Page <seq> of N``;
+    otherwise just the file_id and basic stats."""
     page: PageRow | None = next(
-        (p for p in store.pages() if p.page_id == page_id), None
+        (p for p in store.pages() if p.file_id == file_id), None
     )
     if page is None:
-        return f'<div class="ocrscout-stats-strip"><span>{escape(page_id)}</span></div>'
+        return (
+            f'<div class="ocrscout-stats-strip"><span>{escape(file_id)}</span></div>'
+        )
     err_html = ""
     if page.error_models:
         err_html = (
@@ -440,30 +536,236 @@ def _render_page_summary(store: ViewerStore, page_id: str) -> str:
             + escape(", ".join(page.error_models))
             + "</span>"
         )
+
+    volume = store.volume_for(file_id)
+    volume_lines: list[str] = []
+    if volume is not None:
+        title_bits: list[str] = []
+        if volume.title:
+            title_bits.append(escape(volume.title))
+        if volume.year:
+            title_bits.append(f"({volume.year})")
+        if volume.creators:
+            authors = ", ".join(volume.creators[:3])
+            if authors:
+                title_bits.append(f"— {escape(authors)}")
+        head = (
+            f'<div class="vol-head">'
+            f'<span class="vol-id">Volume {escape(volume.volume_id)}</span>'
+            + (
+                ' · <span class="vol-title">' + " ".join(title_bits) + "</span>"
+                if title_bits else ""
+            )
+            + (
+                f' <a class="vol-link" href="{escape(volume.source_uri)}" '
+                f'target="_blank" rel="noopener">↗</a>'
+                if volume.source_uri
+                else ""
+            )
+            + "</div>"
+        )
+        volume_lines.append(head)
+        seq_str = (
+            f"Page {page.sequence}"
+            + (f" of {volume.page_count}" if volume.page_count else "")
+            if page.sequence is not None
+            else ""
+        )
+        volume_lines.append(
+            '<div class="vol-page">'
+            + (f"<span>{seq_str}</span>" if seq_str else "")
+            + f' <span class="vol-fid">{escape(file_id)}</span>'
+            + "</div>"
+        )
+
+    if volume_lines:
+        return (
+            '<div class="ocrscout-stats-strip ocrscout-volume-header">'
+            + "".join(volume_lines)
+            + '<div class="vol-meta">'
+            f'<span>models: {len(page.models)}</span>'
+            f'<span>disagreement: {page.disagreement:.2f}</span>'
+            f'<span>max chars: {page.char_count}</span>'
+            f"{err_html}"
+            "</div>"
+            "</div>"
+        )
+
     return (
         '<div class="ocrscout-stats-strip">'
-        f'<span class="name">{escape(page.page_id)}</span>'
+        f'<span class="name">{escape(page.file_id)}</span>'
         f'<span>models: {len(page.models)}</span>'
         f'<span>disagreement: {page.disagreement:.2f}</span>'
         f'<span>max chars: {page.char_count}</span>'
         f"{err_html}"
-        '</div>'
+        "</div>"
+    )
+
+
+def _serialize_sidebar(store: ViewerStore) -> str:
+    """JSON-encode the page list for the JS-rendered sidebar.
+
+    Each entry carries the file_id, volume context, indicators, and the
+    aggregate metrics needed for client-side sorting/filtering. The JS
+    side handles search and filter without round-tripping to Python.
+    """
+    pages = store.pages(sort="file_id")
+    rows: list[dict[str, Any]] = []
+    for p in pages:
+        volume = store.volume_for(p.file_id) if p.volume_id else None
+        rows.append({
+            "file_id": p.file_id,
+            "volume_id": p.volume_id,
+            "volume_title": volume.title if volume else None,
+            "volume_year": volume.year if volume else None,
+            "sequence": p.sequence,
+            "n_models": len(p.models),
+            "n_errors": len(p.error_models),
+            "has_reference": p.has_reference,
+            "disagreement": round(p.disagreement, 4),
+            "char_count": p.char_count,
+            "comparison_summary": p.comparison_summary,
+        })
+    return json.dumps({"rows": rows})
+
+
+def _initial_sidebar_html(payload: str, current_file: str) -> str:
+    """Server-side initial render of the sidebar list. The JS side takes
+    over from here and re-renders on filter/sort changes; this initial
+    render keeps the page useful before JS boots and acts as the no-JS
+    fallback."""
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        data = {"rows": []}
+    rows = data.get("rows", [])
+
+    # Group rows by volume_id when at least one row has volume metadata.
+    has_volumes = any(r.get("volume_id") for r in rows)
+    out: list[str] = ['<div class="ocrscout-sidebar-list-inner">']
+    if has_volumes:
+        groups: dict[str, list[dict[str, Any]]] = {}
+        order: list[str] = []
+        for r in rows:
+            key = r.get("volume_id") or "__flat__"
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(r)
+        for key in order:
+            group = groups[key]
+            first = group[0]
+            label = (
+                f"Volume {escape(first.get('volume_id') or '')}"
+                if first.get("volume_id") else "Pages"
+            )
+            title = first.get("volume_title")
+            n_pages = len(group)
+            n_err = sum(r.get("n_errors") or 0 for r in group)
+            avg_disagree = (
+                sum(r.get("disagreement") or 0 for r in group) / n_pages
+                if n_pages else 0.0
+            )
+            out.append(
+                f'<div class="vol-group">'
+                f'<div class="vol-group-head">'
+                f"<span>{label}</span>"
+                + (
+                    f'<span class="vol-group-title">{escape(title)}</span>'
+                    if title else ""
+                )
+                + f'<span class="vol-group-stats">'
+                f"{n_pages} · {n_err} err · {avg_disagree:.2f}"
+                "</span>"
+                "</div>"
+            )
+            for r in group:
+                out.append(_render_sidebar_row(r, r["file_id"] == current_file))
+            out.append("</div>")
+    else:
+        for r in rows:
+            out.append(_render_sidebar_row(r, r["file_id"] == current_file))
+    out.append("</div>")
+    return "".join(out)
+
+
+def _render_sidebar_filtered(
+    store: ViewerStore,
+    *,
+    sort: str,
+    has_error: bool,
+    has_reference: bool,
+    disagreement_min: float,
+    current_file: str,
+) -> str:
+    """Server-side filter+sort+render of the sidebar list. Cheap enough
+    for ~1000 pages; for larger runs we'd want to swap to JS-side rendering
+    against a streamed JSON blob (deferred)."""
+    sort_key = sort if sort in SORT_CHOICES else "file_id"
+    pages = store.pages(sort=sort_key)
+    rows: list[dict[str, Any]] = []
+    for p in pages:
+        if has_error and not p.error_models:
+            continue
+        if has_reference and not p.has_reference:
+            continue
+        if disagreement_min > 0 and p.disagreement < disagreement_min:
+            continue
+        volume = store.volume_for(p.file_id) if p.volume_id else None
+        rows.append({
+            "file_id": p.file_id,
+            "volume_id": p.volume_id,
+            "volume_title": volume.title if volume else None,
+            "volume_year": volume.year if volume else None,
+            "sequence": p.sequence,
+            "n_models": len(p.models),
+            "n_errors": len(p.error_models),
+            "has_reference": p.has_reference,
+            "disagreement": round(p.disagreement, 4),
+            "char_count": p.char_count,
+            "comparison_summary": p.comparison_summary,
+        })
+    payload = json.dumps({"rows": rows})
+    return _initial_sidebar_html(payload, current_file)
+
+
+def _render_sidebar_row(r: dict[str, Any], active: bool) -> str:
+    klass = "row" + (" active" if active else "")
+    indicators: list[str] = []
+    if r.get("n_errors"):
+        indicators.append(
+            f'<span class="ind err" title="{r["n_errors"]} model error(s)">⚠</span>'
+        )
+    if r.get("has_reference"):
+        indicators.append(
+            '<span class="ind ref" title="has reference">📄</span>'
+        )
+    disagreement = float(r.get("disagreement") or 0.0)
+    if disagreement > 0:
+        bar_pct = min(100.0, disagreement * 100)
+        indicators.append(
+            f'<span class="ind bar" title="disagreement {disagreement:.2f}">'
+            f'<span class="bar-fill" style="width:{bar_pct:.0f}%"></span>'
+            "</span>"
+        )
+    return (
+        f'<div class="{klass}" data-file-id="{escape(r["file_id"])}" '
+        f'data-disagreement="{disagreement}" '
+        f'data-has-error="{1 if r.get("n_errors") else 0}" '
+        f'data-has-ref="{1 if r.get("has_reference") else 0}">'
+        f'<span class="fid">{escape(r["file_id"])}</span>'
+        + (
+            f'<span class="ind-row">{"".join(indicators)}</span>'
+            if indicators else ""
+        )
+        + "</div>"
     )
 
 
 def _draw_model_picker(
     store: ViewerStore, mode: str, current: list[str], models_state: gr.State
 ) -> None:
-    """Emit the model-picker component appropriate to the current view mode.
-
-    * **Single**       — exactly 1 model. ``gr.Radio``.
-    * **Side-by-side** — 1..N models. ``gr.CheckboxGroup``.
-    * **Diff**         — exactly 2 models. Two paired ``gr.Dropdown`` (A vs B)
-      so the user can swap either side without thinking about checkbox order.
-
-    All variants write into ``models_state`` so downstream ``@gr.render``
-    blocks (text pane, BrowserState save) only watch one signal.
-    """
+    """Emit the model-picker component appropriate to the current view mode."""
     all_models = store.all_models
 
     if mode == "Single":
@@ -483,11 +785,6 @@ def _draw_model_picker(
         return
 
     if mode == "Compare":
-        # Compare mode pairs any two artifacts: another model, or the
-        # `reference` pseudo-token (which pulls the page's reference text
-        # via store.baselines_for()). Choices for Side B include
-        # baselines when any are registered in this run; the comparison-
-        # type dropdown filters which renderers fire.
         baseline_choices = (
             [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
         )
@@ -528,17 +825,13 @@ def _draw_model_picker(
         dd_b.change(_compare_pair, inputs=[dd_a, dd_b], outputs=[models_state])
         return
 
-    # Side-by-side: free multi-select. Include `reference` as a checkable
-    # column when the run has baselines — it's a parallel text source the
-    # user is likely to want next to the model outputs even though it's
-    # not itself a model. It's still typed as a BaselineRow under the
-    # hood; only the picker UX treats it as another stream.
+    # Side-by-side: free multi-select. All models default-checked per user
+    # request. The grid CSS wraps responsively so 8 panes flow into multiple
+    # rows on a narrow viewport.
     sidebyside_choices = list(all_models) + (
         [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
     )
-    seeded = list(current) if current else (
-        sidebyside_choices[: min(2, len(sidebyside_choices))]
-    )
+    seeded = list(current) if current else list(sidebyside_choices)
     cg = gr.CheckboxGroup(
         choices=sidebyside_choices,
         value=seeded,
@@ -554,40 +847,29 @@ def _draw_model_picker(
 
 
 def _draw_text_pane(
-    store: ViewerStore, page_id: str, models: list[str], mode: str
+    store: ViewerStore, file_id: str, models: list[str], mode: str
 ) -> None:
-    """Body of @gr.render — emits the right component tree for the current mode.
-
-    Called inside Gradio's render context, so it must construct components
-    rather than return values.
-    """
+    """Body of @gr.render — emits the right component tree for the current mode."""
     if not models:
         gr.Markdown("_Pick at least one model._")
         return
 
-    # Compare mode does its own validation and dispatches via the
-    # comparisons registry; it can handle `reference` directly via
-    # store.baselines_for(). Skip the columns-build below.
     if mode == "Compare":
-        _draw_compare_pane(store, page_id, models)
+        _draw_compare_pane(store, file_id, models)
         return
 
-    # Build the list of columns to render. Order follows the user's
-    # selection. Each entry is either a ModelRow (an OCR model output for
-    # this page) or a BaselineRow (the page's reference, surfaced when the
-    # user ticked the `reference` box).
     columns: list[tuple[str, ModelRow | BaselineRow]] = []
     for m in models:
         if m == REFERENCE_PSEUDO_MODEL:
-            baselines = store.baselines_for(page_id)
+            baselines = store.baselines_for(file_id)
             if baselines:
                 columns.append((m, baselines[0]))
         else:
-            r = store.get(page_id, m)
+            r = store.get(file_id, m)
             if r is not None:
                 columns.append((m, r))
     if not columns:
-        gr.Markdown(f"_No content for page `{page_id}` with the current selection._")
+        gr.Markdown(f"_No content for `{escape(file_id)}` with the current selection._")
         return
 
     if mode == "Single":
@@ -600,58 +882,32 @@ def _draw_text_pane(
             _emit_text_body(row, store, use_structured=_has_structure(row))
         return
 
-    # Side-by-side: one column per selected artifact (caps at 5).
-    n = len(columns)
-    capped = columns[:5]
-    if n > 5:
-        gr.Markdown(
-            f"_{n} columns selected — showing first 5. Deselect some to see "
-            "the rest._"
-        )
-    # Color-coded sections only when *every* visible row has layout — mixing
-    # structured and plain panes side-by-side reads inconsistently. References
-    # never have layout, so a Side-by-side that includes one always falls
-    # back to plain markdown across the board.
+    # Side-by-side: one column per selected artifact. No hard cap; CSS grid
+    # handles wrapping when there are many panes.
     all_structured = all(
         isinstance(row, ModelRow) and _has_structure(row)
-        for _, row in capped
+        for _, row in columns
     )
-    with gr.Row(equal_height=False):
-        for _label, row in capped:
-            with gr.Column(scale=1, min_width=200):
+    gr.HTML('<div class="ocrscout-side-by-side-grid">')
+    with gr.Row(equal_height=False, elem_classes=["ocrscout-sbs-row"]):
+        for _label, row in columns:
+            with gr.Column(scale=1, min_width=320):
                 if isinstance(row, BaselineRow):
                     _emit_baseline_stats_strip(row)
                     _emit_baseline_text_body(row)
                 else:
                     _emit_stats_strip(row)
                     _emit_text_body(row, store, use_structured=all_structured)
+    gr.HTML("</div>")
 
 
 def _has_structure(row: ModelRow) -> bool:
-    """Does this row carry true layout structure worth color-coding?
-
-    True iff the model emitted at least one bbox — i.e. the section labels
-    are backed by actual region detection rather than textual heuristics
-    (the markdown normalizer assigns ``title``/``section_header``/``table``
-    purely from ``#`` and ``<table>`` patterns; those labels exist but
-    describe text shape, not detected layout). Color-coded section blocks
-    would imply layout when none was performed, so we fall back to plain
-    markdown for those rows.
-    """
     return len(row.bboxes) > 0
 
 
 def _draw_compare_pane(
-    store: ViewerStore, page_id: str, models: list[str]
+    store: ViewerStore, file_id: str, models: list[str]
 ) -> None:
-    """Compare-mode rendering: build typed views for the two selected
-    artifacts, run every registered comparison whose ``requires`` set is
-    satisfiable, and dispatch each result through its registered renderer.
-
-    Stacks all firing comparisons vertically so a layout-comparison and a
-    text-comparison can both surface side-by-side without a separate UI
-    toggle. Renderers that can't handle the result type silently degrade.
-    """
     if len(models) < 2:
         gr.Markdown(
             "_Compare needs two artifacts. Pick a Prediction and a Baseline._"
@@ -664,12 +920,12 @@ def _draw_compare_pane(
         )
         return
 
-    pred = _build_compare_view(store, page_id, a_label, kind="prediction")
-    base = _build_compare_view(store, page_id, b_label, kind="baseline")
+    pred = _build_compare_view(store, file_id, a_label, kind="prediction")
+    base = _build_compare_view(store, file_id, b_label, kind="baseline")
     if pred is None or base is None:
         gr.Markdown(
             f"_Cannot build comparison views for "
-            f"`{escape(a_label)}` vs `{escape(b_label)}` on page `{escape(page_id)}`._"
+            f"`{escape(a_label)}` vs `{escape(b_label)}` on `{escape(file_id)}`._"
         )
         return
 
@@ -686,7 +942,7 @@ def _draw_compare_pane(
         gr.HTML(
             '<div class="ocrscout-stats-strip">'
             f'<span class="name">{escape(a_label)} vs '
-            f'{escape(b_label)}{escape(prov_label)}</span>'
+            f"{escape(b_label)}{escape(prov_label)}</span>"
             "</div>"
         )
 
@@ -724,35 +980,32 @@ def _draw_compare_pane(
 
 
 def _build_compare_view(
-    store: ViewerStore, page_id: str, label: str, *, kind: str
+    store: ViewerStore, file_id: str, label: str, *, kind: str
 ) -> PredictionView | BaselineView | None:
-    """Translate a label (model name or `reference` pseudo-token) into the
-    appropriate Pydantic view object for one side of a comparison.
-    """
     if label == REFERENCE_PSEUDO_MODEL:
-        baselines = store.baselines_for(page_id)
+        baselines = store.baselines_for(file_id)
         if not baselines:
             return None
         bl = baselines[0]
         if kind == "baseline":
             return BaselineView(
-                page_id=page_id,
+                page_id=file_id,
                 label=bl.label,
                 text=bl.text,
                 provenance=bl.provenance,
             )
-        return PredictionView(page_id=page_id, label=bl.label, text=bl.text)
-    row = store.get(page_id, label)
+        return PredictionView(page_id=file_id, label=bl.label, text=bl.text)
+    row = store.get(file_id, label)
     if row is None:
         return None
     document = _document_from_row(row)
     text = row.text or row.markdown
     if kind == "baseline":
         return BaselineView(
-            page_id=page_id, label=label, text=text, document=document,
+            page_id=file_id, label=label, text=text, document=document,
         )
     return PredictionView(
-        page_id=page_id, label=label, text=text, document=document,
+        page_id=file_id, label=label, text=text, document=document,
     )
 
 
@@ -772,15 +1025,6 @@ def _document_from_row(row: ModelRow) -> Any:
 def _emit_text_body(
     row: ModelRow, store: ViewerStore, *, use_structured: bool
 ) -> None:
-    """Render the model's text content for Single / Side-by-side modes.
-
-    When ``use_structured`` is True (Single mode for a layout-aware model,
-    or Side-by-side where *all* selected models have layout), render an
-    HTML body where each item is a left-bordered block colored to match the
-    bbox legend. Otherwise fall back to the flat markdown export — also the
-    fallback when even one selected model lacks layout, since mixing
-    structured and plain panes side-by-side reads inconsistently.
-    """
     if not use_structured or not row.items:
         gr.Markdown(
             row.markdown or "_(empty)_",
@@ -790,10 +1034,6 @@ def _emit_text_body(
     parts = ['<div class="ocrscout-markdown-pane ocrscout-structured">']
     for item in row.items:
         color = store.LABEL_COLORS.get(item.label, "#888")
-        # ``item.html`` is pre-rendered HTML (currently TableItems via
-        # TableItem.export_to_html) — docling-core escapes cell content,
-        # so it's safe to embed raw and the browser renders a real
-        # <table>. Otherwise fall through to the plain-text escape path.
         body_html = item.html or escape(item.text or "").replace("\n", "<br>")
         parts.append(
             f'<div class="ocrscout-section" '
@@ -801,9 +1041,9 @@ def _emit_text_body(
             f'style="--section-color:{color}">'
             f'<span class="ocrscout-section-tag">{escape(item.label)}</span>'
             f'<div class="ocrscout-section-text">{body_html}</div>'
-            f'</div>'
+            f"</div>"
         )
-    parts.append('</div>')
+    parts.append("</div>")
     gr.HTML("".join(parts))
 
 
@@ -828,11 +1068,6 @@ def _emit_stats_strip(row: ModelRow) -> None:
 
 
 def _emit_baseline_stats_strip(baseline: BaselineRow) -> None:
-    """Stats strip for a reference column. Different shape from a model
-    row's strip — references have no run-time metrics or DoclingDocument
-    items, but their provenance is load-bearing context (the comparison
-    numbers downstream mean very different things if the baseline is
-    legacy OCR vs human transcription)."""
     chars = len(baseline.text)
     prov = baseline.provenance
     prov_bits: list[str] = []
@@ -857,8 +1092,6 @@ def _emit_baseline_stats_strip(baseline: BaselineRow) -> None:
 
 
 def _emit_baseline_text_body(baseline: BaselineRow) -> None:
-    """Render a reference baseline's text. References never have layout
-    structure, so we always fall through to plain markdown."""
     gr.Markdown(
         baseline.text or "_(empty)_",
         elem_classes=["ocrscout-markdown-pane", "ocrscout-baseline-pane"],
@@ -872,20 +1105,27 @@ _HELP_HTML = """
   <dt>j / k</dt><dd>Next / previous page</dd>
   <dt>1 / 2 / 3</dt><dd>Switch to Single / Side-by-side / Compare mode</dd>
   <dt>i</dt><dd>Toggle the image pane</dd>
+  <dt>/</dt><dd>Focus the sidebar search</dd>
   <dt>?</dt><dd>Show this help</dd>
 </dl>
 <h3>View modes</h3>
 <dl>
   <dt>Single</dt><dd>One model, full markdown — for reading.</dd>
-  <dt>Side-by-side</dt><dd>One column per selected model (caps at 5).
-    Synchronized scroll across columns.</dd>
+  <dt>Side-by-side</dt><dd>One column per selected model. All models
+    selected by default; uncheck to narrow. The grid wraps responsively
+    so 8 panes flow into multiple rows on narrow viewports.</dd>
   <dt>Compare</dt><dd>Run text / document / layout comparisons between any
     two artifacts. Side B can be a model or the page's <code>reference</code>
     baseline (with provenance shown). Stacks every comparison whose
     required modality is satisfied.</dd>
 </dl>
+<h3>Sidebar</h3>
+<p>Search by file_id or volume title. Use the filter checkboxes to show
+only pages with errors or references. The slider raises the disagreement
+floor (handy for finding pages where models diverge most). Sort by
+file_id, disagreement (most-divergent first), errors, or output volume.</p>
 <h3>URL parameters</h3>
-<p>Append <code>?page=...&amp;models=a,b&amp;mode=Compare</code> to share a
+<p>Append <code>?file=...&amp;models=a,b&amp;mode=Compare</code> to share a
 specific view.</p>
 </div>
 """

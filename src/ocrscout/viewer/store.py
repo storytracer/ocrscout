@@ -18,9 +18,14 @@ from typing import Any, ClassVar
 
 from PIL import Image
 
-from ocrscout.exports.layout import find_parquet_files, parquet_data_files
+from ocrscout.exports.layout import (
+    find_parquet_files,
+    find_volumes_files,
+    parquet_data_files,
+    volumes_data_files,
+)
 from ocrscout.interfaces.comparison import ComparisonResult
-from ocrscout.types import ReferenceProvenance
+from ocrscout.types import ReferenceProvenance, Volume
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +60,7 @@ class TextItem:
 class ModelRow:
     """One (page, model) record materialized for the viewer."""
 
+    file_id: str
     page_id: str
     model: str
     output_format: str
@@ -82,7 +88,7 @@ class BaselineRow:
     rather than accuracy-vs-truth.
     """
 
-    page_id: str
+    file_id: str
     label: str  # "reference" by default; multiple baselines could differentiate later
     text: str
     provenance: ReferenceProvenance | None = None
@@ -90,14 +96,25 @@ class BaselineRow:
 
 @dataclass
 class PageRow:
-    """One page summary, aggregated across all models that touched it."""
+    """One page summary, aggregated across all models that touched it.
 
+    ``file_id`` is the user-facing canonical identifier (``volume_id/filename``
+    for volume sources, ``parent_dir/filename`` for flat sources). ``page_id``
+    is the source-side raw id (BHL's PageID, etc.) — kept around for
+    debugging and source-side lookups but not surfaced in the viewer UI.
+    """
+
+    file_id: str
     page_id: str
+    volume_id: str | None
+    sequence: int | None
     source_uri: str | None
     models: list[str]
     error_models: list[str]
+    has_reference: bool
     disagreement: float  # 0..1, mean pairwise word-diff distance (lower = agreement)
     char_count: int  # max chars across the present models, for sorting by output volume
+    comparison_summary: dict[str, float] = field(default_factory=dict)
 
 
 class ViewerStore:
@@ -132,48 +149,58 @@ class ViewerStore:
                 "ocrscout dataset repo)."
             )
         self._rows: list[dict[str, Any]] = self._load_rows(output_dir)
-        self._by_page_model: dict[tuple[str, str], dict[str, Any]] = {
-            (r["page_id"], r["model"]): r for r in self._rows
+        self._by_file_model: dict[tuple[str, str], dict[str, Any]] = {
+            (r["file_id"], r["model"]): r for r in self._rows
         }
         self.all_models: list[str] = sorted({r["model"] for r in self._rows})
+        self._volumes: dict[str, Volume] = self._load_volumes(output_dir)
         self._pages: list[PageRow] = self._build_page_index()
         log.info(
-            "viewer: loaded %d rows across %d pages × %d models from %s",
+            "viewer: loaded %d rows across %d pages × %d models from %s%s",
             len(self._rows), len(self._pages), len(self.all_models),
             ", ".join(str(p.relative_to(output_dir)) for p in shards),
+            f" (+{len(self._volumes)} volume(s))" if self._volumes else "",
         )
 
     # ------------------------------------------------------------------ public
 
-    def pages(self, *, sort: str = "page_id") -> list[PageRow]:
+    def pages(self, *, sort: str = "file_id") -> list[PageRow]:
         """Return all pages.
 
-        Default ordering is alphabetical by ``page_id``, which is predictable
+        Default ordering is alphabetical by ``file_id``, which is predictable
         and stable across runs. Pass ``sort="parquet"`` to keep the order in
         which rows appeared in the parquet shards (whatever the source
-        adapter emitted).
+        adapter emitted), ``"chars"`` to sort by output volume,
+        ``"errors"`` to surface failed pages first, or any other value for
+        the disagreement-desc default.
         """
         if sort == "parquet":
             return list(self._pages)
         pages = list(self._pages)
-        if sort == "page_id":
-            pages.sort(key=lambda p: p.page_id)
+        if sort == "file_id":
+            pages.sort(key=lambda p: p.file_id)
         elif sort == "chars":
             pages.sort(key=lambda p: -p.char_count)
+        elif sort == "errors":
+            pages.sort(key=lambda p: (-len(p.error_models), p.file_id))
         else:
-            pages.sort(key=lambda p: (-p.disagreement, p.page_id))
+            pages.sort(key=lambda p: (-p.disagreement, p.file_id))
         return pages
 
-    def page_ids(self, *, sort: str = "page_id") -> list[str]:
-        return [p.page_id for p in self.pages(sort=sort)]
+    def file_ids(self, *, sort: str = "file_id") -> list[str]:
+        return [p.file_id for p in self.pages(sort=sort)]
 
-    def models_for(self, page_id: str) -> list[str]:
+    # Back-compat alias — older app.py code path.
+    def page_ids(self, *, sort: str = "file_id") -> list[str]:
+        return self.file_ids(sort=sort)
+
+    def models_for(self, file_id: str) -> list[str]:
         """All models that produced a row for this page (alphabetical)."""
         return sorted(
-            m for (pid, m) in self._by_page_model if pid == page_id
+            m for (fid, m) in self._by_file_model if fid == file_id
         )
 
-    def layout_models_for(self, page_id: str) -> list[str]:
+    def layout_models_for(self, file_id: str) -> list[str]:
         """Models that produced layout bboxes for this page (alphabetical).
 
         Used by the viewer's Layout source dropdown so the user can only
@@ -182,22 +209,23 @@ class ViewerStore:
         out — picking one of them would just show an empty overlay.
         """
         out: list[str] = []
-        for model in self.models_for(page_id):
-            row = self._by_page_model.get((page_id, model))
+        for model in self.models_for(file_id):
+            row = self._by_file_model.get((file_id, model))
             if row is None:
                 continue
             if self._bboxes_for(row):
                 out.append(model)
         return out
 
-    def get(self, page_id: str, model: str) -> ModelRow | None:
-        raw = self._by_page_model.get((page_id, model))
+    def get(self, file_id: str, model: str) -> ModelRow | None:
+        raw = self._by_file_model.get((file_id, model))
         if raw is None:
             return None
         markdown = self._markdown_for(raw)
         bboxes = self._bboxes_for(raw)
         items = self._text_items_for(raw)
         return ModelRow(
+            file_id=raw["file_id"],
             page_id=raw["page_id"],
             model=raw["model"],
             output_format=raw["output_format"],
@@ -211,7 +239,7 @@ class ViewerStore:
             comparisons=self._comparisons_for(raw),
         )
 
-    def baselines_for(self, page_id: str) -> list[BaselineRow]:
+    def baselines_for(self, file_id: str) -> list[BaselineRow]:
         """Return all reference-style baselines registered for the page.
 
         Today the run loop only ever wires up a single reference adapter,
@@ -221,7 +249,7 @@ class ViewerStore:
         Compare panel will show all of them.
         """
         for raw in self._rows:
-            if raw["page_id"] != page_id:
+            if raw["file_id"] != file_id:
                 continue
             text = raw.get("reference_text")
             if not text:
@@ -229,7 +257,7 @@ class ViewerStore:
             provenance = _parse_provenance(raw.get("reference_provenance_json"))
             return [
                 BaselineRow(
-                    page_id=page_id,
+                    file_id=file_id,
                     label="reference",
                     text=text,
                     provenance=provenance,
@@ -240,8 +268,21 @@ class ViewerStore:
     def has_any_baseline(self) -> bool:
         return any(r.get("reference_text") for r in self._rows)
 
-    def image_for(self, page_id: str) -> Image.Image | None:
-        """Return the PIL image for ``page_id``, or None.
+    def volume_for(self, file_id: str) -> Volume | None:
+        """Return the ``Volume`` (loaded from ``volumes-*.parquet``) backing
+        this page, or ``None`` if the source has no volume concept or the
+        sidecar wasn't written.
+        """
+        raw = next((r for r in self._rows if r["file_id"] == file_id), None)
+        if raw is None:
+            return None
+        vid = raw.get("volume_id")
+        if not vid:
+            return None
+        return self._volumes.get(str(vid))
+
+    def image_for(self, file_id: str) -> Image.Image | None:
+        """Return the PIL image for ``file_id``, or None.
 
         Resolution order:
 
@@ -254,7 +295,7 @@ class ViewerStore:
 
         Returns ``None`` for pages with neither.
         """
-        raw = next((r for r in self._rows if r["page_id"] == page_id), None)
+        raw = next((r for r in self._rows if r["file_id"] == file_id), None)
         if raw is None:
             return None
         img_bytes = raw.get("image_bytes")
@@ -272,15 +313,15 @@ class ViewerStore:
         return _load_image_cached(src)
 
     def annotated_for(
-        self, page_id: str, model: str
+        self, file_id: str, model: str
     ) -> tuple[Image.Image | None, list[tuple[tuple[int, int, int, int], str]]]:
         """Return the source image plus per-item ``((x1,y1,x2,y2), label)`` tuples.
 
         Coords come from the model's ``ProvenanceItem.bbox`` in pixel space.
         Empty list if the model has no layout data.
         """
-        img = self.image_for(page_id)
-        row = self.get(page_id, model)
+        img = self.image_for(file_id)
+        row = self.get(file_id, model)
         if row is None or img is None:
             return img, []
         annotations: list[tuple[tuple[int, int, int, int], str]] = []
@@ -328,11 +369,17 @@ class ViewerStore:
                 payload = raw.get("image")
                 if isinstance(payload, dict):
                     image_bytes = payload.get("bytes")
+            # Older parquets predate the file_id column — fall back to
+            # page_id so the viewer keeps working without rewrites.
+            file_id = raw.get("file_id") or raw["page_id"]
             out.append(
                 {
+                    "file_id": file_id,
                     "page_id": raw["page_id"],
                     "model": raw["model"],
                     "source_uri": raw.get("source_uri"),
+                    "volume_id": raw.get("volume_id"),
+                    "sequence": raw.get("sequence"),
                     "output_format": raw.get("output_format"),
                     "document_json": raw.get("document_json"),
                     "markdown": raw.get("markdown"),
@@ -347,12 +394,61 @@ class ViewerStore:
             )
         return out
 
+    def _load_volumes(self, output_dir: Path) -> dict[str, Volume]:
+        """Load the ``volumes-*.parquet`` sidecar (when present) into a map.
+
+        Sources without a volume concept (hf_dataset over a flat folder)
+        don't write this sidecar; we just return an empty map and the
+        viewer renders without volume context.
+        """
+        shards = find_volumes_files(output_dir)
+        if not shards:
+            return {}
+        try:
+            from datasets import load_dataset
+        except ImportError:
+            return {}
+        try:
+            ds = load_dataset(
+                "parquet",
+                data_files=volumes_data_files(output_dir),
+                split="train",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("viewer: failed to load volumes sidecar: %s", e)
+            return {}
+        out: dict[str, Volume] = {}
+        for raw in ds:
+            vid = raw.get("volume_id")
+            if not vid:
+                continue
+            try:
+                creators = json.loads(raw.get("creators_json") or "[]")
+            except json.JSONDecodeError:
+                creators = []
+            try:
+                extra = json.loads(raw.get("extra_json") or "{}")
+            except json.JSONDecodeError:
+                extra = {}
+            out[str(vid)] = Volume(
+                volume_id=str(vid),
+                title=raw.get("title"),
+                creators=creators if isinstance(creators, list) else [],
+                language=raw.get("language"),
+                year=raw.get("year"),
+                rights=raw.get("rights"),
+                page_count=raw.get("page_count"),
+                source_uri=raw.get("source_uri"),
+                extra=extra if isinstance(extra, dict) else {},
+            )
+        return out
+
     def _build_page_index(self) -> list[PageRow]:
-        by_page: dict[str, list[dict[str, Any]]] = {}
+        by_file: dict[str, list[dict[str, Any]]] = {}
         for r in self._rows:
-            by_page.setdefault(r["page_id"], []).append(r)
+            by_file.setdefault(r["file_id"], []).append(r)
         pages: list[PageRow] = []
-        for page_id, rows in by_page.items():
+        for file_id, rows in by_file.items():
             rows.sort(key=lambda r: r["model"])
             present = [r["model"] for r in rows]
             errors = [r["model"] for r in rows if r["error"]]
@@ -361,16 +457,31 @@ class ViewerStore:
                 default=0,
             )
             disagreement = self._page_disagreement(rows)
+            page_id = rows[0].get("page_id") or file_id
+            volume_id = next(
+                (r.get("volume_id") for r in rows if r.get("volume_id")), None
+            )
+            sequence = next(
+                (r.get("sequence") for r in rows if r.get("sequence") is not None),
+                None,
+            )
+            has_reference = any(r.get("reference_text") for r in rows)
+            comparison_summary = _aggregate_comparison_summary(rows)
             pages.append(
                 PageRow(
-                    page_id=page_id,
+                    file_id=file_id,
+                    page_id=str(page_id),
+                    volume_id=str(volume_id) if volume_id else None,
+                    sequence=int(sequence) if sequence is not None else None,
                     source_uri=next(
                         (r["source_uri"] for r in rows if r.get("source_uri")), None
                     ),
                     models=present,
                     error_models=errors,
+                    has_reference=has_reference,
                     disagreement=disagreement,
                     char_count=chars,
+                    comparison_summary=comparison_summary,
                 )
             )
         return pages
@@ -523,6 +634,48 @@ class ViewerStore:
             except Exception:  # noqa: BLE001
                 continue
         return out
+
+
+def _aggregate_comparison_summary(rows: list[dict[str, Any]]) -> dict[str, float]:
+    """Lift ``comparisons[*].summary`` keys onto a flat per-page dict.
+
+    Used by the sidebar to surface comparison metrics (text_similarity,
+    layout_iou_mean, …) as row indicators without re-running comparisons
+    at view time. When multiple models on the same page each carry their
+    own summary, we keep the max similarity / min CER / max IoU — the
+    "best agreement with the reference" reading, which matches what the
+    user wants to scan for. Pages without comparisons get ``{}``.
+    """
+    out: dict[str, float] = {}
+    for r in rows:
+        raw = r.get("comparisons_json")
+        if not raw:
+            continue
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(envelope, dict):
+            continue
+        for cmp_name, payload in envelope.items():
+            if not isinstance(payload, dict):
+                continue
+            summary = payload.get("summary") or {}
+            if not isinstance(summary, dict):
+                continue
+            for key, val in summary.items():
+                if not isinstance(val, (int, float)):
+                    continue
+                flat = f"{cmp_name}_{key}"
+                # Aggregate: keep max for similarity/IoU-style "higher is
+                # better" metrics; min for error-rate metrics.
+                if "cer" in flat or "wer" in flat or "delta" in flat:
+                    cur = out.get(flat)
+                    out[flat] = float(val) if cur is None else min(cur, float(val))
+                else:
+                    cur = out.get(flat)
+                    out[flat] = float(val) if cur is None else max(cur, float(val))
+    return out
 
 
 def _parse_provenance(raw: str | None) -> ReferenceProvenance | None:

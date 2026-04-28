@@ -40,7 +40,7 @@ class ModelStats:
 class PageDisagreement:
     """Per-page summary used for "most divergent pages" tables."""
 
-    page_id: str
+    file_id: str
     disagreement: float
     n_models: int
 
@@ -115,16 +115,21 @@ def aggregate_per_model(rows: list[dict[str, Any]]) -> list[ModelStats]:
     return out
 
 
+def _row_file_id(r: dict[str, Any]) -> str:
+    """Return the row's file_id, falling back to page_id for older parquets."""
+    return r.get("file_id") or r["page_id"]
+
+
 def page_disagreements(rows: list[dict[str, Any]]) -> list[PageDisagreement]:
     """One :class:`PageDisagreement` per page across the run."""
     by_page: dict[str, list[dict[str, Any]]] = {}
     for r in rows:
-        by_page.setdefault(r["page_id"], []).append(r)
+        by_page.setdefault(_row_file_id(r), []).append(r)
     out: list[PageDisagreement] = []
-    for page_id, group in by_page.items():
+    for file_id, group in by_page.items():
         out.append(
             PageDisagreement(
-                page_id=page_id,
+                file_id=file_id,
                 disagreement=compute_page_disagreement(group),
                 n_models=len({r.get("model") for r in group if r.get("model")}),
             )
@@ -137,17 +142,17 @@ def top_disagreement_pages(
 ) -> list[PageDisagreement]:
     """Top-``k`` pages by disagreement, descending. Multi-model pages only."""
     pds = [pd for pd in page_disagreements(rows) if pd.n_models >= 2]
-    pds.sort(key=lambda pd: (-pd.disagreement, pd.page_id))
+    pds.sort(key=lambda pd: (-pd.disagreement, pd.file_id))
     return pds[:k]
 
 
 def overall_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """High-level run summary used at the top of the dataset card."""
-    pages = sorted({r["page_id"] for r in rows})
+    pages = sorted({_row_file_id(r) for r in rows})
     models = sorted({m for m in (r.get("model") for r in rows) if m})
     pds = page_disagreements(rows)
     multi = [pd for pd in pds if pd.n_models >= 2]
-    pages_with_errors = {r["page_id"] for r in rows if r.get("error")}
+    pages_with_errors = {_row_file_id(r) for r in rows if r.get("error")}
     return {
         "n_pages": len(pages),
         "n_models": len(models),

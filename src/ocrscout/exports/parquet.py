@@ -126,6 +126,7 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
             )
 
     return {
+        "file_id": record.page.file_id,
         "page_id": record.page.page_id,
         "model": record.model,
         "source_uri": record.page.source_uri,

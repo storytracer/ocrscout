@@ -223,7 +223,7 @@ def _render_top_disagreement_table(pages: list[PageDisagreement]) -> str:
     out.append("| --- | ---: | ---: |")
     for pd in pages:
         out.append(
-            f"| {_md_escape(pd.page_id)} | {pd.n_models} | "
+            f"| {_md_escape(pd.file_id)} | {pd.n_models} | "
             f"{_fmt_pct(pd.disagreement)} |"
         )
     return "\n".join(out) + "\n"
@@ -245,7 +245,10 @@ def _render_schema_section(has_image_column: bool) -> str:
         "Each row in `data/train-*.parquet` is one `(page, model)` pair.\n\n"
         "| Column | Type | Notes |\n"
         "| --- | --- | --- |\n"
-        "| `page_id` | string | Stable id from the source adapter. |\n"
+        "| `file_id` | string | Globally-unique human identifier. `volume_id/filename` for volume sources, `parent_dir/filename` for flat sources. |\n"
+        "| `page_id` | string | Source-side raw id (e.g. BHL's PageID). Used by the run loop and reference adapters. |\n"
+        "| `volume_id` | string | Source-side volume id (BHL ItemID, IA item, …). Joins to `volumes-NNNNN.parquet`. |\n"
+        "| `sequence` | int | Page index within its volume, when applicable. |\n"
         "| `model` | string | ocrscout profile name. |\n"
         "| `source_uri` | string | Original image path or URL (provenance). |\n"
     )
@@ -273,7 +276,7 @@ def _render_usage_section(repo_id: str) -> str:
         "```python\n"
         "from datasets import load_dataset\n"
         f'ds = load_dataset("{repo_id}", split="train")\n'
-        'print(ds[0]["page_id"], ds[0]["model"])\n'
+        'print(ds[0]["file_id"], ds[0]["model"])\n'
         "```\n\n"
         "**Browse with the ocrscout viewer:**\n\n"
         "```bash\n"

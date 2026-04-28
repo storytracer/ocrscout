@@ -331,6 +331,7 @@ def _iter_rows_for_stats(ds: Dataset) -> list[dict[str, Any]]:
     (which would otherwise decode a PIL.Image per row).
     """
     keep = {
+        "file_id",
         "page_id",
         "model",
         "output_format",

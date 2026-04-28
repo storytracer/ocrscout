@@ -24,6 +24,13 @@ class PageImage(BaseModel):
     ``image`` is the live PIL.Image and is intentionally not serialized — it is
     runtime state. Use ``source_uri`` to recover the source if needed.
 
+    ``page_id`` is the source-side raw identifier (BHL's PageID, an HF row id,
+    a filename stem) used as the join key by the run loop, backends, and
+    reference adapters. ``file_id`` is the human-facing canonical identifier
+    surfaced by viewer/inspect/publish: ``{volume_id}/{filename.ext}`` for
+    volume sources, ``{parent_dir}/{filename.ext}`` for flat folder/URL/Hub
+    sources. file_id is globally unique within a run.
+
     ``volume_id`` joins to ``Volume.volume_id`` for sources that group pages
     into bibliographic units (BHL items, IA items, HathiTrust volumes, IIIF
     manifests). It stays ``None`` for flat sources like ``hf_dataset``.
@@ -32,6 +39,7 @@ class PageImage(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     page_id: str
+    file_id: str
     image: Any  # PIL.Image.Image at runtime
     width: int
     height: int

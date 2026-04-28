@@ -223,8 +223,10 @@ class BhlSourceAdapter(SourceAdapter):
             log.warning("BHL image fetch/decode failed for %s: %s", url, e)
             return None
         width, height = image.size
+        filename = f"{bar_code_s}_{sequence:04d}.jp2"
         return PageImage(
             page_id=str(page_id),
+            file_id=f"{item_id}/{filename}",
             image=image,
             width=width,
             height=height,

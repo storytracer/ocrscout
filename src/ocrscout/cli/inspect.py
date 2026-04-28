@@ -43,8 +43,8 @@ def inspect(
     ),
     page: str | None = typer.Option(
         None, "--page", "-p",
-        help="Show the full per-model markdown for one page_id instead of "
-             "the summary table.",
+        help="Show the full per-model markdown for one file_id (or page_id, "
+             "for older runs) instead of the summary table.",
     ),
     compare: str | None = typer.Option(
         None, "--compare",
@@ -86,7 +86,7 @@ def inspect(
 
     if compare is not None:
         if page is None:
-            rprint("[red]--compare requires --page <page_id>[/red]")
+            rprint("[red]--compare requires --page <file_id>[/red]")
             raise typer.Exit(code=1)
         parts = [s.strip() for s in compare.split(",") if s.strip()]
         if len(parts) != 2:
@@ -135,7 +135,11 @@ def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
             metrics = json.loads(metrics_raw) if metrics_raw else {}
         except json.JSONDecodeError:
             metrics = {}
+        # Older parquets predate the file_id column — fall back to page_id
+        # so existing runs still inspect cleanly.
+        file_id = raw.get("file_id") or raw["page_id"]
         out.append({
+            "file_id": file_id,
             "page_id": raw["page_id"],
             "model": raw["model"],
             "source_uri": raw.get("source_uri"),
@@ -174,7 +178,7 @@ _FLAT_COLUMN_HEADERS: dict[str, str] = {
 
 
 def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
-    rows_sorted = sorted(rows, key=lambda r: (r["page_id"], r["model"]))
+    rows_sorted = sorted(rows, key=lambda r: (r["file_id"], r["model"]))
 
     # Only show comparison columns that have at least one non-null value.
     active_flat = [
@@ -183,7 +187,7 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
     ]
 
     table = Table(title="ocrscout inspect — per-(page, model) summary")
-    table.add_column("page_id", style="bold")
+    table.add_column("file_id", style="bold")
     table.add_column("model")
     table.add_column("items", justify="right")
     table.add_column("chars", justify="right")
@@ -192,7 +196,7 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
         table.add_column(_FLAT_COLUMN_HEADERS[col], justify="right")
     table.add_column("snippet", overflow="fold")
 
-    last_page: str | None = None
+    last_file: str | None = None
     for r in rows_sorted:
         m = r["metrics"]
         items = _fmt_int(m.get("item_count"))
@@ -200,9 +204,9 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
         s_per_page = _fmt_seconds(m.get("run_seconds_per_page"))
         snippet = _snippet_from_doc(r["document_json"], snippet_length)
 
-        page_label = r["page_id"] if r["page_id"] != last_page else ""
-        last_page = r["page_id"]
-        cells = [page_label, r["model"], items, chars, s_per_page]
+        file_label = r["file_id"] if r["file_id"] != last_file else ""
+        last_file = r["file_id"]
+        cells = [file_label, r["model"], items, chars, s_per_page]
         for col in active_flat:
             cells.append(_fmt_metric(col, r.get(col)))
         cells.append(snippet)
@@ -211,18 +215,33 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
     Console().print(table)
 
 
+def _resolve_id(rows: list[dict[str, Any]], requested: str) -> str | None:
+    """Match the user-supplied ``--page`` value against file_id first
+    (the new canonical identifier), then page_id as a fallback for older
+    runs / source-side debugging. Returns the file_id of the first match,
+    or ``None`` when nothing matches."""
+    for r in rows:
+        if r["file_id"] == requested:
+            return r["file_id"]
+    for r in rows:
+        if r["page_id"] == requested:
+            return r["file_id"]
+    return None
+
+
 def _show_page(rows: list[dict[str, Any]], *, page_id: str) -> None:
-    matches = [r for r in rows if r["page_id"] == page_id]
-    if not matches:
-        all_pages = sorted({r["page_id"] for r in rows})
-        rprint(f"[red]No rows for page_id={page_id!r}.[/red]")
-        rprint(f"[dim]Available: {all_pages}[/dim]")
+    file_id = _resolve_id(rows, page_id)
+    if file_id is None:
+        all_files = sorted({r["file_id"] for r in rows})
+        rprint(f"[red]No rows for {page_id!r}.[/red]")
+        rprint(f"[dim]Available file_ids: {all_files}[/dim]")
         raise typer.Exit(code=1)
+    matches = [r for r in rows if r["file_id"] == file_id]
 
     matches.sort(key=lambda r: r["model"])
     for r in matches:
         rprint(
-            f"\n[bold cyan]=== {r['page_id']}  ·  {r['model']} "
+            f"\n[bold cyan]=== {r['file_id']}  ·  {r['model']} "
             f"({r['output_format']}) ===[/bold cyan]"
         )
         m = r["metrics"]
@@ -249,7 +268,7 @@ def _show_page(rows: list[dict[str, Any]], *, page_id: str) -> None:
         )
         prov_label = _format_provenance(provenance)
         rprint(
-            f"\n[bold magenta]=== {page_id}  ·  reference "
+            f"\n[bold magenta]=== {file_id}  ·  reference "
             f"({len(reference)} chars{prov_label}) ===[/bold magenta]"
         )
         rprint(reference)
@@ -265,12 +284,14 @@ def _show_page_compare(
     html: bool,
 ) -> None:
     """Run a Comparison between the two named artifacts and dispatch render."""
-    page_rows = {r["model"]: r for r in rows if r["page_id"] == page_id}
-    if not page_rows:
-        all_pages = sorted({r["page_id"] for r in rows})
-        rprint(f"[red]No rows for page_id={page_id!r}.[/red]")
-        rprint(f"[dim]Available: {all_pages}[/dim]")
+    file_id = _resolve_id(rows, page_id)
+    if file_id is None:
+        all_files = sorted({r["file_id"] for r in rows})
+        rprint(f"[red]No rows for {page_id!r}.[/red]")
+        rprint(f"[dim]Available file_ids: {all_files}[/dim]")
         raise typer.Exit(code=1)
+    page_rows = {r["model"]: r for r in rows if r["file_id"] == file_id}
+    page_id = file_id  # downstream uses this for display
 
     missing = [
         m for m in (label_a, label_b)
@@ -353,23 +374,25 @@ def _build_view(
         if not text:
             return None
         provenance = _parse_provenance(any_row.get("reference_provenance_json"))
-        page_id = any_row["page_id"]
+        # Render comparisons use the file_id as the human identifier.
+        view_id = any_row.get("file_id") or any_row["page_id"]
         if kind == "baseline":
             return BaselineView(
-                page_id=page_id, label=label, text=text, provenance=provenance,
+                page_id=view_id, label=label, text=text, provenance=provenance,
             )
-        return PredictionView(page_id=page_id, label=label, text=text)
+        return PredictionView(page_id=view_id, label=label, text=text)
     row = page_rows.get(label)
     if row is None:
         return None
     text = row.get("text") or row.get("markdown")
     document = _parse_document(row.get("document_json"))
+    view_id = row.get("file_id") or row["page_id"]
     if kind == "baseline":
         return BaselineView(
-            page_id=row["page_id"], label=label, text=text, document=document,
+            page_id=view_id, label=label, text=text, document=document,
         )
     return PredictionView(
-        page_id=row["page_id"], label=label, text=text, document=document,
+        page_id=view_id, label=label, text=text, document=document,
     )
 
 

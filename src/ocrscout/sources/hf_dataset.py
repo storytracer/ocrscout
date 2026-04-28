@@ -159,8 +159,10 @@ class HfDatasetSourceAdapter(SourceAdapter):
                 dpi = _dpi(img)
 
             page_id = self._page_id(row, id_col, raw_path, idx)
+            file_id = self._file_id(raw_path, page_id)
             yield PageImage(
                 page_id=page_id,
+                file_id=file_id,
                 image=page_image,
                 width=w,
                 height=h,
@@ -248,6 +250,30 @@ class HfDatasetSourceAdapter(SourceAdapter):
             if stem:
                 return stem
         return f"row_{idx:06d}"
+
+    def _parent_dir(self) -> str:
+        """The grouping segment of file_id — basename of the source root.
+
+        - HF Hub ``org/dataset`` → ``dataset``
+        - fsspec URL ``s3://bucket/folder/`` → ``folder`` (or ``bucket`` if no path)
+        - Local dir ``/path/to/scans/`` → ``scans``
+        """
+        if _is_hf_repo_id(self.path):
+            return self.path.split("/", 1)[1]
+        if "://" in self.path:
+            parsed = urlparse(self.path)
+            path_part = (parsed.path or "").rstrip("/")
+            if path_part:
+                return Path(path_part).name
+            return parsed.netloc or self.path
+        return Path(self.path).expanduser().name or self.path
+
+    def _file_id(self, raw_path: str | None, page_id: str) -> str:
+        if raw_path:
+            filename = Path(urlparse(raw_path).path or raw_path).name or page_id
+        else:
+            filename = page_id
+        return f"{self._parent_dir()}/{filename}"
 
 
 # --------------------------------------------------------------------- module helpers
