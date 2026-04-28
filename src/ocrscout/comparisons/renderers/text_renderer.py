@@ -289,6 +289,11 @@ def _render_header(
         f'<span class="stat removed">−{result.lines_removed}</span>'
         f'<span class="stat dim">{result.lines_unchanged} unchanged</span>'
         f"{cer_html}{wer_html}"
+        '<span class="diff-legend">'
+        f'<span class="legend-chip pred">■ {escape(prediction_label)}</span>'
+        f'<span class="legend-chip base">■ {escape(baseline_label)}</span>'
+        f'<span class="legend-chip word-key">▪ word diff</span>'
+        "</span>"
         "</div>"
         '<div class="diff-controls">'
         '<div class="diff-mode" role="radiogroup" aria-label="Diff mode">'
@@ -653,6 +658,17 @@ body {
 .diff-stats .stat.added { background: #e6ffec; border-color: #a6e9b5; color: #1a7f37; }
 .diff-stats .stat.removed { background: #ffeef0; border-color: #ffabba; color: #cf222e; }
 .diff-stats .stat.dim { color: #59636e; }
+.diff-legend {
+  display: inline-flex; gap: 0.5rem; align-items: center;
+  margin-left: 0.25rem;
+  padding-left: 0.65rem;
+  border-left: 1px solid #d0d7de;
+  font-size: 0.75rem;
+}
+.legend-chip { font-weight: 600; }
+.legend-chip.pred { color: #cf222e; }
+.legend-chip.base { color: #1a7f37; }
+.legend-chip.word-key { color: #59636e; font-weight: 400; font-style: italic; }
 .diff-controls { display: flex; align-items: center; gap: 0.75rem; }
 .diff-mode { display: inline-flex; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; }
 .diff-mode .mode-btn {
@@ -722,11 +738,9 @@ body {
 .ocrscout-diff-pane td.line.empty { background: #f6f8fa; }
 .ocrscout-diff-pane td.line.equal { color: #1f2328; }
 .ocrscout-diff-pane td.line.delete {
-  background: #ffeef0;
   border-left: 3px solid #cf222e;
 }
 .ocrscout-diff-pane td.line.insert {
-  background: #e6ffec;
   border-left: 3px solid #1a7f37;
 }
 .ocrscout-diff-pane td.line .marker {
@@ -800,8 +814,8 @@ body {
   .ocrscout-diff-pane td.ln { background: #161b22; color: #6e7681; border-color: #21262d; }
   .ocrscout-diff-pane td.line.empty { background: #161b22; }
   .ocrscout-diff-pane td.line.equal { color: #c9d1d9; }
-  .ocrscout-diff-pane td.line.delete { background: #67060c33; border-left-color: #f85149; }
-  .ocrscout-diff-pane td.line.insert { background: #033a1633; border-left-color: #3fb950; }
+  .ocrscout-diff-pane td.line.delete { border-left-color: #f85149; }
+  .ocrscout-diff-pane td.line.insert { border-left-color: #3fb950; }
   .ocrscout-diff-pane td.line .word-delete { background: rgba(248, 81, 73, 0.30); color: #ffa198; }
   .ocrscout-diff-pane td.line .word-insert { background: rgba(63, 185, 80, 0.30); color: #56d364; }
   .ocrscout-diff-minimap { background: #161b22; border-color: #30363d; }

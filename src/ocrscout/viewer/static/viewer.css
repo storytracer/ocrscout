@@ -229,11 +229,9 @@
 }
 .ocrscout-diff-pane td.line.empty { background: rgba(127, 127, 127, 0.04); }
 .ocrscout-diff-pane td.line.delete {
-  background: rgba(207, 34, 46, 0.10);
   border-left: 3px solid #cf222e;
 }
 .ocrscout-diff-pane td.line.insert {
-  background: rgba(26, 127, 55, 0.10);
   border-left: 3px solid #1a7f37;
 }
 .ocrscout-diff-pane td.line .marker {
@@ -377,33 +375,7 @@
 .ocrscout-layout-cmp .legend .matched .dot { background: #1a7f37; }
 .ocrscout-layout-cmp .legend .missing .dot { background: #cf222e; }
 .ocrscout-layout-cmp .legend .extra .dot { background: #d29922; }
-.ocrscout-layout-cmp .iou-list {
-  display: flex; flex-direction: column; gap: 0.25rem;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.78rem;
-}
-.ocrscout-layout-cmp .iou-row {
-  display: grid;
-  grid-template-columns: 8rem 1fr 3rem;
-  gap: 0.5rem;
-  align-items: center;
-}
-.ocrscout-layout-cmp .iou-row .label { color: var(--body-text-color-subdued, #6c757d); }
-.ocrscout-layout-cmp .iou-row .bar {
-  height: 8px;
-  border-radius: 4px;
-  background: rgba(127, 127, 127, 0.12);
-  overflow: hidden;
-}
-.ocrscout-layout-cmp .iou-row .bar > span {
-  display: block;
-  height: 100%;
-  background: linear-gradient(90deg, #cf222e 0%, #d29922 50%, #1a7f37 100%);
-}
-.ocrscout-layout-cmp .iou-row .val {
-  text-align: right;
-  font-variant-numeric: tabular-nums;
-}
+
 
 
 /* Color-coded section blocks for layout-aware models (e.g. dots-mocr).

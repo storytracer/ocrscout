@@ -19,7 +19,7 @@ from __future__ import annotations
 from html import escape
 from typing import TYPE_CHECKING
 
-from rich.table import Table
+
 
 from ocrscout.comparisons.layout import LayoutComparisonResult
 from ocrscout.interfaces.comparison import ComparisonRenderer, ComparisonResult
@@ -59,18 +59,10 @@ class LayoutComparisonRenderer(ComparisonRenderer):
             f"[green]── {baseline_label}[/green]"
         )
         console.print(
-            f"[dim]iou mean {result.iou_mean:.3f}  ·  "
-            f"matched {result.matched_regions}  ·  "
+            f"[dim]matched {result.matched_regions}  ·  "
             f"missing {result.unmatched_base}  ·  "
             f"extra {result.unmatched_pred}[/dim]\n"
         )
-        table = Table(show_header=True, header_style="bold")
-        table.add_column("category")
-        table.add_column("mean IoU", justify="right")
-        for cat in sorted(result.iou_per_category):
-            iou = result.iou_per_category[cat]
-            table.add_row(cat, f"{iou:.3f}")
-        console.print(table)
 
 
 def _render_layout_html(
@@ -83,26 +75,11 @@ def _render_layout_html(
         f'<span class="chip matched"><span class="dot"></span>matched {result.matched_regions}</span>'
         f'<span class="chip missing"><span class="dot"></span>missing {result.unmatched_base}</span>'
         f'<span class="chip extra"><span class="dot"></span>extra {result.unmatched_pred}</span>'
-        f'<span class="chip"><b>IoU mean {result.iou_mean:.3f}</b></span>'
         "</div>"
     )
-    iou_rows: list[str] = []
-    for cat in sorted(result.iou_per_category):
-        iou = result.iou_per_category[cat]
-        pct = max(0.0, min(1.0, iou)) * 100
-        iou_rows.append(
-            f'<div class="iou-row">'
-            f'<span class="label">{escape(cat)}</span>'
-            f'<span class="bar"><span style="width:{pct:.1f}%;"></span></span>'
-            f'<span class="val">{iou:.3f}</span>'
-            "</div>"
-        )
     return (
         '<div class="ocrscout-layout-cmp">'
         + legend
-        + '<div class="iou-list">'
-        + "".join(iou_rows)
-        + "</div>"
         + "</div>"
     )
 
