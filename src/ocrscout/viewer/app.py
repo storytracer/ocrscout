@@ -29,6 +29,16 @@ VIEW_MODES = ["Single", "Side-by-side", "Compare"]
 REFERENCE_PSEUDO_MODEL = "reference"
 STATIC_DIR = Path(__file__).parent / "static"
 
+# Layout-source dropdown opt-out. Bbox overlay rendering is expensive on
+# large documents; the default is the empty-string sentinel so pages load
+# without annotations until the user explicitly picks a layout.
+LAYOUT_NONE_VALUE = ""
+
+
+def _layout_choices(models: list[str]) -> list[tuple[str, str]]:
+    """Layout-source dropdown choices: None opt-out + available models."""
+    return [("None", LAYOUT_NONE_VALUE)] + [(m, m) for m in models]
+
 
 def build_app(output_dir: Path) -> gr.Blocks:
     """Build the Gradio Blocks app for ``output_dir``.
@@ -61,7 +71,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
     # want, rather than the inverse. The CSS grid wraps responsively.
     initial_models = list(store.all_models)
     initial_layout_models = store.layout_models_for(initial_file)
-    initial_layout_choice = initial_layout_models[0] if initial_layout_models else None
+    initial_layout_choice = LAYOUT_NONE_VALUE
 
     with gr.Blocks(
         title="ocrscout viewer",
@@ -113,7 +123,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
             with gr.Column(scale=2, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">Layout source</div>')
                 layout_model_dd = gr.Dropdown(
-                    choices=initial_layout_models or [""],
+                    choices=_layout_choices(initial_layout_models),
                     value=initial_layout_choice,
                     label=None,
                     show_label=False,
@@ -180,11 +190,13 @@ def build_app(output_dir: Path) -> gr.Blocks:
         def _on_file_change(file_id: str) -> tuple:
             summary = _render_page_summary(store, file_id)
             layout_models = store.layout_models_for(file_id)
-            layout_choice = layout_models[0] if layout_models else None
             return (
                 file_id,
                 summary,
-                gr.update(choices=layout_models or [""], value=layout_choice),
+                gr.update(
+                    choices=_layout_choices(layout_models),
+                    value=LAYOUT_NONE_VALUE,
+                ),
             )
 
         page_dd.change(
@@ -202,12 +214,14 @@ def build_app(output_dir: Path) -> gr.Blocks:
             new_idx = max(0, min(len(ids) - 1, idx + direction))
             new_file = ids[new_idx]
             layout_models = store.layout_models_for(new_file)
-            layout_choice = layout_models[0] if layout_models else None
             return (
                 gr.update(value=new_file, choices=ids),
                 new_file,
                 _render_page_summary(store, new_file),
-                gr.update(choices=layout_models or [""], value=layout_choice),
+                gr.update(
+                    choices=_layout_choices(layout_models),
+                    value=LAYOUT_NONE_VALUE,
+                ),
             )
 
         prev_btn.click(
@@ -348,18 +362,16 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 pred = models[0] if models else store.all_models[0]
                 models = [pred, REFERENCE_PSEUDO_MODEL]
             layout_models = store.layout_models_for(requested_id)
-            layout_choice = layout_models[0] if layout_models else None
-            img, anns = (
-                store.annotated_for(requested_id, layout_choice)
-                if layout_choice
-                else (store.image_for(requested_id), [])
-            )
+            img, anns = (store.image_for(requested_id), [])
             return (
                 gr.update(value=requested_id, choices=store.file_ids()),
                 requested_id,
                 models,
                 gr.update(value=mode),
-                gr.update(choices=layout_models or [""], value=layout_choice),
+                gr.update(
+                    choices=_layout_choices(layout_models),
+                    value=LAYOUT_NONE_VALUE,
+                ),
                 _render_page_summary(store, requested_id),
                 (img, anns) if img is not None else None,
                 _render_legend(anns, store),
