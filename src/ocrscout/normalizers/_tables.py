@@ -1,21 +1,72 @@
 """Shared table parsers used by multiple normalizers.
 
-- ``parse_html_table`` — handles the HTML ``<table>`` payloads emitted by
-  layout-aware models (dots-ocr) and prose-style models that nonetheless
-  produce HTML markup for tabular regions (lighton-ocr2).
-- ``parse_pipe_table`` — handles GitHub-flavoured Markdown pipe tables
-  emitted by other markdown-producing models.
+- ``parse_html_table`` — handles HTML ``<table>`` payloads (dots-ocr,
+  lighton-ocr2, glm-ocr's Table Recognition mode).
+- ``parse_pipe_table`` — handles GitHub-flavoured Markdown pipe tables.
+- ``parse_otsl_table`` — handles DocTags / OTSL ``<fcel>...<nl>`` fragments
+  emitted by PaddleOCR-VL's Table Recognition mode (and likely future
+  DocTags-native models).
+- ``parse_table_payload`` — auto-detects the format and dispatches.
 
-Both return a ``TableData`` ready to feed into ``DoclingDocument.add_table``.
+All variants return a ``TableData`` ready to feed into
+``DoclingDocument.add_table``. Parsing failures fall through to an empty
+``TableData`` rather than raising — per-block resilience is the contract.
 """
 
 from __future__ import annotations
 
+import logging
 import re
 from html.parser import HTMLParser
 from typing import Any
 
 from docling_core.types.doc.document import TableCell, TableData
+
+log = logging.getLogger(__name__)
+
+_OTSL_MARKERS = ("<fcel", "<ecel", "<lcel", "<ucel", "<xcel", "<otsl", "<ched", "<rhed")
+
+
+def parse_table_payload(text: str) -> TableData:
+    """Pick the right parser by looking at the payload, then call it.
+
+    Detection precedence:
+
+    1. OTSL — any of ``<fcel>``/``<ecel>``/``<lcel>``/``<otsl>`` markers
+       (DocTags table grammar; PaddleOCR-VL Table Recognition mode).
+    2. HTML — contains a ``<table>`` (or ``<tr>`` / ``<td>``) tag.
+    3. Pipe table — fallback.
+
+    Empty input returns an empty ``TableData``.
+    """
+    stripped = (text or "").strip()
+    if not stripped:
+        return TableData(table_cells=[], num_rows=0, num_cols=0)
+    lower = stripped.lower()
+    if any(m in lower for m in _OTSL_MARKERS):
+        return parse_otsl_table(stripped)
+    if "<table" in lower or "<tr" in lower or "<td" in lower:
+        return parse_html_table(stripped)
+    return parse_pipe_table(stripped)
+
+
+def parse_otsl_table(otsl_text: str) -> TableData:
+    """Parse a DocTags / OTSL table fragment into a ``TableData``.
+
+    Delegates to ``docling_core.types.doc.document.parse_otsl_table_content``.
+    Failures degrade to an empty ``TableData`` so a malformed cell doesn't
+    drop the whole document.
+    """
+    try:
+        from docling_core.types.doc.document import parse_otsl_table_content
+    except ImportError:  # pragma: no cover
+        log.warning("docling-core has no parse_otsl_table_content; returning empty table")
+        return TableData(table_cells=[], num_rows=0, num_cols=0)
+    try:
+        return parse_otsl_table_content(otsl_text)
+    except Exception as e:  # noqa: BLE001
+        log.warning("OTSL parse failed (%s); returning empty table", e)
+        return TableData(table_cells=[], num_rows=0, num_cols=0)
 
 
 def parse_html_table(html_text: str) -> TableData:

@@ -20,7 +20,7 @@ from docling_core.types.doc.labels import DocItemLabel
 
 from ocrscout.errors import NormalizerError
 from ocrscout.interfaces.normalizer import Normalizer
-from ocrscout.normalizers._tables import parse_html_table
+from ocrscout.normalizers._tables import parse_table_payload
 from ocrscout.profile import ModelProfile
 from ocrscout.types import PageImage, RawOutput
 
@@ -114,7 +114,7 @@ class LayoutJsonNormalizer(Normalizer):
             doc.add_picture(prov=picture_prov)
             return
         if kind == "table":
-            data = parse_html_table(text)
+            data = parse_table_payload(text)
             table_prov = _build_prov(bbox_raw, page_no=page_no, charspan=(0, 0))
             doc.add_table(data=data, prov=table_prov)
             return

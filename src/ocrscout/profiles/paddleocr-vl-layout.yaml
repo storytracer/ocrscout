@@ -1,0 +1,117 @@
+name: paddleocr-vl-layout
+source: layout_chat
+model_id: PaddlePaddle/PaddleOCR-VL-1.5
+model_size: 0.9B
+upstream_script: uv-scripts/ocr/paddleocr-vl.py
+
+# Layout-aware orchestration: PP-DocLayoutV3 segments the page; the layout
+# backend crops each region and dispatches one chat-completion per region
+# with the matching task prompt (text / table / formula / chart). This is
+# where PaddleOCR-VL really shines — it's the only model in the ocrscout
+# zoo with a `chart` task mode, and the layout pipeline is the only honest
+# way to use it (the model is single-task-per-call, like glm-ocr).
+output_format: layout_json
+normalizer: layout_json
+has_bboxes: true
+has_layout: true
+
+layout_detector: pp-doclayout-v3
+layout_detector_args:
+  device: cpu
+  score_threshold: 0.5
+  # revision: <commit-sha>   # pin once a known-good commit is verified
+
+# Map PP-DocLayoutV3 native labels → docling category keys consumed by
+# LayoutJsonNormalizer. Same mapping as glm-ocr-layout.
+category_mapping:
+  doc_title: title
+  paragraph_title: section_header
+  figure_title: caption
+  table_title: caption
+  text: text
+  abstract: text
+  content: text
+  aside_text: text
+  vertical_text: text
+  reference: reference
+  reference_content: text
+  footnote: footnote
+  vision_footnote: footnote
+  header: page_header
+  header_image: page_header
+  footer: page_footer
+  footer_image: page_footer
+  number: text
+  table: table
+  image: picture
+  chart: picture
+  seal: picture
+  formula: formula
+  display_formula: formula
+  inline_formula: formula
+  formula_number: text
+  algorithm: code
+
+# Per-region prompt routing. Keyed on the *detector-native* category (not
+# the docling-mapped one). PaddleOCR-VL-1.5 has a dedicated `chart` task
+# mode that none of our other profiles can use — route detector `chart`
+# regions to it. Anything not listed falls back to preferred_prompt_mode.
+prompt_mode_per_category:
+  table: table
+  formula: formula
+  display_formula: formula
+  inline_formula: formula
+  formula_number: formula
+  chart: chart
+
+# Four task prompts from upstream paddleocr-vl.py:66-71 (TASK_MODES dict).
+preferred_prompt_mode: ocr
+prompt_templates:
+  ocr: "OCR:"
+  table: "Table Recognition:"
+  formula: "Formula Recognition:"
+  chart: "Chart Recognition:"
+
+chat_template_content_format: null
+
+# Same vLLM tuning as paddleocr-vl.yaml. enforce_eager and
+# enable_prefix_caching=false mirror upstream's defensive flags for the
+# PaddleOCR-VL architecture; revisit when vLLM lands first-class support.
+vllm_engine_args:
+  max_model_len: 8192
+  limit_mm_per_prompt:
+    image: 1
+  max_num_batched_tokens: 16384
+  enable_prefix_caching: false
+  enforce_eager: true
+  kv_cache_memory_bytes: 2G
+
+sampling_args:
+  temperature: 0.0
+  max_tokens: 4096
+
+backend_args:
+  region_concurrency: 16
+
+metadata:
+  notes: |
+    Layout-aware variant of paddleocr-vl.yaml. Uses PP-DocLayoutV3 to
+    segment the page into typed regions, then dispatches one OCR call per
+    region with the task prompt that matches the region's category — text
+    regions get OCR mode, table regions get Table Recognition, formula
+    regions get Formula Recognition, and chart regions get the dedicated
+    Chart Recognition mode. Recovers structured TableItems on table-heavy
+    pages and provides bbox provenance for the viewer overlay.
+
+    Compared to glm-ocr-layout: same architecture, same detector, same
+    single-task-per-call paradigm — but PaddleOCR-VL's fourth `chart` mode
+    means dataset pages with diagrams / plots / bar charts get a more
+    informative read-out instead of being captioned as pictures.
+
+    Trade-off vs whole-page paddleocr-vl: per-page wall-clock is 2-3× higher
+    because each region is one HTTP call, but you get structured tables and
+    bbox provenance for the viewer overlay. Use plain paddleocr-vl if you
+    only care about prose pages.
+
+    Requires onnxruntime + transformers + torch; install with
+    `uv pip install ocrscout[layout]`.

@@ -1,0 +1,69 @@
+name: paddleocr-vl
+source: vllm
+model_id: PaddlePaddle/PaddleOCR-VL-1.5
+model_size: 0.9B
+upstream_script: uv-scripts/ocr/paddleocr-vl.py
+
+# Whole-page mode: model receives the full page image and one task prompt.
+# Like glm-ocr, this model is single-task-per-call — pick a `task_mode` via
+# `preferred_prompt_mode` per run, or use the layout-aware sibling profile
+# `paddleocr-vl-layout` to route per-region.
+output_format: markdown
+normalizer: markdown
+has_bboxes: false
+has_layout: false
+
+# Four task modes from upstream PROMPT_TEMPLATES (paddleocr-vl.py:66-71):
+#   ocr     → general text → markdown
+#   table   → table cells  → HTML
+#   formula → equations    → LaTeX
+#   chart   → charts       → structured analysis
+preferred_prompt_mode: ocr
+prompt_templates:
+  ocr: "OCR:"
+  table: "Table Recognition:"
+  formula: "Formula Recognition:"
+  chart: "Chart Recognition:"
+
+chat_template_content_format: null
+
+# vLLM engine args ported from upstream LLM(...) call at paddleocr-vl.py:402-412.
+# enforce_eager=true and enable_prefix_caching=false are upstream's defensive
+# flags for PaddleOCR-VL's vLLM compatibility (the script header at lines
+# 36-39 explicitly notes "batch processing in vLLM is still being finalised
+# ... use vllm serve"). ocrscout's managed mode routes through `vllm serve`,
+# so we get the supported path; we still mirror the engine flags for safety.
+# Revisit (drop enforce_eager) once vLLM ships first-class PaddleOCRVL
+# kernel/cudagraph support.
+vllm_engine_args:
+  max_model_len: 8192
+  limit_mm_per_prompt:
+    image: 1
+  max_num_batched_tokens: 16384
+  enable_prefix_caching: false
+  enforce_eager: true
+  kv_cache_memory_bytes: 2G
+
+# Greedy / deterministic sampling per upstream paddleocr-vl.py:424-427.
+sampling_args:
+  temperature: 0.0
+  max_tokens: 4096
+
+metadata:
+  notes: |
+    PaddleOCR-VL-1.5 is a 0.9B OCR VLM from PaddlePaddle (NaViT-style
+    vision encoder + ERNIE-4.5-0.3B decoder). The 1.5 release supersedes
+    the bare PaddlePaddle/PaddleOCR-VL repo (which used to bundle
+    PP-DocLayoutV2 inside) and is the actively-downloaded variant.
+
+    Image preprocessing (the `smart_resize` in paddleocr-vl.py:92-143) is
+    handled by the model's PaddleOCRVLImageProcessor — patch_size=14 with
+    merge_size=2 gives the same 28-px factor the script uses, and
+    min_pixels/max_pixels (112896 / 1003520) match. We don't need to
+    pre-resize regions ourselves.
+
+    vLLM architecture support: `PaddleOCRVLForConditionalGeneration` ships
+    its modeling code via `auto_map` (preprocessor_config.json), so
+    `trust_remote_code=true` (the ocrscout default) is required and
+    sufficient. Confirm with `vllm serve <model_id> --trust-remote-code`
+    before scouting at scale.
