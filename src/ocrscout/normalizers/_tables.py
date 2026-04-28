@@ -203,6 +203,25 @@ class _HtmlTableParser(HTMLParser):
         if self._cell_buf is not None:
             self._cell_buf.append(data)
 
+    def close(self) -> None:
+        # VLM outputs frequently emit `<table><tr><td>...</table>` without the
+        # matching `</td>`/`</tr>` (especially when a layout-aware backend
+        # routes a non-table region through a "Table Recognition:" prompt and
+        # the model dumps prose into one giant cell). Without this flush,
+        # `build()` only sees rows that hit an explicit `</tr>` and silently
+        # drops the entire payload — observed on glm-ocr-layout under the
+        # ``layout_chat`` backend.
+        super().close()
+        if self._cell_buf is not None and self._current_row is not None:
+            text = " ".join("".join(self._cell_buf).split())
+            self._current_row.append(
+                (text, self._cell_colspan, self._cell_rowspan, self._cell_is_header)
+            )
+            self._cell_buf = None
+        if self._current_row:
+            self._rows.append(self._current_row)
+            self._current_row = None
+
     def build(self) -> TableData:
         cells: list[TableCell] = []
         occupied: set[tuple[int, int]] = set()
