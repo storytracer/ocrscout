@@ -136,6 +136,7 @@ class ExportRecord(BaseModel):
     raw: RawOutput
     reference: Reference | None = None
     markdown: str | None = None
+    text: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     scores: dict[str, float] = Field(default_factory=dict)
 

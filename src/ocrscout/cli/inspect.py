@@ -33,9 +33,12 @@ def inspect(
     diff: str | None = typer.Option(
         None, "--diff",
         help="Show an inline word-level diff between two models for the page "
-             "given by --page. Format: 'modelA,modelB'. Words only in modelA "
-             "render red strikethrough; words only in modelB render green; "
-             "common words render in default text color. Requires --page.",
+             "given by --page. Format: 'modelA,modelB'. Use the literal "
+             "`reference` as either side to diff a model's text against the "
+             "reference adapter's ground truth (uses the flattened `text` "
+             "column on the model side, not `markdown`). Words only on the "
+             "left render red strikethrough; words only on the right render "
+             "green; common words render plain. Requires --page.",
     ),
     html: bool = typer.Option(
         False, "--html",
@@ -112,10 +115,15 @@ def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
             "output_format": raw.get("output_format"),
             "document_json": raw.get("document_json"),
             "markdown": raw.get("markdown"),
+            "text": raw.get("text"),
+            "reference_text": raw.get("reference_text"),
             "error": raw.get("error"),
             "metrics": metrics,
         })
     return out
+
+
+REFERENCE_PSEUDO_MODEL = "reference"
 
 
 def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
@@ -170,6 +178,20 @@ def _show_page(rows: list[dict[str, Any]], *, page_id: str) -> None:
         else:
             rprint("[yellow](no rendered text available)[/yellow]")
 
+    # Reference is a per-page fact, not a per-model one — print it once
+    # at the bottom so spot-checks can see prediction(s) above and ground
+    # truth below in one go.
+    reference = next(
+        (r.get("reference_text") for r in matches if r.get("reference_text")),
+        None,
+    )
+    if reference:
+        rprint(
+            f"\n[bold magenta]=== {page_id}  ·  reference "
+            f"({len(reference)} chars) ===[/bold magenta]"
+        )
+        rprint(reference)
+
 
 def _show_page_diff(
     rows: list[dict[str, Any]],
@@ -179,27 +201,57 @@ def _show_page_diff(
     model_b: str,
     html: bool,
 ) -> None:
-    """Compute a word-level diff between two models; render to terminal or HTML."""
+    """Compute a word-level diff between two models; render to terminal or HTML.
+
+    Either side may be the literal ``"reference"`` to pull from the
+    ``reference_text`` column instead of a model output. When the
+    reference is involved we diff on the prediction's flattened ``text``
+    column (rather than ``markdown``) so the comparison is content-only.
+    """
     page_rows = {r["model"]: r for r in rows if r["page_id"] == page_id}
     if not page_rows:
         all_pages = sorted({r["page_id"] for r in rows})
         rprint(f"[red]No rows for page_id={page_id!r}.[/red]")
         rprint(f"[dim]Available: {all_pages}[/dim]")
         raise typer.Exit(code=1)
-    missing = [m for m in (model_a, model_b) if m not in page_rows]
+    missing = [
+        m for m in (model_a, model_b)
+        if m != REFERENCE_PSEUDO_MODEL and m not in page_rows
+    ]
     if missing:
-        available = sorted(page_rows)
+        available = sorted(page_rows) + [REFERENCE_PSEUDO_MODEL]
         rprint(
             f"[red]No row for model(s) {missing!r} on page {page_id!r}.[/red]"
         )
         rprint(f"[dim]Available for this page: {available}[/dim]")
         raise typer.Exit(code=1)
 
-    text_a = page_rows[model_a].get("markdown") or ""
-    text_b = page_rows[model_b].get("markdown") or ""
+    diff_against_reference = REFERENCE_PSEUDO_MODEL in (model_a, model_b)
+
+    def _side_text(model_name: str) -> str:
+        if model_name == REFERENCE_PSEUDO_MODEL:
+            # All rows for this page carry the same reference_text; any will do.
+            any_row = next(iter(page_rows.values()))
+            return any_row.get("reference_text") or ""
+        row = page_rows[model_name]
+        # When diffing against the reference, compare the prediction's
+        # plain-text projection — markdown headings/escape syntax would
+        # otherwise pollute every line of a content-level diff.
+        if diff_against_reference:
+            return row.get("text") or row.get("markdown") or ""
+        return row.get("markdown") or ""
+
+    text_a = _side_text(model_a)
+    text_b = _side_text(model_b)
     if not text_a or not text_b:
+        empty = []
+        if not text_a:
+            empty.append(model_a)
+        if not text_b:
+            empty.append(model_b)
         rprint(
-            "[yellow]Cannot diff: one or both models produced no rendered text.[/yellow]"
+            f"[yellow]Cannot diff: no text available for {empty}. "
+            f"({'reference adapter returned None for this page' if REFERENCE_PSEUDO_MODEL in empty else 'model produced empty output'})[/yellow]"
         )
         raise typer.Exit(code=1)
 

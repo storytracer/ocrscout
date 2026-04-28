@@ -91,6 +91,7 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
         "output_format": record.raw.output_format,
         "document_json": document_json,
         "markdown": record.markdown,
+        "text": record.text,
         "reference_text": record.reference.text if record.reference else None,
         "raw_payload": record.raw.payload,
         "tokens": record.raw.tokens,

@@ -404,7 +404,7 @@ def _run_one_model(
             log.warning("normalizer failed for %s/%s: %s", model_name, raw.page_id, e)
             continue
 
-        item_count, text_length, markdown = _doc_stats(doc)
+        item_count, text_length, markdown, text = _doc_stats(doc)
 
         reference = None
         if reference_adapter is not None:
@@ -423,6 +423,7 @@ def _run_one_model(
             raw=raw,
             reference=reference,
             markdown=markdown,
+            text=text,
             metrics={
                 "prepare_seconds": round(prepare_seconds, 4),
                 "run_seconds_total": round(run_seconds_total, 4),
@@ -487,13 +488,15 @@ def _print_summary(
     log.info("Wrote %s", dest)
 
 
-def _doc_stats(doc) -> tuple[int, int, str]:
-    """Return (item_count, text_length, markdown) for a DoclingDocument.
+def _doc_stats(doc) -> tuple[int, int, str, str]:
+    """Return (item_count, text_length, markdown, text) for a DoclingDocument.
 
     `item_count` sums texts + pictures + tables; `text_length` is the total
     character count of all text items; `markdown` is the
-    ``export_to_markdown()`` rendering. Each is computed defensively so a
-    missing attribute degrades to a zero/empty rather than crashing the run.
+    ``export_to_markdown()`` rendering kept for human reading and viewer
+    display; `text` is ``export_to_text()`` flattened for direct comparison
+    against ``reference_text``. Each is computed defensively so a missing
+    attribute degrades to a zero/empty rather than crashing the run.
     """
     try:
         text_length = sum(len(t.text or "") for t in (doc.texts or []))
@@ -512,4 +515,9 @@ def _doc_stats(doc) -> tuple[int, int, str]:
     except Exception as e:  # noqa: BLE001
         log.warning("export_to_markdown failed: %s", e)
         markdown = ""
-    return item_count, text_length, markdown
+    try:
+        text = doc.export_to_text()
+    except Exception as e:  # noqa: BLE001
+        log.warning("export_to_text failed: %s", e)
+        text = ""
+    return item_count, text_length, markdown, text

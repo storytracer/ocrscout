@@ -68,7 +68,24 @@ class BhlOcrReferenceAdapter(ReferenceAdapter):
             return None
 
         item_dir = f"item-{item_id:06d}"
-        filename = f"item-{item_id:06d}-{page_id:08d}-0000.txt"
+        # The README's "-0000.txt" suffix is misleading: the trailing 4-digit
+        # number is the page's SequenceOrder within the item, not a constant.
+        # We populate page.sequence from the BHL catalog, so use it directly.
+        # If absent, fall back to listing the OCR directory and matching by
+        # the {item_id:06d}-{page_id:08d}- prefix.
+        if page.sequence is not None:
+            filename = (
+                f"item-{item_id:06d}-{page_id:08d}-{page.sequence:04d}.txt"
+            )
+        else:
+            filename = self._discover_filename(item_dir, item_id, page_id)
+            if filename is None:
+                log.debug(
+                    "bhl_ocr: no OCR file in %s matching PageID=%d",
+                    item_dir, page_id,
+                )
+                return None
+
         url = f"{BHL_OCR_PREFIX}/{item_dir}/{filename}"
         cache_path = self.cache_dir / item_dir / filename
 
@@ -88,6 +105,25 @@ class BhlOcrReferenceAdapter(ReferenceAdapter):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache_path.write_text(text, encoding="utf-8")
         return Reference(page_id=page.page_id, text=text)
+
+    def _discover_filename(
+        self, item_dir: str, item_id: int, page_id: int
+    ) -> str | None:
+        try:
+            import s3fs
+        except ImportError:
+            return None
+        prefix = f"{BHL_BUCKET}/ocr/{item_dir}/item-{item_id:06d}-{page_id:08d}-"
+        try:
+            fs = s3fs.S3FileSystem(**self.storage_options)
+            matches = [k for k in fs.ls(f"{BHL_BUCKET}/ocr/{item_dir}")
+                       if k.startswith(prefix) and k.endswith(".txt")]
+        except Exception as e:  # noqa: BLE001
+            log.debug("bhl_ocr: listing failed for %s: %s", item_dir, e)
+            return None
+        if not matches:
+            return None
+        return matches[0].rsplit("/", 1)[-1]
 
 
 def _default_cache_dir() -> Path:

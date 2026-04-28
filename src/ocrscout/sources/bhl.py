@@ -69,7 +69,12 @@ class BhlSourceAdapter(SourceAdapter):
         self.sample_n = int(sample)
         self.seed = int(seed)
         self.rights = str(rights)
-        self.languages = [str(x) for x in languages] if languages else None
+        # BHL stores language codes in uppercase (ENG, GER, LAT) but ISO
+        # 639-2 codes are conventionally written lowercase elsewhere; accept
+        # either and normalize.
+        self.languages = (
+            [str(x).upper() for x in languages] if languages else None
+        )
         if year_range is not None:
             yr = tuple(year_range)
             if len(yr) != 2:
@@ -182,32 +187,39 @@ class BhlSourceAdapter(SourceAdapter):
             log.warning("BHL row missing identifiers, skipping: %r", row)
             return None
         sequence = _parse_int(row.get("SequenceOrder"))
-        file_prefix = (row.get("FileNamePrefix") or "").strip() or None
-        image_url = _build_image_url(bar_code=str(bar_code), sequence=sequence,
-                                     file_prefix=file_prefix)
-        try:
-            image, dpi = _fetch_and_decode_jp2(image_url, self.storage_options)
-        except Exception as e:  # noqa: BLE001
-            log.warning("BHL image fetch/decode failed for %s: %s", image_url, e)
-            return None
-        width, height = image.size
-        return PageImage(
-            page_id=str(page_id),
-            image=image,
-            width=width,
-            height=height,
-            dpi=dpi,
-            source_uri=image_url,
-            volume_id=str(item_id),
-            sequence=sequence,
-            extra={
-                "BarCode": str(bar_code),
-                "ItemID": str(item_id),
-                "PageID": str(page_id),
-                "PageType": row.get("PageType"),
-                "FileNamePrefix": file_prefix,
-            },
+        candidates = _image_url_candidates(str(bar_code), sequence)
+        for url in candidates:
+            try:
+                image, dpi = _fetch_and_decode_jp2(url, self.storage_options)
+            except FileNotFoundError:
+                continue
+            except Exception as e:  # noqa: BLE001
+                log.warning("BHL image fetch/decode failed for %s: %s", url, e)
+                return None
+            width, height = image.size
+            return PageImage(
+                page_id=str(page_id),
+                image=image,
+                width=width,
+                height=height,
+                dpi=dpi,
+                source_uri=url,
+                volume_id=str(item_id),
+                sequence=sequence,
+                extra={
+                    "BarCode": str(bar_code),
+                    "ItemID": str(item_id),
+                    "PageID": str(page_id),
+                    "PageTypeName": row.get("PageTypeName"),
+                    "PagePrefix": row.get("PagePrefix"),
+                    "PageNumber": row.get("PageNumber"),
+                },
+            )
+        log.warning(
+            "BHL image not found at any of %r for ItemID=%s PageID=%s",
+            candidates, item_id, page_id,
         )
+        return None
 
 
 # --- helpers ----------------------------------------------------------------
@@ -230,21 +242,20 @@ def _parse_int(value: Any) -> int | None:
         return None
 
 
-def _build_image_url(*, bar_code: str, sequence: int | None, file_prefix: str | None) -> str:
-    """Compose the JP2 URL for a BHL page.
+def _image_url_candidates(bar_code: str, sequence: int | None) -> list[str]:
+    """Return JP2 URL candidates to try in order.
 
-    BHL's per-page ``FileNamePrefix`` is the canonical filename stem (it
-    handles the ``_0000`` vs ``_0001`` first-page inconsistency the README
-    calls out). When absent we fall back to ``{BarCode}_{seq:04d}``, which
-    is correct for the majority of items.
+    BHL's README calls out a historical inconsistency: the first image of
+    an item may be ``_0000.jp2`` or ``_0001.jp2``. Since the page table
+    doesn't record which numbering an item uses, try the 0-indexed path
+    first, then the 1-indexed path.
     """
-    if file_prefix:
-        stem = file_prefix
-    elif sequence is not None:
-        stem = f"{bar_code}_{sequence - 1:04d}"
-    else:
-        stem = f"{bar_code}_0000"
-    return f"{BHL_IMAGES_PREFIX}/{bar_code}/{stem}.jp2"
+    if sequence is None:
+        return [f"{BHL_IMAGES_PREFIX}/{bar_code}/{bar_code}_0000.jp2"]
+    return [
+        f"{BHL_IMAGES_PREFIX}/{bar_code}/{bar_code}_{sequence - 1:04d}.jp2",
+        f"{BHL_IMAGES_PREFIX}/{bar_code}/{bar_code}_{sequence:04d}.jp2",
+    ]
 
 
 def _s3_etag(url: str, storage_options: dict[str, Any]) -> str | None:
@@ -360,11 +371,11 @@ def _run_duckdb_sample(
             "all_varchar=true, nullstr='\\N', quote='', escape='')"
         )
 
-    where_clauses = ["c.label = ?"]
+    where_clauses = ["c.classification = ?", "c.parsing_success = TRUE"]
     params: list[Any] = [rights]
     if languages:
         placeholders = ", ".join("?" for _ in languages)
-        where_clauses.append(f"t.Language IN ({placeholders})")
+        where_clauses.append(f"t.LanguageCode IN ({placeholders})")
         params.extend(languages)
     if year_range is not None:
         where_clauses.append(
@@ -381,15 +392,16 @@ def _run_duckdb_sample(
             i.BarCode,
             i.TitleID,
             i.CopyrightStatus,
-            t.Language,
+            t.LanguageCode AS Language,
             COALESCE(t.FullTitle, t.ShortTitle) AS Title,
             t.MARCBibID,
+            t.TL2Author,
             i.Year AS ItemYear,
             TRY_CAST(REGEXP_EXTRACT(i.Year, '\\d{{4}}', 0) AS INTEGER) AS Year,
-            c.label AS Rights
+            c.classification AS Rights
         FROM {_read_tsv(item_path)} AS i
         LEFT JOIN {_read_tsv(title_path)} AS t USING (TitleID)
-        JOIN {_read_tsv(copyright_path)} AS c
+        JOIN read_parquet('{copyright_path}') AS c
           ON c.CopyrightStatus = i.CopyrightStatus
         WHERE {where_sql}
     ),
@@ -398,11 +410,13 @@ def _run_duckdb_sample(
             p.PageID,
             p.ItemID,
             p.SequenceOrder,
-            p.FileNamePrefix,
-            p.PageType,
+            p.PageTypeName,
+            p.PagePrefix,
+            p.PageNumber,
             e.BarCode,
             e.TitleID,
             e.Title,
+            e.TL2Author,
             e.Language,
             e.Year,
             e.Rights,
@@ -412,11 +426,18 @@ def _run_duckdb_sample(
             ) AS rn
         FROM {_read_tsv(page_path)} AS p
         JOIN eligible e USING (ItemID)
+    ),
+    -- Materialize the per-volume cap into its own CTE so the reservoir
+    -- sample below only sees already-capped rows. Inlining the cap into
+    -- the same SELECT as USING SAMPLE causes DuckDB to apply the WHERE
+    -- after the sample (with the window column re-evaluated against the
+    -- sampled subset), and the result drains to zero.
+    capped AS (
+        SELECT * FROM ranked WHERE rn <= {max_pages_per_volume}
     )
     SELECT *
-    FROM ranked
-    WHERE rn <= {max_pages_per_volume}
-    USING SAMPLE {sample_n} ROWS (reservoir, {seed});
+    FROM capped
+    USING SAMPLE reservoir({sample_n} ROWS) REPEATABLE({seed});
     """
     log.debug("BHL DuckDB sample SQL params=%r", params)
     cursor = conn.execute(sql, params)
@@ -444,11 +465,12 @@ def _rows_to_volumes(rows: list[dict[str, Any]]) -> list[Volume]:
         title = row.get("Title")
         bar_code = row.get("BarCode")
         title_id = row.get("TitleID")
+        author = (row.get("TL2Author") or "").strip()
         volumes.append(
             Volume(
                 volume_id=item_id,
                 title=title or None,
-                creators=[],
+                creators=[author] if author else [],
                 language=row.get("Language") or None,
                 year=year,
                 rights=row.get("Rights") or None,
