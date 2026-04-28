@@ -44,9 +44,11 @@ Per-feature extras:
 | `pdf` | `ocrmypdf`, `pikepdf` | PDF source/reference adapters |
 | `alto` | `lxml` | ALTO/hOCR reference adapter |
 | `iiif` | `httpx` | IIIF source adapter |
+| `cloud` | `s3fs`, `gcsfs` | cloud-bucket sources (`s3://`, `gs://`) |
 | `docling` | `docling` | non-VLM OCR backend (Tesseract, EasyOCR, etc. via Docling) |
 | `serve` | `litellm[proxy]` | managed multi-model server mode |
 | `viewer` | `gradio`, `polars` | interactive browser inspector |
+| `layout` | `transformers`, `torch` | PP-DocLayoutV3 detector for the `layout_chat` backend (single-task models like GLM-OCR, PaddleOCR-VL) |
 | `all` | all of the above | recommended default |
 
 ## Quick start
@@ -93,13 +95,16 @@ Each model is described by a hand-curated YAML in [src/ocrscout/profiles/](src/o
 | Profile | Backend | Output | Notes |
 | --- | --- | --- | --- |
 | `dots-mocr` | vLLM | DocTags + bboxes | Layout-aware, structured |
-| `dots-ocr` | vLLM | Markdown + bboxes | Plain reading-order text |
-| `glm-ocr` | vLLM | Markdown | GLM-4V-based |
-| `lighton-ocr2` | vLLM | Markdown | LightOnOCR-2 |
+| `dots-ocr` | vLLM | Layout JSON + bboxes | Layout-aware, plain reading-order text |
+| `glm-ocr` | vLLM | Markdown | Single-task GLM-OCR (0.9B); pick task via `preferred_prompt_mode` |
+| `glm-ocr-layout` | layout_chat | Layout JSON + bboxes | GLM-OCR routed per region by PP-DocLayoutV3 (recovers structured tables) |
+| `lighton-ocr2` | vLLM | Markdown | LightOnOCR-2; emits HTML tables inline |
+| `paddleocr-vl` | vLLM | Markdown | Single-task PaddleOCR-VL-1.5 (0.9B); ocr / table / formula / chart modes |
+| `paddleocr-vl-layout` | layout_chat | Layout JSON + bboxes | PaddleOCR-VL-1.5 routed per region; the only profile with `chart` mode |
 | `rolm-ocr` | vLLM | Markdown | Reducto's RolmOCR |
-| `smoldocling` | vLLM | DocTags | Layout-aware, low VRAM |
+| `smoldocling` | docling | DocTags | Layout-aware, low VRAM (Docling backend) |
 
-A profile records the model's identity (HF id, size), output shape (format + normalizer + label mapping), prompt templates, and vLLM tuning (`vllm_engine_args`, `sampling_args`, `kv_cache_memory_bytes`). To add a model, drop a YAML into `src/ocrscout/profiles/` — or ship one from a downstream package via the `ocrscout.backends` / `ocrscout.normalizers` entry points. `uv run ocrscout introspect <name>` produces a draft profile from a matching [`uv-scripts/ocr`](https://huggingface.co/datasets/uv-scripts/ocr) reference script (static `ast.parse` only — the upstream script is never executed).
+A profile records the model's identity (HF id, size), output shape (format + normalizer + label mapping), prompt templates, vLLM tuning (`vllm_engine_args`, `sampling_args`, `kv_cache_memory_bytes`), and — for `source: layout_chat` profiles — a `layout_detector` reference plus `prompt_mode_per_category` for routing per-region prompts. To add a model, drop a YAML into `src/ocrscout/profiles/` — or ship one from a downstream package via the `ocrscout.backends` / `ocrscout.normalizers` / `ocrscout.layout_detectors` entry points. `uv run ocrscout introspect <name>` produces a draft profile from a matching [`uv-scripts/ocr`](https://huggingface.co/datasets/uv-scripts/ocr) reference script (static `ast.parse` only — the upstream script is never executed).
 
 ## Running vLLM-backed models
 
@@ -110,6 +115,8 @@ vLLM-source profiles can run in three modes — pick by what's already running:
 | **runner** | _(default)_ | per-invocation `uv run --with vllm …` subprocess; killed on exit | one-off scout, single model, no warm server available |
 | **external-server** | `--server-url URL` | not managed by ocrscout | a `vllm serve` you started by hand, or any OpenAI-compatible endpoint (incl. a LiteLLM proxy) |
 | **managed** | `ocrscout serve` (long-lived) **or** `ocrscout run --managed` (inline) | ocrscout owns N `vllm serve` + 1 LiteLLM proxy (when N≥2); torn down on exit | comparing multiple models with warm servers; one URL fronting many models |
+
+`source: layout_chat` profiles (e.g. `glm-ocr-layout`, `paddleocr-vl-layout`) are **server-mode only** — they need an OpenAI-compatible endpoint to dispatch one POST per detected region. Use `--managed` or `--server-url`; subprocess vLLM is not supported in layout mode.
 
 ```bash
 # runner (default): spin up vllm just for this run
@@ -148,13 +155,14 @@ ocrscout is built around a small set of ABCs in [src/ocrscout/interfaces/](src/o
 - `SourceAdapter` — yields `PageImage` objects (directory, HF dataset, IIIF, PDF, …).
 - `ReferenceAdapter` — returns ground-truth text or `DoclingDocument` for a `page_id`.
 - `ModelBackend` — runs inference and yields `RawOutput`.
+- `LayoutDetector` — emits typed regions (`LayoutRegion`) for a page image; consumed by layout-aware backends like `LayoutChatBackend`.
 - `Normalizer` — converts `RawOutput` + `PageImage` into a `DoclingDocument`.
 - `ExportAdapter` — writes a stream of `ExportRecord` objects.
 - `Evaluator` — scores a prediction against a reference.
 - `Benchmark` — bundles source + reference + evaluator + canonical scoring protocol.
 - `Reporter` — turns a results directory into a report.
 
-Subclass the relevant ABC, set `name: ClassVar[str]`, and register either in-process (`registry.register("normalizers", "my_normalizer", MyNormalizer)`) or via a `pyproject.toml` entry point group like `ocrscout.normalizers`. Built-ins are protected from being shadowed by third-party entry points. See [CLAUDE.md](CLAUDE.md) for the full extension guide and design decisions.
+Subclass the relevant ABC, set `name: ClassVar[str]`, and register either in-process (`registry.register("normalizers", "my_normalizer", MyNormalizer)`) or via a `pyproject.toml` entry point group like `ocrscout.normalizers` / `ocrscout.layout_detectors`. Built-ins are protected from being shadowed by third-party entry points. See [CLAUDE.md](CLAUDE.md) for the full extension guide and design decisions.
 
 ## Logging
 

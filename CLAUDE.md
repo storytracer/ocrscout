@@ -12,6 +12,7 @@ ocrscout is extended through Abstract Base Classes and Python entry points.
    - `SourceAdapter` — yields `PageImage` objects from somewhere (a directory, an HF dataset, IIIF, PDF). The shipped `hf_dataset` adapter at [src/ocrscout/sources/hf_dataset.py](src/ocrscout/sources/hf_dataset.py) covers local dirs, fsspec URLs (`s3://`, `gs://`, `https://`, `hf://`), and HF Hub repo IDs (`org/dataset`) through one code path — extend it (or write a new adapter) for IIIF, PDF rasterisation, etc.
    - `ReferenceAdapter` — returns ground-truth text or `DoclingDocument` for a `page_id`.
    - `ModelBackend` — prepares a `BackendInvocation` and runs it, yielding `RawOutput`.
+   - `LayoutDetector` — emits typed `LayoutRegion`s (bbox + native category) for a `PageImage`. Consumed by layout-aware backends like `LayoutChatBackend`. Built-in: `pp-doclayout-v3` (transformers + torch via the `[layout]` extra). See "Layout-aware OCR" below.
    - `Normalizer` — converts a `RawOutput` + `PageImage` into a `DoclingDocument`.
    - `ExportAdapter` — writes a stream of `ExportRecord` objects to a destination.
    - `Evaluator` — scores a prediction `DoclingDocument` against a `Reference`.
@@ -26,7 +27,7 @@ ocrscout is extended through Abstract Base Classes and Python entry points.
      [project.entry-points."ocrscout.normalizers"]
      my_normalizer = "my_pkg.normalizers:MyNormalizer"
      ```
-     Entry-point groups: `ocrscout.sources`, `ocrscout.references`, `ocrscout.backends`, `ocrscout.normalizers`, `ocrscout.exports`, `ocrscout.evaluators`, `ocrscout.benchmarks`, `ocrscout.reporters`.
+     Entry-point groups: `ocrscout.sources`, `ocrscout.references`, `ocrscout.backends`, `ocrscout.normalizers`, `ocrscout.exports`, `ocrscout.evaluators`, `ocrscout.benchmarks`, `ocrscout.reporters`, `ocrscout.layout_detectors`.
    - **In-process**: `from ocrscout import registry; registry.register("normalizers", "my_normalizer", MyNormalizer)`.
 
 Built-in components are registered in [src/ocrscout/registry.py](src/ocrscout/registry.py) and are protected from being shadowed by third-party entry points.
@@ -37,10 +38,11 @@ Each OCR model has a hand-curated YAML profile shipped at [src/ocrscout/profiles
 
 A profile records:
 
-- **Identity**: `name`, `source` (which backend), `model_id`, `model_size`, `upstream_script` (informational pointer to the HF reference script).
+- **Identity**: `name`, `source` (which backend — any registered name; the field is a plain `str` so adding a backend doesn't require touching the schema), `model_id`, `model_size`, `upstream_script` (informational pointer to the HF reference script).
 - **Output shape**: `output_format`, `normalizer`, `has_bboxes`, `has_layout`, `category_mapping` (script-output-category → DoclingDocument label).
 - **Prompts**: `prompt_templates` (mode → prompt string), `preferred_prompt_mode`, `chat_template_content_format`.
 - **vLLM tuning**: `vllm_engine_args` (passed to `vllm.LLM(...)`), `sampling_args` (passed to `vllm.SamplingParams(...)`), `vllm_version`, `server_url` (for HTTP server mode).
+- **Layout-aware orchestration** (consumed by `source: layout_chat`): `layout_detector` (registered detector name, e.g. `pp-doclayout-v3`), `layout_detector_args` (constructor kwargs for the detector — `device`, `score_threshold`, `revision`, …), `prompt_mode_per_category` (detector-native category → `prompt_templates` key, for routing per-region prompts; falls back to `preferred_prompt_mode` for anything not listed). A cross-field validator on `ModelProfile` rejects malformed `layout_chat` profiles at YAML load time (requires `layout_detector` set, `output_format == "layout_json"`, `normalizer == "layout_json"`).
 - **Free-form**: `backend_args`, `metadata`.
 
 ### Profile defaults
@@ -93,6 +95,34 @@ uv run ocrscout run --source ./images/ --models dots-mocr \
 **When to pick which mode.** Runner is right when you're scouting one model on a fresh dataset; the startup cost amortizes across the run. External-server is right when you're iterating on prompts/inputs against a single model and want to avoid paying startup per ocrscout invocation. Managed is right when you're comparing multiple models in one go (the proxy lets a single ocrscout run drive all of them) or when you want the convenience of "one command spins everything up and tears it down."
 
 **High-resolution images are a known soft spot.** ocrscout's preflight is sizing-blind to image dimensions: it sizes KV/overhead for "typical" workloads (~256 vision tokens per MP at default Qwen2-VL-style processor settings). With much larger inputs (>4 MP), four things degrade in this order: (1) `prompt_tokens + max_tokens > max_model_len` → vLLM returns HTTP 400 and the page is recorded as `pages_failed`; (2) per-request KV demand grows linearly, draining the cache and pushing requests into vLLM's `Waiting:` queue; (3) vision-encoder transient activations may spike past the per-engine cap and OOM mid-run (preflight won't catch this — the cap covers steady-state, not the encoder peak); (4) vLLM's encoder cache budget (~14400 tokens by default) overflows and visual features get recomputed per request, slowing prefill. None of this surfaces as a clear up-front error today. If/when this bites, the cleanest defense is `vllm_engine_args.mm_processor_kwargs.max_pixels: <N>` to cap input resolution at the source — bounds prefill, KV use, and encoder memory in one knob with a predictable accuracy trade-off. Other levers: bump `max_model_len`, lower `sampling_args.max_tokens`, raise `kv_cache_memory_bytes`. Worth revisiting when scouting tabloid-size scans, large maps, or anything substantially above 4 MP.
+
+### Layout-aware OCR (`layout_chat` backend)
+
+Single-task-per-call OCR models (GLM-OCR, PaddleOCR-VL, …) take one prompt prefix and do exactly one thing — text, table, formula, or chart extraction — per call. Run them in default `ocr` mode against a mixed-content page and tables come back as flat prose because that's literally what "Text Recognition:" returns. The `layout_chat` backend (registered as `source: layout_chat`) wraps these with an external layout detector: detect typed regions on the page → for each region, crop the source image and POST one chat-completion with the prompt that matches the region's category → assemble the per-region results into one `layout_json` payload that the existing `LayoutJsonNormalizer` turns into a structured `DoclingDocument` with proper `TableItem`s and bbox provenance.
+
+| Knob | Where | What it does |
+| --- | --- | --- |
+| `layout_detector` | profile YAML | Registered `LayoutDetector` name (built-in: `pp-doclayout-v3`). |
+| `layout_detector_args` | profile YAML | Detector kwargs (`device`, `score_threshold`, `revision`, …). |
+| `prompt_mode_per_category` | profile YAML | Detector-native category → `prompt_templates` key. Lookup is on the **detector's** raw label (before `category_mapping` is applied). Anything not listed falls through to `preferred_prompt_mode`. |
+| `backend_args.region_concurrency` | profile YAML | Parallel POSTs per page (default 16). Pages stay sequential within a profile. |
+
+**Server-mode-only.** `layout_chat.prepare()` fails fast if no OpenAI-compatible endpoint is configured (`--server-url`, `--managed`, or `profile.server_url`). Subprocess-mode vLLM is unsupported because the per-region launch cost would dwarf any benefit. The backend declares `requires_managed_vllm: ClassVar[bool] = True`, which is what `managed.py`'s filter looks at when deciding which profiles get a managed `vllm serve` spawned for them — so adding a new layout-aware backend is one class flag, not a new string in `managed.py`.
+
+**The first detector.** `pp-doclayout-v3` uses the official Hugging Face Transformers integration of PP-DocLayoutV3 (`AutoModelForObjectDetection` + `AutoImageProcessor` against `PaddlePaddle/PP-DocLayoutV3_safetensors`). Lazy-imports `transformers` and `torch` only on first `detect()` call (so `import ocrscout` stays snappy without the `[layout]` extra). The model emits results in its own predicted reading order — `LayoutChatBackend._sort_reading_order` prefers `LayoutRegion.reading_order` when the detector populates it, falling back to a top-then-left bucketed sort otherwise.
+
+**A/B pattern.** Pair a layout-aware profile with its whole-page sibling so users can compare honestly: ship `glm-ocr.yaml` (whole-page, single mode) alongside `glm-ocr-layout.yaml` (PP-DocLayoutV3 + per-region routing); same for `paddleocr-vl` vs `paddleocr-vl-layout`. The layout variant's per-page wall-clock is typically 2–3× higher because each region is one HTTP call, but you get structured tables and bbox provenance for the viewer overlay.
+
+### Table parsing (`_tables.py`)
+
+Normalizer-internal helper at [src/ocrscout/normalizers/_tables.py](src/ocrscout/normalizers/_tables.py) provides three parsers + a smart dispatcher:
+
+- `parse_html_table(text)` — `<table>...</table>` (lighton-ocr2, dots-ocr, glm-ocr in Table Recognition mode).
+- `parse_pipe_table(text)` — GitHub-flavoured Markdown pipe tables.
+- `parse_otsl_table(text)` — DocTags / OTSL `<fcel>...<nl>` fragments (PaddleOCR-VL Table Recognition mode; delegates to `docling_core.types.doc.document.parse_otsl_table_content`).
+- `parse_table_payload(text)` — the dispatcher; picks OTSL → HTML → pipe-table by inspecting the payload markers.
+
+`LayoutJsonNormalizer` calls `parse_table_payload` for every `category == "table"` block, so future models that emit any of these formats inside a layout-json table block work without normalizer changes. All variants degrade to an empty `TableData` on parse failure rather than raising — per-block resilience is the contract.
 
 ### Authoring a new profile (Claude-Code-assisted)
 
@@ -164,7 +194,7 @@ The project is in rapid-prototyping mode. The previous test suite was deleted (r
 
 ## What NOT to do
 
-- **Don't add GPU dependencies to the core `pyproject.toml`.** No `vllm`, no `torch`, no `transformers`. Those are concerns of `VllmBackend` subprocesses (`uv run --with vllm ...`) or optional extras like `docling`.
+- **Don't add GPU dependencies to the core `pyproject.toml`.** No `vllm`, no `torch`, no `transformers` in core. Those are concerns of `VllmBackend` subprocesses (`uv run --with vllm ...`), remote vLLM servers, or optional extras (`docling` ships Docling; `layout` ships `transformers` + `torch` for the PP-DocLayoutV3 detector). New extras are fine when they unlock a real workload; growing core is not.
 - **Don't invent a custom document model.** Use `DoclingDocument` everywhere. Convert inputs to it as early as possible; convert outputs from it as late as possible.
 - **Don't build a production OCR pipeline.** That's Docling's lane. ocrscout measures and compares; it does not productionize.
 - **Don't add an auto-generated profile tier.** Profiles are curated only — every model has a hand-tuned YAML in `src/ocrscout/profiles/`. The `ocrscout introspect` command produces a draft to refine, not a profile to install.
