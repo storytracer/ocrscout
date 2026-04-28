@@ -34,6 +34,12 @@ vllm_engine_args:
   limit_mm_per_prompt:
     image: 1
   kv_cache_memory_bytes: 2G
+  # vLLM's per-step encoder cache is sized from max_num_batched_tokens. The
+  # auto-profiled default (~6084 on a single GB10) overflows on dense
+  # ~7 MP scans (e.g. BHL), which produce ~6100 vision tokens and trip
+  # `pre-allocated encoder cache size 6084` HTTP 400s. 8192 matches
+  # max_model_len and gives ~34% headroom. See vllm-project/vllm#34040.
+  max_num_batched_tokens: 8192
 
 # Sampling defaults from the GLM-OCR SDK (per upstream comment at
 # glm-ocr.py:287-291): temperature=0.01, top_p=0.00001, top_k=1,

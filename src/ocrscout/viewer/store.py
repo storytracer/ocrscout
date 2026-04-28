@@ -379,9 +379,29 @@ class ViewerStore:
 @lru_cache(maxsize=32)
 def _load_image_cached(path: str) -> Image.Image | None:
     try:
-        img = Image.open(path)
+        img = _open_fsspec(path) if "://" in path else Image.open(path)
         img.load()
         return img
     except (OSError, FileNotFoundError) as e:
         log.warning("viewer: cannot open source image %s: %s", path, e)
         return None
+
+
+def _open_fsspec(url: str) -> Image.Image:
+    """Open a fsspec URL (``s3://``, ``gs://``, ``https://``, ``hf://``).
+
+    Anonymous read is the default for ``s3://`` so anonymous-access buckets
+    (BHL, Common Crawl, etc.) work without credentials. If the user has
+    creds configured for the same bucket, fsspec's normal config chain
+    still picks them up — we only set ``anon`` when no kwargs are given.
+    """
+    import io
+
+    import fsspec
+
+    storage_options: dict[str, Any] = {}
+    if url.startswith("s3://"):
+        storage_options["anon"] = True
+    with fsspec.open(url, "rb", **storage_options) as f:
+        data = f.read()
+    return Image.open(io.BytesIO(data))

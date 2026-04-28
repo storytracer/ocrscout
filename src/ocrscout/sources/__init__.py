@@ -1,5 +1,5 @@
 """Source adapters: yield PageImage objects."""
 
-from ocrscout.sources.local import LocalSourceAdapter
+from ocrscout.sources.hf_dataset import HfDatasetSourceAdapter
 
-__all__ = ["LocalSourceAdapter"]
+__all__ = ["HfDatasetSourceAdapter"]

@@ -45,6 +45,13 @@ dependencies = [
 pdf = ["ocrmypdf>=16.0.0", "pikepdf>=9.0.0"]
 alto = ["lxml>=5.0.0"]
 iiif = ["httpx>=0.27.0"]
+# Cloud filesystems for the hf_dataset source adapter. `datasets` is in
+# core deps; the fsspec backends below are only pulled in when you point
+# --source at the matching URL scheme.
+cloud = [
+    "s3fs>=2024.0.0",
+    "gcsfs>=2024.0.0",
+]
 docling = ["docling"]
 serve = ["litellm[proxy]>=1.50.0"]
 viewer = [
@@ -52,7 +59,7 @@ viewer = [
     "polars>=1.0.0",
 ]
 all = [
-    "ocrscout[pdf,alto,iiif,docling,serve,viewer]",
+    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer]",
 ]
 dev = [
     "ruff>=0.6.0",

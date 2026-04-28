@@ -44,7 +44,7 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
     ``ocrscout.registry`` never imports concrete adapters."""
     return {
         "sources": {
-            "local": "ocrscout.sources.local:LocalSourceAdapter",
+            "hf_dataset": "ocrscout.sources.hf_dataset:HfDatasetSourceAdapter",
         },
         "references": {
             "plain_text": "ocrscout.references.plain_text:PlainTextReferenceAdapter",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import itertools
 import logging
 import os
 import time
@@ -27,8 +28,12 @@ log = logging.getLogger(__name__)
 
 @app.command("run")
 def run(
-    source: Path = typer.Option(
-        ..., "--source", "-s", help="Directory of images to OCR."
+    source: str = typer.Option(
+        ..., "--source", "-s",
+        help="Image source: a local directory, a fsspec URL "
+             "(s3://bucket/prefix/, gs://..., https://...), or a "
+             "HuggingFace Hub dataset id (org/name). All routes load "
+             "through the `hf_dataset` adapter.",
     ),
     models: str = typer.Option(
         ..., "--models", "-m", help="Comma-separated profile names."
@@ -127,7 +132,7 @@ def run(
 
     cfg = PipelineConfig(
         name="run",
-        source=AdapterRef(name="local", args={"path": str(source)}),
+        source=AdapterRef(name="hf_dataset", args={"path": source}),
         reference=(
             AdapterRef(
                 name=reference,
@@ -222,17 +227,20 @@ def _execute(
 ) -> None:
     source_cls = registry.get("sources", cfg.source.name)
     source = source_cls(**cfg.source.args)
-    pages = list(source.iter_pages())
+    pages_iter = source.iter_pages()
     if cfg.sample is not None:
-        pages = pages[: cfg.sample]
+        pages = list(itertools.islice(pages_iter, cfg.sample))
+    else:
+        pages = list(pages_iter)
     page_by_id = {p.page_id: p for p in pages}
     log.info("Loaded %d page(s) from %r", len(pages), cfg.source.args.get("path"))
     if not pages:
-        from ocrscout.sources.local import _SUPPORTED_SUFFIXES
-
         log.error(
-            "No images found at %r. LocalSourceAdapter recognizes %s.",
-            cfg.source.args.get("path"), sorted(_SUPPORTED_SUFFIXES),
+            "No images found at %r. The hf_dataset adapter loads via the "
+            "`imagefolder` builder for filesystem/URL paths and via "
+            "`load_dataset(repo_id)` for HF Hub names — check that the path "
+            "contains image files (or rows with an Image-typed column).",
+            cfg.source.args.get("path"),
         )
         raise typer.Exit(code=1)
 

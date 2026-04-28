@@ -9,7 +9,7 @@ ocrscout is a toolkit for evaluating SOTA OCR models on user-supplied data and h
 ocrscout is extended through Abstract Base Classes and Python entry points.
 
 1. Subclass the relevant ABC in [src/ocrscout/interfaces/](src/ocrscout/interfaces/):
-   - `SourceAdapter` — yields `PageImage` objects from somewhere (a directory, an HF dataset, IIIF, PDF).
+   - `SourceAdapter` — yields `PageImage` objects from somewhere (a directory, an HF dataset, IIIF, PDF). The shipped `hf_dataset` adapter at [src/ocrscout/sources/hf_dataset.py](src/ocrscout/sources/hf_dataset.py) covers local dirs, fsspec URLs (`s3://`, `gs://`, `https://`, `hf://`), and HF Hub repo IDs (`org/dataset`) through one code path — extend it (or write a new adapter) for IIIF, PDF rasterisation, etc.
    - `ReferenceAdapter` — returns ground-truth text or `DoclingDocument` for a `page_id`.
    - `ModelBackend` — prepares a `BackendInvocation` and runs it, yielding `RawOutput`.
    - `Normalizer` — converts a `RawOutput` + `PageImage` into a `DoclingDocument`.
