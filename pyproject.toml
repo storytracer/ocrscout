@@ -63,6 +63,15 @@ viewer = [
     # to import against huggingface_hub>=1.0 (removed `HfFolder`). 6.13 is
     # the current stable.
     "gradio>=6.13.0",
+    # Custom component for the source-page bbox overlay. gr.AnnotatedImage
+    # wrote one full-resolution PNG mask per bbox per page render and
+    # blocked the viewer; this one ships boxes as plain dicts and renders
+    # them on a canvas, so cost is O(1) regardless of bbox count.
+    # Using seanpedrick-case's fork because the upstream
+    # `gradio_image_annotation` 0.5.0 wheel is incomplete (its bundle
+    # references svelte_runtime_entry.js but doesn't include it). The
+    # fork is properly packaged for gradio 6.x.
+    "gradio_image_annotation_redaction>=0.5.5",
 ]
 # Layout-aware OCR pipeline (ocrscout.backends.layout_chat + the
 # pp-doclayout-v3 detector). Uses the official Hugging Face Transformers
@@ -139,3 +148,8 @@ ignore = ["E501", "B008"]  # typer.Option in defaults is the canonical typer idi
 python_version = "3.11"
 strict_optional = true
 warn_unused_ignores = true
+
+[dependency-groups]
+dev = [
+    "playwright",
+]

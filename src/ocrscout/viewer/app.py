@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import gradio as gr
+from gradio_image_annotation_redaction import image_annotator
 
 from ocrscout import registry as _registry
 from ocrscout.interfaces.comparison import BaselineView, PredictionView
@@ -38,6 +39,19 @@ LAYOUT_NONE_VALUE = ""
 def _layout_choices(models: list[str]) -> list[tuple[str, str]]:
     """Layout-source dropdown choices: None opt-out + available models."""
     return [("None", LAYOUT_NONE_VALUE)] + [(m, m) for m in models]
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    """Parse ``#RRGGBB`` into an ``(r, g, b)`` int tuple for the bbox
+    overlay component, which expects per-box colour as RGB."""
+    s = hex_color.lstrip("#")
+    return int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16)
+
+
+def _default_layout_value(layout_models: list[str]) -> str:
+    """Default layout-source selection for a page: pick the first available
+    layout model when present, else fall back to the None opt-out."""
+    return layout_models[0] if layout_models else LAYOUT_NONE_VALUE
 
 
 def build_app(output_dir: Path) -> gr.Blocks:
@@ -71,7 +85,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
     # want, rather than the inverse. The CSS grid wraps responsively.
     initial_models = list(store.all_models)
     initial_layout_models = store.layout_models_for(initial_file)
-    initial_layout_choice = LAYOUT_NONE_VALUE
+    initial_layout_choice = _default_layout_value(initial_layout_models)
 
     with gr.Blocks(
         title="ocrscout viewer",
@@ -146,11 +160,22 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 elem_id="ocrscout-image-col",
                 elem_classes=["ocrscout-image-col"],
             ) as image_col:
-                annotated = gr.AnnotatedImage(
+                annotated = image_annotator(
                     label="Source page (boxes from selected layout model)",
-                    show_legend=False,
-                    color_map=ViewerStore.LABEL_COLORS,
-                    format="webp",
+                    interactive=False,
+                    disable_edit_boxes=True,
+                    show_clear_button=False,
+                    show_remove_button=False,
+                    show_share_button=False,
+                    show_download_button=False,
+                    enable_keyboard_shortcuts=False,
+                    handles_cursor=False,
+                    # Hide the per-corner resize handles. Boxes are
+                    # display-only here so the handles add visual noise
+                    # without function. Setting size=0 makes the canvas
+                    # draw a 0x0 rect per handle (a no-op).
+                    handle_size=0,
+                    sources=[],
                     elem_id="ocrscout-annotated",
                     elem_classes=["ocrscout-annotated"],
                 )
@@ -191,26 +216,48 @@ def build_app(output_dir: Path) -> gr.Blocks:
             """Compute the (annotated_value, legend_html) pair for a given
             (file_id, layout_model). Single source of truth for image-column
             updates — invoked inline from navigation handlers and from the
-            layout dropdown's change listener."""
+            layout dropdown's change listener.
+
+            Returns the dict shape that ``image_annotator`` expects:
+            ``{"image": <PIL|URL>, "boxes": [{xmin, ymin, xmax, ymax,
+            label, color}, …]}``.
+            """
             if not model:
                 img = store.image_for(file_id)
-                value = (img, []) if img is not None else None
-                return value, _render_legend([], store)
+                if img is None:
+                    return None, _render_legend([], store)
+                return {"image": img, "boxes": []}, _render_legend([], store)
             img, anns = store.annotated_for(file_id, model)
             if img is None:
                 return None, _render_legend([], store)
-            return (img, anns), _render_legend(anns, store)
+            # Omit ``label`` from each box dict — the upstream Canvas
+            # renders an in-image label chip whenever ``box.label`` is
+            # non-empty, and the legend strip below the image already
+            # carries that information. ``color`` is per-box so the
+            # category-colour mapping survives.
+            boxes = [
+                {
+                    "xmin": int(x1), "ymin": int(y1),
+                    "xmax": int(x2), "ymax": int(y2),
+                    "color": _hex_to_rgb(
+                        store.LABEL_COLORS.get(label, "#888888")
+                    ),
+                }
+                for (x1, y1, x2, y2), label in anns
+            ]
+            return {"image": img, "boxes": boxes}, _render_legend(anns, store)
 
         def _on_file_change(file_id: str) -> tuple:
             summary = _render_page_summary(store, file_id)
             layout_models = store.layout_models_for(file_id)
-            annotated_value, legend = _image_outputs(file_id, LAYOUT_NONE_VALUE)
+            layout_value = _default_layout_value(layout_models)
+            annotated_value, legend = _image_outputs(file_id, layout_value)
             return (
                 file_id,
                 summary,
                 gr.update(
                     choices=_layout_choices(layout_models),
-                    value=LAYOUT_NONE_VALUE,
+                    value=layout_value,
                 ),
                 annotated_value,
                 legend,
@@ -237,14 +284,15 @@ def build_app(output_dir: Path) -> gr.Blocks:
             new_idx = max(0, min(len(ids) - 1, idx + direction))
             new_file = ids[new_idx]
             layout_models = store.layout_models_for(new_file)
-            annotated_value, legend = _image_outputs(new_file, LAYOUT_NONE_VALUE)
+            layout_value = _default_layout_value(layout_models)
+            annotated_value, legend = _image_outputs(new_file, layout_value)
             return (
                 gr.update(value=new_file, choices=ids),
                 new_file,
                 _render_page_summary(store, new_file),
                 gr.update(
                     choices=_layout_choices(layout_models),
-                    value=LAYOUT_NONE_VALUE,
+                    value=layout_value,
                 ),
                 annotated_value,
                 legend,
@@ -390,7 +438,10 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 pred = models[0] if models else store.all_models[0]
                 models = [pred, REFERENCE_PSEUDO_MODEL]
             layout_models = store.layout_models_for(requested_id)
-            img, anns = (store.image_for(requested_id), [])
+            layout_value = _default_layout_value(layout_models)
+            annotated_value, legend = _image_outputs(
+                requested_id, layout_value
+            )
             return (
                 gr.update(value=requested_id, choices=store.file_ids()),
                 requested_id,
@@ -398,11 +449,11 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 gr.update(value=mode),
                 gr.update(
                     choices=_layout_choices(layout_models),
-                    value=LAYOUT_NONE_VALUE,
+                    value=layout_value,
                 ),
                 _render_page_summary(store, requested_id),
-                (img, anns) if img is not None else None,
-                _render_legend(anns, store),
+                annotated_value,
+                legend,
             )
 
         demo.load(
