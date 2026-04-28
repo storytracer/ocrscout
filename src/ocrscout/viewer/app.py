@@ -242,11 +242,17 @@ def build_app(output_dir: Path) -> gr.Blocks:
         )
 
         def _on_layout_change(page_id: str, model: str | None):
+            # No layout model selected (or none exist for this page) — show
+            # the bare source image rather than clearing the pane. Without
+            # this, navigating to a layout-less page (e.g. plain markdown
+            # OCR like lighton-ocr2 or glm-ocr) blanks the source image.
             if not model:
-                return gr.update(value=None), _render_legend([], store)
+                img = store.image_for(page_id)
+                value = (img, []) if img is not None else None
+                return value, _render_legend([], store)
             img, anns = store.annotated_for(page_id, model)
             if img is None:
-                return gr.update(value=None), _render_legend([], store)
+                return None, _render_legend([], store)
             return (img, anns), _render_legend(anns, store)
 
         layout_model_dd.change(

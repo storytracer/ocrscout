@@ -8,6 +8,7 @@ import logging
 import os
 import time
 from pathlib import Path
+from typing import Any
 
 import typer
 import yaml
@@ -45,7 +46,16 @@ def run(
         None, "--reference-path", help="Path passed to the reference adapter."
     ),
     sample: int | None = typer.Option(
-        None, "--sample", help="Limit to first N pages."
+        None, "--sample",
+        help="Take a random subset of N pages (no-op if N >= total). "
+             "Sources that can list cheaply (local dirs, fsspec URLs, HF "
+             "Hub) only fetch the sampled subset — they do not download "
+             "the whole prefix. Use --seed for reproducibility.",
+    ),
+    seed: int | None = typer.Option(
+        None, "--seed",
+        help="RNG seed for --sample. Default is unseeded — every run gets "
+             "a different subset. Pin to an integer to reproduce a scout.",
     ),
     benchmark: str | None = typer.Option(
         None, "--benchmark", help="Run a registered benchmark instead of --source."
@@ -130,9 +140,15 @@ def run(
         os.environ["OCRSCOUT_VLLM_URL"] = server_url
         log.info("vLLM server: %s", server_url)
 
+    source_args: dict[str, Any] = {"path": source}
+    if sample is not None:
+        # Sampling is pushed down into the adapter so cheap pre-listing
+        # avoids downloading the whole prefix just to discard most of it.
+        source_args["sample"] = sample
+        source_args["seed"] = seed
     cfg = PipelineConfig(
         name="run",
-        source=AdapterRef(name="hf_dataset", args={"path": source}),
+        source=AdapterRef(name="hf_dataset", args=source_args),
         reference=(
             AdapterRef(
                 name=reference,

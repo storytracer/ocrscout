@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import io
 import logging
+import random
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -32,6 +33,14 @@ log = logging.getLogger(__name__)
 # (or a leading dot/slash) is a filesystem path, not a repo id.
 _HF_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _FSSPEC_SCHEMES = {"s3", "gs", "gcs", "az", "abfs", "abfss", "http", "https", "hf", "file"}
+
+# Image extensions ``imagefolder`` understands. Used when we pre-list files
+# ourselves for sampling — ``load_dataset("imagefolder", data_files=[...])``
+# expects an explicit set of image-suffixed paths, not a mixed listing.
+_IMAGE_EXTS = frozenset({
+    ".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp",
+    ".bmp", ".gif", ".jp2", ".j2k", ".jpx",
+})
 
 
 def _is_hf_repo_id(path: str) -> bool:
@@ -70,6 +79,15 @@ class HfDatasetSourceAdapter(SourceAdapter):
             anonymous S3 access pass ``{"anon": True}`` (the default when
             ``path`` starts with ``s3://`` and no options are supplied).
         revision: HF Hub revision (commit / branch / tag). Hub paths only.
+        sample: When set, yield a random subset of this size. For fsspec
+            URLs and local dirs, files are pre-listed cheaply (fsspec
+            ``find`` / ``rglob``) and a random ``k``-subset is selected
+            *before* any bytes are fetched — so over S3 only ``sample``
+            files are downloaded, not the whole prefix. For HF Hub repo
+            IDs, ``Dataset.shuffle(seed).select(range(sample))`` is used
+            (cost: index permutation, no extra downloads).
+        seed: RNG seed for ``sample``. ``None`` means a different random
+            subset every run; pin to an integer for reproducible scouts.
     """
 
     name = "hf_dataset"
@@ -85,6 +103,8 @@ class HfDatasetSourceAdapter(SourceAdapter):
         streaming: bool | None = None,
         storage_options: dict[str, Any] | None = None,
         revision: str | None = None,
+        sample: int | None = None,
+        seed: int | None = None,
     ) -> None:
         self.path = path
         self.split = split
@@ -95,6 +115,8 @@ class HfDatasetSourceAdapter(SourceAdapter):
         # paths as source_uri and avoids materialising the whole prefix).
         self.streaming = streaming if streaming is not None else ("://" in path)
         self.revision = revision
+        self.sample = sample
+        self.seed = seed
 
         if storage_options is None and _scheme(path) == "s3":
             storage_options = {"anon": True}
@@ -179,18 +201,38 @@ class HfDatasetSourceAdapter(SourceAdapter):
             if self.revision is not None:
                 kwargs["revision"] = self.revision
             ds = load_dataset(self.path, **kwargs)
+            if self.sample is not None:
+                ds = _sample_hub_dataset(ds, self.sample, self.seed)
         elif "://" in self.path:
-            # ``imagefolder``'s ``data_dir`` is a local-only argument (it
-            # joins onto the cwd); fsspec URLs go through ``data_files``
-            # with a glob. ``**`` walks all subdirs; ``imagefolder`` then
-            # filters by image extension internally.
-            glob = self.path.rstrip("/") + "/**"
-            log.debug("hf_dataset: loading imagefolder data_files=%r", glob)
-            ds = load_dataset("imagefolder", data_files=glob, **kwargs)
+            if self.sample is not None:
+                files = _list_image_files_fsspec(self.path, self.storage_options)
+                files = _random_subset(files, self.sample, self.seed)
+                log.debug(
+                    "hf_dataset: sampled %d remote files (seed=%r) from %r",
+                    len(files), self.seed, self.path,
+                )
+                ds = load_dataset("imagefolder", data_files=files, **kwargs)
+            else:
+                # ``imagefolder``'s ``data_dir`` is a local-only argument (it
+                # joins onto the cwd); fsspec URLs go through ``data_files``
+                # with a glob. ``**`` walks all subdirs; ``imagefolder`` then
+                # filters by image extension internally.
+                glob = self.path.rstrip("/") + "/**"
+                log.debug("hf_dataset: loading imagefolder data_files=%r", glob)
+                ds = load_dataset("imagefolder", data_files=glob, **kwargs)
         else:
             data_dir = str(Path(self.path).expanduser())
-            log.debug("hf_dataset: loading imagefolder data_dir=%r", data_dir)
-            ds = load_dataset("imagefolder", data_dir=data_dir, **kwargs)
+            if self.sample is not None:
+                files = _list_image_files_local(data_dir)
+                files = _random_subset(files, self.sample, self.seed)
+                log.debug(
+                    "hf_dataset: sampled %d local files (seed=%r) from %r",
+                    len(files), self.seed, data_dir,
+                )
+                ds = load_dataset("imagefolder", data_files=files, **kwargs)
+            else:
+                log.debug("hf_dataset: loading imagefolder data_dir=%r", data_dir)
+                ds = load_dataset("imagefolder", data_dir=data_dir, **kwargs)
 
         self._dataset = ds
         return ds
@@ -209,6 +251,68 @@ class HfDatasetSourceAdapter(SourceAdapter):
 
 
 # --------------------------------------------------------------------- module helpers
+
+
+def _list_image_files_fsspec(url: str, storage_options: dict[str, Any] | None) -> list[str]:
+    """List all image files under a fsspec URL prefix, returning full URLs.
+
+    Uses fsspec's ``find`` (recursive listing). The bytes are not fetched —
+    we only need the file paths so we can sample without downloading.
+    """
+    try:
+        import fsspec
+    except ImportError as e:
+        raise ScoutError(
+            f"hf_dataset: fsspec needed to list {url!r}: {e}. "
+            "Install the relevant extra (e.g. `pip install ocrscout[cloud]` for S3)."
+        ) from e
+
+    parsed = urlparse(url)
+    fs, _ = fsspec.core.url_to_fs(url, **(storage_options or {}))
+    prefix = (parsed.netloc + parsed.path).rstrip("/")
+    listing = fs.find(prefix)
+    scheme = parsed.scheme
+    return [
+        f"{scheme}://{p}"
+        for p in listing
+        if Path(p).suffix.lower() in _IMAGE_EXTS
+    ]
+
+
+def _list_image_files_local(data_dir: str) -> list[str]:
+    root = Path(data_dir).expanduser()
+    if not root.exists():
+        raise ScoutError(f"hf_dataset: source path does not exist: {root}")
+    if root.is_file():
+        return [str(root)]
+    return [
+        str(p) for p in sorted(root.rglob("*"))
+        if p.is_file() and p.suffix.lower() in _IMAGE_EXTS
+    ]
+
+
+def _random_subset(items: list[str], k: int, seed: int | None) -> list[str]:
+    if not items:
+        raise ScoutError("hf_dataset: no image files found to sample from.")
+    rng = random.Random(seed)
+    return rng.sample(items, k=min(k, len(items)))
+
+
+def _sample_hub_dataset(ds: Any, k: int, seed: int | None) -> Any:
+    """Random subset of an HF Hub Dataset / IterableDataset.
+
+    For a sized ``Dataset`` we shuffle indices and ``select(range(k))`` —
+    no extra downloads. For an ``IterableDataset`` (streaming) we use
+    ``shuffle(buffer_size=...)`` then ``take(k)``; this fills a buffer of
+    ``max(k, 1024)`` items first (a known cost of streaming shuffle).
+    """
+    try:
+        n = len(ds)
+    except TypeError:
+        # IterableDataset — shuffle within a buffer, then take.
+        buffer_size = max(k, 1024)
+        return ds.shuffle(seed=seed, buffer_size=buffer_size).take(k)
+    return ds.shuffle(seed=seed).select(range(min(k, n)))
 
 
 def _detect_image_column(features: Any) -> str:
