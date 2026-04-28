@@ -140,6 +140,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     label="Source page (boxes from selected layout model)",
                     show_legend=False,
                     color_map=ViewerStore.LABEL_COLORS,
+                    format="webp",
                     elem_id="ocrscout-annotated",
                     elem_classes=["ocrscout-annotated"],
                 )

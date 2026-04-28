@@ -281,20 +281,27 @@ class ViewerStore:
             return None
         return self._volumes.get(str(vid))
 
-    def image_for(self, file_id: str) -> Image.Image | None:
-        """Return the PIL image for ``file_id``, or None.
+    def image_for(self, file_id: str) -> Image.Image | str | None:
+        """Return the source image for ``file_id`` — PIL image, URL, or None.
 
         Resolution order:
 
         1. The ``image`` column (bytes embedded in the parquet by the publisher
            when ``--bundle-images`` was set). Decoded once per call; the LRU
            cache guards repeat calls.
-        2. ``source_uri`` — local path resolved relative to ``self.output_dir``
-           if not absolute, fsspec URL otherwise. Cached on the resolved
-           string.
+        2. For BHL JP2 ``source_uri`` values, return the pre-converted WebP
+           HTTPS URL directly — Gradio fetches it server-side, skipping the
+           multi-MB JP2 download and the slow OpenJPEG decode. BHL's "full"
+           WebP is published at the same dimensions as the JP2, so bbox
+           overlays align without any scaling.
+        3. ``source_uri`` — local path resolved relative to ``self.output_dir``
+           if not absolute, fsspec URL otherwise. Loaded as PIL via the LRU
+           cache.
 
         Returns ``None`` for pages with neither.
         """
+        from ocrscout.sources.bhl import bhl_web_image_url
+
         raw = next((r for r in self._rows if r["file_id"] == file_id), None)
         if raw is None:
             return None
@@ -305,6 +312,9 @@ class ViewerStore:
         if not src:
             return None
         src = str(src)
+        web_src = bhl_web_image_url(src)
+        if web_src is not None:
+            return web_src
         if "://" not in src:
             p = Path(src)
             if not p.is_absolute():
@@ -314,11 +324,16 @@ class ViewerStore:
 
     def annotated_for(
         self, file_id: str, model: str
-    ) -> tuple[Image.Image | None, list[tuple[tuple[int, int, int, int], str]]]:
+    ) -> tuple[
+        Image.Image | str | None,
+        list[tuple[tuple[int, int, int, int], str]],
+    ]:
         """Return the source image plus per-item ``((x1,y1,x2,y2), label)`` tuples.
 
-        Coords come from the model's ``ProvenanceItem.bbox`` in pixel space.
-        Empty list if the model has no layout data.
+        Image may be a PIL.Image, a URL string (handed to Gradio for direct
+        fetch), or ``None``. Coords come from the model's
+        ``ProvenanceItem.bbox`` in pixel space. Empty list if the model has
+        no layout data.
         """
         img = self.image_for(file_id)
         row = self.get(file_id, model)

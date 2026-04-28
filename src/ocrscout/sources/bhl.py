@@ -19,6 +19,7 @@ from __future__ import annotations
 import io
 import logging
 import os
+import re
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -35,6 +36,39 @@ log = logging.getLogger(__name__)
 BHL_BUCKET = "bhl-open-data"
 BHL_DATA_PREFIX = f"s3://{BHL_BUCKET}/data"
 BHL_IMAGES_PREFIX = f"s3://{BHL_BUCKET}/images"
+BHL_WEB_HTTPS_PREFIX = f"https://{BHL_BUCKET}.s3.amazonaws.com/web"
+
+# Pattern for the canonical BHL JP2 source_uri produced by this adapter.
+# Anchored on BHL_IMAGES_PREFIX so it stays in lockstep if the prefix moves.
+_BHL_JP2_RE = re.compile(
+    rf"^{re.escape(BHL_IMAGES_PREFIX)}/(?P<barcode>[^/]+)/(?P=barcode)_(?P<seq>\d{{4}})\.jp2$"
+)
+_BHL_WEB_SIZES = ("thumb", "small", "medium", "large", "full")
+
+
+def bhl_web_image_url(source_uri: str, size: str = "full") -> str | None:
+    """Map a BHL JP2 ``source_uri`` to its pre-converted WebP HTTPS URL.
+
+    BHL publishes web-friendly WebPs alongside the archival JP2s at
+    ``s3://bhl-open-data/web/{barcode}/{barcode}_{seq:04d}_{size}.webp`` for
+    sizes ``thumb`` / ``small`` / ``medium`` / ``large`` / ``full``. They're
+    publicly readable over HTTPS, so the viewer can hand the URL straight to
+    Gradio without auth. Returns ``None`` for any input that doesn't match
+    the BHL JP2 form, so non-BHL parquets sail through untouched.
+    """
+    if size not in _BHL_WEB_SIZES:
+        raise ValueError(
+            f"unknown BHL web size {size!r}; expected one of {_BHL_WEB_SIZES}"
+        )
+    if not source_uri:
+        return None
+    m = _BHL_JP2_RE.match(source_uri)
+    if not m:
+        return None
+    barcode = m.group("barcode")
+    seq = m.group("seq")
+    return f"{BHL_WEB_HTTPS_PREFIX}/{barcode}/{barcode}_{seq}_{size}.webp"
+
 
 CATALOG_FILES: tuple[str, ...] = ("item.txt.gz", "page.txt.gz", "title.txt.gz")
 COPYRIGHT_DATASET = "storytracer/bhl_copyright_statuses_classified"
