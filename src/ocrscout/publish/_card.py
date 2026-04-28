@@ -302,7 +302,9 @@ def render_space_readme(
     card_data = SpaceCardData(
         title=f"ocrscout viewer — {title_short}",
         sdk="gradio",
-        sdk_version="5.0.0",
+        # Match the floor in ocrscout's `[viewer]` extra. Older gradio's
+        # gradio.oauth crashes against huggingface_hub>=1.0 (HfFolder removed).
+        sdk_version="5.49.1",
         app_file="app.py",
         python_version="3.11",
         pinned=False,

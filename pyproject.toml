@@ -58,7 +58,10 @@ cloud = [
 docling = ["docling"]
 serve = ["litellm[proxy]>=1.50.0"]
 viewer = [
-    "gradio>=5.0.0",
+    # >=5.49 is the first line whose `gradio.oauth` uses `huggingface_hub.get_token`
+    # instead of the removed-in-hub-1.0 `HfFolder`. Older gradio crashes at
+    # import on machines with huggingface_hub>=1.0.
+    "gradio>=5.49.0",
 ]
 # Layout-aware OCR pipeline (ocrscout.backends.layout_chat + the
 # pp-doclayout-v3 detector). Uses the official Hugging Face Transformers

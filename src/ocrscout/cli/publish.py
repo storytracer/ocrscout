@@ -273,11 +273,11 @@ def publish_space(
 def _has_token(token: str | None) -> bool:
     if token:
         return True
-    if os.environ.get("HF_TOKEN"):
+    if os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"):
         return True
     try:
-        from huggingface_hub import HfFolder
+        from huggingface_hub import get_token
 
-        return bool(HfFolder.get_token())
+        return bool(get_token())
     except Exception:  # noqa: BLE001
         return False
