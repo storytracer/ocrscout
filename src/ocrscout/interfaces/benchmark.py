@@ -1,17 +1,23 @@
-"""Benchmark ABC: bundles a source, reference, and evaluator."""
+"""Benchmark ABC: bundles a source, reference, and comparisons."""
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
-from ocrscout.interfaces.evaluator import Evaluator
+from ocrscout.interfaces.comparison import Comparison
 from ocrscout.interfaces.reference import ReferenceAdapter
 from ocrscout.interfaces.source import SourceAdapter
 
 
 class Benchmark(ABC):
-    """A reproducible benchmark: a source dataset + ground truth + scoring."""
+    """A reproducible benchmark: a source dataset + reference + comparisons.
+
+    Note "reference" — not "ground truth". A benchmark measures agreement
+    against whatever artifact the reference adapter yields, which may itself
+    be OCR (legacy or otherwise). Use ``Reference.provenance`` to interpret
+    whether a comparison number reflects accuracy or consistency.
+    """
 
     name: ClassVar[str]
 
@@ -22,10 +28,10 @@ class Benchmark(ABC):
     def reference(self) -> ReferenceAdapter: ...
 
     @abstractmethod
-    def evaluator(self) -> Evaluator: ...
+    def comparisons(self) -> list[Comparison]: ...
 
-    def canonical_score(self, scores: dict[str, float]) -> float:
-        """Reduce per-page scores to one headline number; default is mean."""
-        if not scores:
+    def canonical_summary(self, summaries: dict[str, float]) -> float:
+        """Reduce per-page summary metrics to one headline number; default is mean."""
+        if not summaries:
             return 0.0
-        return sum(scores.values()) / len(scores)
+        return sum(summaries.values()) / len(summaries)

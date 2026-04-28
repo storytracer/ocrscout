@@ -19,6 +19,8 @@ from typing import Any, ClassVar
 from PIL import Image
 
 from ocrscout.exports.layout import find_parquet_files, parquet_data_files
+from ocrscout.interfaces.comparison import ComparisonResult
+from ocrscout.types import ReferenceProvenance
 
 log = logging.getLogger(__name__)
 
@@ -60,8 +62,30 @@ class ModelRow:
     error: str | None
     metrics: dict[str, Any]
     markdown: str = ""
+    text: str = ""
     bboxes: list[BBoxItem] = field(default_factory=list)
     items: list[TextItem] = field(default_factory=list)
+    # Per-comparison-name typed result loaded from the parquet's
+    # ``comparisons_json`` envelope. Keys are comparison names; values are
+    # ``ComparisonResult`` subclass instances.
+    comparisons: dict[str, ComparisonResult] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class BaselineRow:
+    """A page-level reference artifact materialized for the viewer.
+
+    Distinct from ``ModelRow`` because a baseline is per-page (one
+    reference per page), not per-(page, model). Carries provenance so the
+    Compare panel can label it correctly ("bhl_ocr (ocr, bhl-legacy)") and
+    so consumers can interpret comparison numbers as agreement-vs-OCR
+    rather than accuracy-vs-truth.
+    """
+
+    page_id: str
+    label: str  # "reference" by default; multiple baselines could differentiate later
+    text: str
+    provenance: ReferenceProvenance | None = None
 
 
 @dataclass
@@ -181,9 +205,40 @@ class ViewerStore:
             error=raw["error"],
             metrics=raw["metrics"],
             markdown=markdown,
+            text=raw.get("text") or "",
             bboxes=bboxes,
             items=items,
+            comparisons=self._comparisons_for(raw),
         )
+
+    def baselines_for(self, page_id: str) -> list[BaselineRow]:
+        """Return all reference-style baselines registered for the page.
+
+        Today the run loop only ever wires up a single reference adapter,
+        so this returns at most one row per page. The plural shape is
+        forward-looking: future runs may attach multiple baselines (an
+        old-OCR layer plus a human transcription, for instance) and the
+        Compare panel will show all of them.
+        """
+        for raw in self._rows:
+            if raw["page_id"] != page_id:
+                continue
+            text = raw.get("reference_text")
+            if not text:
+                continue
+            provenance = _parse_provenance(raw.get("reference_provenance_json"))
+            return [
+                BaselineRow(
+                    page_id=page_id,
+                    label="reference",
+                    text=text,
+                    provenance=provenance,
+                )
+            ]
+        return []
+
+    def has_any_baseline(self) -> bool:
+        return any(r.get("reference_text") for r in self._rows)
 
     def image_for(self, page_id: str) -> Image.Image | None:
         """Return the PIL image for ``page_id``, or None.
@@ -281,6 +336,10 @@ class ViewerStore:
                     "output_format": raw.get("output_format"),
                     "document_json": raw.get("document_json"),
                     "markdown": raw.get("markdown"),
+                    "text": raw.get("text"),
+                    "reference_text": raw.get("reference_text"),
+                    "reference_provenance_json": raw.get("reference_provenance_json"),
+                    "comparisons_json": raw.get("comparisons_json"),
                     "error": raw.get("error"),
                     "metrics": metrics,
                     "image_bytes": image_bytes,
@@ -412,6 +471,67 @@ class ViewerStore:
             tup = (float(bbox.l), float(bbox.t), float(bbox.r), float(bbox.b))
             out.append(BBoxItem(bbox=tup, label=label, text=text, item_idx=idx))
         return out
+
+    def _comparisons_for(self, row: dict[str, Any]) -> dict[str, ComparisonResult]:
+        """Decode the ``comparisons_json`` envelope into typed results.
+
+        Uses the comparisons registry to round-trip each entry through its
+        ``ComparisonResult`` subclass. Unknown comparison names (downstream
+        plugins that aren't installed locally) are silently skipped — the
+        viewer still renders cleanly without their typed payload.
+        """
+        raw = row.get("comparisons_json")
+        if not raw:
+            return {}
+        try:
+            envelope = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(envelope, dict):
+            return {}
+        out: dict[str, ComparisonResult] = {}
+        for name, payload in envelope.items():
+            try:
+                # Lazy-import avoids forcing the comparisons package at
+                # store init even when no comparisons ran.
+                from ocrscout import registry as _reg
+
+                cmp_cls = _reg.registry.get("comparisons", name)
+                # The Comparison class itself doesn't carry the result
+                # type; introspect by importing per-comparison module
+                # convention. Each module exports a Result subclass next
+                # to the Comparison; we look it up by ``__module__`` of
+                # the comparison and pick the first ComparisonResult
+                # subclass. Defensive for plugin authors who may not
+                # follow the convention.
+                module = __import__(cmp_cls.__module__, fromlist=["*"])
+                result_cls = next(
+                    (
+                        getattr(module, attr)
+                        for attr in dir(module)
+                        if isinstance(getattr(module, attr, None), type)
+                        and issubclass(
+                            getattr(module, attr), ComparisonResult
+                        )
+                        and getattr(module, attr) is not ComparisonResult
+                    ),
+                    None,
+                )
+                if result_cls is None:
+                    continue
+                out[name] = result_cls.model_validate(payload)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+
+def _parse_provenance(raw: str | None) -> ReferenceProvenance | None:
+    if not raw:
+        return None
+    try:
+        return ReferenceProvenance.model_validate_json(raw)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 @lru_cache(maxsize=32)

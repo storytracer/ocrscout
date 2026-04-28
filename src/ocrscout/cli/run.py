@@ -8,6 +8,8 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,13 @@ from ocrscout import registry
 from ocrscout.cli import app
 from ocrscout.errors import BackendError, ManagedServerError, NormalizerError, ProfileNotFound
 from ocrscout.exports.layout import parquet_dest
+from ocrscout.interfaces.comparison import (
+    BaselineView,
+    Comparison,
+    ComparisonResult,
+    PredictionView,
+    aggregate_summaries,
+)
 from ocrscout.interfaces.reference import ReferenceAdapter
 from ocrscout.log import VERBOSE, setup_logging
 from ocrscout.managed import managed_servers
@@ -64,6 +73,14 @@ def run(
     ),
     reference_path: Path | None = typer.Option(
         None, "--reference-path", help="Path passed to the reference adapter."
+    ),
+    comparisons: str | None = typer.Option(
+        None, "--comparisons",
+        help="Comma-separated comparison names to run per (page, model) "
+             "(e.g. `text`, `text,document`, `text,document,layout`). When "
+             "omitted and a reference adapter is configured, all built-in "
+             "comparisons whose `requires` set is satisfied by the data "
+             "fire by default. Pass `none` to skip comparisons entirely.",
     ),
     sample: int | None = typer.Option(
         None, "--sample",
@@ -176,6 +193,7 @@ def run(
         # avoids downloading the whole prefix just to discard most of it.
         source_args.setdefault("sample", sample)
         source_args.setdefault("seed", seed)
+    comparison_names = _parse_comparisons_flag(comparisons)
     cfg = PipelineConfig(
         name="run",
         source=AdapterRef(name=source_name, args=source_args),
@@ -187,6 +205,7 @@ def run(
             if reference
             else None
         ),
+        comparisons=comparison_names,
         models=[m.strip() for m in models.split(",") if m.strip()],
         export=AdapterRef(name=export, args={"dest": str(parquet_dest(output_dir))}),
         sample=sample,
@@ -294,6 +313,15 @@ def _execute(
         reference_adapter = ref_cls(**cfg.reference.args)
         log.info("Reference adapter: %s", cfg.reference.name)
 
+    active_comparisons = _resolve_comparisons(
+        cfg.comparisons, has_reference=reference_adapter is not None,
+    )
+    if active_comparisons:
+        log.info(
+            "Comparisons: %s",
+            ", ".join(c.name for c in active_comparisons),
+        )
+
     exporter_cls = registry.get("exports", cfg.export.name)
     exporter = exporter_cls()
     exporter.open(cfg.export.args["dest"])
@@ -308,40 +336,50 @@ def _execute(
         log.info("Loaded %d volume(s) from source", volume_count)
 
     metrics = MetricsCollector(pipeline_id=cfg.name)
-    # results[model_name] -> (ok, failed, run_seconds). We collect into a dict
-    # to preserve cfg.models order for the summary table even when models
-    # complete out-of-order under parallelism.
-    results: dict[str, tuple[int, int, float]] = {}
+    # results[model_name] -> ModelRunResult. Dict so the summary table can
+    # walk cfg.models in order even when parallel runs finish out-of-order.
+    results: dict[str, _ModelRunResult] = {}
 
-    def _run(name: str) -> tuple[str, int, int, float]:
-        ok, failed, run_seconds = _run_one_model(
+    def _run(name: str) -> tuple[str, _ModelRunResult]:
+        result = _run_one_model(
             model_name=name,
             pages=pages,
             page_by_id=page_by_id,
             normalizer_overrides=cfg.normalizer_overrides,
             exporter=exporter,
             reference_adapter=reference_adapter,
+            comparisons=active_comparisons,
             metrics=metrics,
         )
-        return name, ok, failed, run_seconds
+        return name, result
 
     try:
         if parallel_models <= 1:
             for model_name in cfg.models:
-                _, ok, failed, run_seconds = _run(model_name)
-                results[model_name] = (ok, failed, run_seconds)
+                _, run_result = _run(model_name)
+                results[model_name] = run_result
         else:
             with concurrent.futures.ThreadPoolExecutor(max_workers=parallel_models) as ex:
                 futures = [ex.submit(_run, name) for name in cfg.models]
                 for fut in concurrent.futures.as_completed(futures):
-                    name, ok, failed, run_seconds = fut.result()
-                    results[name] = (ok, failed, run_seconds)
+                    name, run_result = fut.result()
+                    results[name] = run_result
     finally:
         exporter.close()
         metrics.finish()
 
-    summary_rows = [(m, *results[m]) for m in cfg.models if m in results]
+    summary_rows = [
+        (m, results[m]) for m in cfg.models if m in results
+    ]
     _print_summary(summary_rows, dest=cfg.export.args["dest"])
+
+
+@dataclass
+class _ModelRunResult:
+    ok: int
+    failed: int
+    run_seconds: float
+    comparison_results: list[ComparisonResult] = dc_field(default_factory=list)
 
 
 def _run_one_model(
@@ -352,8 +390,9 @@ def _run_one_model(
     normalizer_overrides: dict,
     exporter,
     reference_adapter: ReferenceAdapter | None,
+    comparisons: list[Comparison],
     metrics: MetricsCollector,
-) -> tuple[int, int, float]:
+) -> _ModelRunResult:
     try:
         profile = resolve(model_name)
         backend = registry.get("backends", profile.source)()
@@ -361,7 +400,7 @@ def _run_one_model(
         normalizer = registry.get("normalizers", normalizer_name)()
     except Exception as e:
         log.error("[%s] setup failed: %s", model_name, e)
-        return 0, len(pages), 0.0
+        return _ModelRunResult(ok=0, failed=len(pages), run_seconds=0.0)
 
     log.info(
         "[%s] starting (backend=%s, normalizer=%s)",
@@ -375,7 +414,11 @@ def _run_one_model(
             raws = list(backend.run(inv))
     except BackendError as e:
         log.error("[%s] backend failed: %s", model_name, e)
-        return 0, len(pages), metrics.stage_seconds.get(f"{model_name}.run", 0.0)
+        return _ModelRunResult(
+            ok=0,
+            failed=len(pages),
+            run_seconds=metrics.stage_seconds.get(f"{model_name}.run", 0.0),
+        )
 
     prepare_seconds = metrics.stage_seconds.get(f"{model_name}.prepare", 0.0)
     run_seconds_total = metrics.stage_seconds.get(f"{model_name}.run", 0.0)
@@ -384,6 +427,7 @@ def _run_one_model(
 
     ok = 0
     failed = 0
+    accumulated_comparisons: list[ComparisonResult] = []
     for raw in raws:
         page = page_by_id.get(raw.page_id)
         if page is None:
@@ -416,6 +460,34 @@ def _run_one_model(
                     model_name, raw.page_id, e,
                 )
 
+        page_comparisons: dict[str, ComparisonResult] = {}
+        if reference is not None and comparisons:
+            view_pred = PredictionView(
+                page_id=page.page_id,
+                label=model_name,
+                text=text,
+                document=doc,
+            )
+            view_base = BaselineView(
+                page_id=page.page_id,
+                label=reference_adapter.name if reference_adapter else "reference",
+                text=reference.text,
+                document=reference.document,
+                provenance=reference.provenance,
+            )
+            for cmp in comparisons:
+                try:
+                    result = cmp.compare(view_pred, view_base)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "comparison %s failed for %s/%s: %s",
+                        cmp.name, model_name, raw.page_id, e,
+                    )
+                    continue
+                if result is not None:
+                    page_comparisons[cmp.name] = result
+                    accumulated_comparisons.append(result)
+
         record = ExportRecord(
             page=page,
             model=model_name,
@@ -433,7 +505,7 @@ def _run_one_model(
                 "item_count": item_count,
                 "text_length": text_length,
             },
-            scores={},
+            comparisons=page_comparisons,
         )
         exporter.write(record)
         ok += 1
@@ -444,7 +516,12 @@ def _run_one_model(
         "[%s] done: %d/%d ok in %.1fs",
         model_name, ok, ok + failed, run_seconds,
     )
-    return ok, failed, run_seconds
+    return _ModelRunResult(
+        ok=ok,
+        failed=failed,
+        run_seconds=run_seconds,
+        comparison_results=accumulated_comparisons,
+    )
 
 
 def _parse_source_args(raw: list[str]) -> dict[str, Any]:
@@ -470,8 +547,55 @@ def _parse_source_args(raw: list[str]) -> dict[str, Any]:
     return parsed
 
 
+def _parse_comparisons_flag(raw: str | None) -> list[str] | None:
+    """Decode the ``--comparisons`` flag into a list of comparison names.
+
+    ``None`` / unset → default-on (resolved later from registry + reference
+    state). ``"none"`` → explicit opt-out (returns ``[]``). Otherwise a
+    comma-separated whitelist of registered comparison names.
+    """
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw.lower() == "none":
+        return []
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    if not names:
+        return None
+    return names
+
+
+def _resolve_comparisons(
+    names: list[str] | None, *, has_reference: bool
+) -> list[Comparison]:
+    """Materialize Comparison instances from the names list.
+
+    ``None`` + reference present → all built-in comparisons. ``[]`` →
+    no comparisons (explicit opt-out). Otherwise the named comparisons.
+    Names not in the registry raise a typer.BadParameter so typos surface
+    early.
+    """
+    if names is None:
+        if not has_reference:
+            return []
+        names = list(registry.list("comparisons"))
+    elif not names:
+        return []
+    out: list[Comparison] = []
+    for n in names:
+        try:
+            cls = registry.get("comparisons", n)
+        except Exception as e:
+            raise typer.BadParameter(
+                f"unknown comparison {n!r}; available: "
+                f"{registry.list('comparisons')}"
+            ) from e
+        out.append(cls())
+    return out
+
+
 def _print_summary(
-    summary_rows: list[tuple[str, int, int, float]], *, dest: str
+    summary_rows: list[tuple[str, _ModelRunResult]], *, dest: str
 ) -> None:
     # Summary table is the *deliverable*, not status — always rprinted, never
     # gated by log level. Quiet mode still shows it.
@@ -481,11 +605,52 @@ def _print_summary(
     table.add_column("pages_failed", justify="right")
     table.add_column("run_seconds", justify="right")
     table.add_column("s/page", justify="right")
-    for name, ok, failed, secs in summary_rows:
-        per_page = f"{secs / ok:.2f}" if ok > 0 else "—"
-        table.add_row(name, str(ok), str(failed), f"{secs:.1f}", per_page)
+
+    # Dynamic comparison columns: union of every summary key any model
+    # produced. A model with no result for a given key renders ``—``.
+    extra_keys: list[str] = sorted({
+        key
+        for _, run_result in summary_rows
+        for r in run_result.comparison_results
+        for key in (r.summary or {})
+    })
+    for key in extra_keys:
+        table.add_column(f"{key}_avg", justify="right")
+
+    for name, run_result in summary_rows:
+        per_page = (
+            f"{run_result.run_seconds / run_result.ok:.2f}" if run_result.ok > 0 else "—"
+        )
+        row = [
+            name,
+            str(run_result.ok),
+            str(run_result.failed),
+            f"{run_result.run_seconds:.1f}",
+            per_page,
+        ]
+        if extra_keys:
+            agg = aggregate_summaries(run_result.comparison_results)
+            for key in extra_keys:
+                if key in agg:
+                    mean, n = agg[key]
+                    row.append(_format_summary_metric(key, mean, n))
+                else:
+                    row.append("—")
+        table.add_row(*row)
     rprint(table)
     log.info("Wrote %s", dest)
+
+
+def _format_summary_metric(key: str, mean: float, n: int) -> str:
+    # Similarity-like metrics live in 0..100 territory and read better as
+    # percentages with one decimal; CER/WER are in 0..1 and read better as
+    # three-decimal proportions; everything else falls back to a generic
+    # two-decimal float.
+    if key == "similarity":
+        return f"{mean:.1f}%  (n={n})"
+    if key in ("cer", "wer"):
+        return f"{mean:.3f}  (n={n})"
+    return f"{mean:.2f}  (n={n})"
 
 
 def _doc_stats(doc) -> tuple[int, int, str, str]:

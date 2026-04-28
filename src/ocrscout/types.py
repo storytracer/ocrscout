@@ -81,12 +81,26 @@ class LayoutRegion(BaseModel):
     parent_id: int | None = None
 
 
-class Reference(BaseModel):
-    """Ground-truth content for a single page.
+class ReferenceProvenance(BaseModel):
+    """Where a ``Reference`` came from. Load-bearing: most references in the
+    wild (BHL legacy OCR, IA djvu, ABBYY exports) are themselves OCR output,
+    not ground truth. Consumers need ``method`` to know whether to interpret
+    a comparison result as accuracy-vs-truth or agreement-vs-incumbent.
+    """
 
-    Either ``text`` or ``document`` (or both) may be set, depending on what the
-    reference adapter produces. ``document`` is a ``DoclingDocument`` at runtime
-    but typed as ``Any`` here to keep this module import-light.
+    method: Literal["human", "ocr", "llm", "mixed", "unknown"] = "unknown"
+    engine: str | None = None
+    confidence: float | None = None
+
+
+class Reference(BaseModel):
+    """Pre-existing OCR or transcription content for a single page.
+
+    NOT necessarily an oracle. Use ``provenance`` to capture what kind of
+    artifact this is. Either ``text`` or ``document`` (or both) may be set,
+    depending on what the reference adapter produces. ``document`` is a
+    ``DoclingDocument`` at runtime but typed as ``Any`` here to keep this
+    module import-light.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -94,6 +108,7 @@ class Reference(BaseModel):
     page_id: str
     text: str | None = None
     document: Any | None = None
+    provenance: ReferenceProvenance = Field(default_factory=ReferenceProvenance)
 
 
 class RawOutput(BaseModel):
@@ -138,7 +153,11 @@ class ExportRecord(BaseModel):
     markdown: str | None = None
     text: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
-    scores: dict[str, float] = Field(default_factory=dict)
+    # Per-comparison-name results from any Comparison objects that ran on
+    # this (page, model). Typed as ``Any`` here so this module stays free of
+    # ABC imports; the run loop puts ``ComparisonResult`` subclass instances
+    # in, and the parquet writer round-trips them as JSON.
+    comparisons: dict[str, Any] = Field(default_factory=dict)
 
 
 class RunMetrics(BaseModel):
@@ -178,10 +197,13 @@ class PipelineConfig(BaseModel):
     name: str
     source: AdapterRef
     reference: AdapterRef | None = None
+    # Comparison names to run per (page, model). ``None`` lets the run loop
+    # pick a default based on what data is available; ``[]`` (or the literal
+    # ``["none"]``) explicitly disables all comparisons.
+    comparisons: list[str] | None = None
     models: list[str]
     normalizer_overrides: dict[str, str] = Field(default_factory=dict)
     export: AdapterRef
-    evaluator: AdapterRef | None = None
     reporter: AdapterRef | None = None
     sample: int | None = None
     output_dir: Path

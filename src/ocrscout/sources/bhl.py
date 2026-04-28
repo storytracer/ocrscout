@@ -42,7 +42,18 @@ COPYRIGHT_PARQUET_PATH = "data/train-00000-of-00001.parquet"
 
 
 class BhlSourceAdapter(SourceAdapter):
-    """Sample pages from the BHL public S3 bucket via its TSV catalogs."""
+    """Sample pages from the BHL public S3 bucket via its TSV catalogs.
+
+    **Image-numbering convention.** BHL's S3 image filenames use the form
+    ``{BarCode}_{SequenceOrder:04d}.jp2``, with matching OCR sidecars at
+    ``{ItemID:06d}-{PageID:08d}-{SequenceOrder:04d}.txt``. BHL's README
+    notes a historical inconsistency where some items' first image was
+    ``_0000.jp2`` instead of ``_0001.jp2``, but empirically that case is
+    vanishingly rare (0/100 random items in our last sweep). This adapter
+    just trusts the modern convention universally; on the off-chance a
+    truly-legacy item slips through, the image fetch 404s and the page
+    is cleanly skipped with a warning.
+    """
 
     name = "bhl"
 
@@ -187,39 +198,49 @@ class BhlSourceAdapter(SourceAdapter):
             log.warning("BHL row missing identifiers, skipping: %r", row)
             return None
         sequence = _parse_int(row.get("SequenceOrder"))
-        candidates = _image_url_candidates(str(bar_code), sequence)
-        for url in candidates:
-            try:
-                image, dpi = _fetch_and_decode_jp2(url, self.storage_options)
-            except FileNotFoundError:
-                continue
-            except Exception as e:  # noqa: BLE001
-                log.warning("BHL image fetch/decode failed for %s: %s", url, e)
-                return None
-            width, height = image.size
-            return PageImage(
-                page_id=str(page_id),
-                image=image,
-                width=width,
-                height=height,
-                dpi=dpi,
-                source_uri=url,
-                volume_id=str(item_id),
-                sequence=sequence,
-                extra={
-                    "BarCode": str(bar_code),
-                    "ItemID": str(item_id),
-                    "PageID": str(page_id),
-                    "PageTypeName": row.get("PageTypeName"),
-                    "PagePrefix": row.get("PagePrefix"),
-                    "PageNumber": row.get("PageNumber"),
-                },
+        if sequence is None:
+            log.warning(
+                "BHL row missing SequenceOrder for PageID=%s; skipping", page_id,
             )
-        log.warning(
-            "BHL image not found at any of %r for ItemID=%s PageID=%s",
-            candidates, item_id, page_id,
+            return None
+        bar_code_s = str(bar_code)
+        # Modern-convention image URL: SequenceOrder is the file suffix.
+        # See class docstring for the legacy-item caveat.
+        url = (
+            f"{BHL_IMAGES_PREFIX}/{bar_code_s}/{bar_code_s}_{sequence:04d}.jp2"
         )
-        return None
+        try:
+            image, dpi = _fetch_and_decode_jp2(url, self.storage_options)
+        except FileNotFoundError:
+            log.warning(
+                "BHL image %s not found (PageID=%s, SO=%d); skipping. "
+                "Likely a phantom catalog entry (foldout/insert without "
+                "scan) or a legacy 0-indexed item.",
+                url, page_id, sequence,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001
+            log.warning("BHL image fetch/decode failed for %s: %s", url, e)
+            return None
+        width, height = image.size
+        return PageImage(
+            page_id=str(page_id),
+            image=image,
+            width=width,
+            height=height,
+            dpi=dpi,
+            source_uri=url,
+            volume_id=str(item_id),
+            sequence=sequence,
+            extra={
+                "BarCode": bar_code_s,
+                "ItemID": str(item_id),
+                "PageID": str(page_id),
+                "PageTypeName": row.get("PageTypeName"),
+                "PagePrefix": row.get("PagePrefix"),
+                "PageNumber": row.get("PageNumber"),
+            },
+        )
 
 
 # --- helpers ----------------------------------------------------------------
@@ -240,22 +261,6 @@ def _parse_int(value: Any) -> int | None:
         return int(s)
     except ValueError:
         return None
-
-
-def _image_url_candidates(bar_code: str, sequence: int | None) -> list[str]:
-    """Return JP2 URL candidates to try in order.
-
-    BHL's README calls out a historical inconsistency: the first image of
-    an item may be ``_0000.jp2`` or ``_0001.jp2``. Since the page table
-    doesn't record which numbering an item uses, try the 0-indexed path
-    first, then the 1-indexed path.
-    """
-    if sequence is None:
-        return [f"{BHL_IMAGES_PREFIX}/{bar_code}/{bar_code}_0000.jp2"]
-    return [
-        f"{BHL_IMAGES_PREFIX}/{bar_code}/{bar_code}_{sequence - 1:04d}.jp2",
-        f"{BHL_IMAGES_PREFIX}/{bar_code}/{bar_code}_{sequence:04d}.jp2",
-    ]
 
 
 def _s3_etag(url: str, storage_options: dict[str, Any]) -> str | None:

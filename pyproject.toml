@@ -88,8 +88,15 @@ bhl = [
     "s3fs>=2024.0.0",
     "imagecodecs>=2024.0.0",
 ]
+# Optional metrics for the comparisons subsystem. The TextComparison core
+# always returns a SequenceMatcher word-level similarity score; jiwer adds
+# CER and WER (the OCR/ASR community lingua franca). Pure-Python install,
+# no GPU footprint.
+eval = [
+    "jiwer>=3.0.0",
+]
 all = [
-    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout,bhl]",
+    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout,bhl,eval]",
 ]
 dev = [
     "ruff>=0.6.0",

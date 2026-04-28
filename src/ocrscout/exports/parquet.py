@@ -8,6 +8,11 @@ publishing.
 
 When the source yielded ``Volume``s, a parallel ``volumes-NNNNN.parquet``
 sidecar lands next to the per-page file, joinable on ``volume_id``.
+
+When per-page comparisons (text/document/layout) ran, the structured
+``ComparisonResult`` envelope is stored in ``comparisons_json`` and the
+most-queried metrics are also lifted into flat top-level columns for SQL
+ergonomics. See ``RESULTS_FEATURES`` for the canonical set.
 """
 
 from __future__ import annotations
@@ -82,6 +87,44 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
         document_json = json.dumps(doc.export_to_dict())
     else:
         document_json = json.dumps(doc) if doc is not None else None
+
+    comparisons_json: str | None = None
+    flat_metrics: dict[str, Any] = {
+        "text_similarity": None,
+        "text_cer": None,
+        "text_wer": None,
+        "document_heading_count_delta": None,
+        "document_table_count_delta": None,
+        "document_picture_count_delta": None,
+        "layout_iou_mean": None,
+    }
+    if record.comparisons:
+        # Each entry's value is a ComparisonResult Pydantic model — dump it
+        # via model_dump (it round-trips because each subclass declares a
+        # Literal `comparison` discriminator).
+        envelope: dict[str, Any] = {}
+        for name, result in record.comparisons.items():
+            envelope[name] = (
+                result.model_dump(mode="json")
+                if hasattr(result, "model_dump")
+                else result
+            )
+            summary = getattr(result, "summary", {}) or {}
+            for key, val in summary.items():
+                flat_key = f"{name}_{key}"
+                if flat_key in flat_metrics:
+                    flat_metrics[flat_key] = val
+        comparisons_json = json.dumps(envelope)
+
+    reference_provenance_json: str | None = None
+    if record.reference is not None:
+        prov = record.reference.provenance
+        if prov is not None:
+            reference_provenance_json = (
+                prov.model_dump_json() if hasattr(prov, "model_dump_json")
+                else json.dumps(prov)
+            )
+
     return {
         "page_id": record.page.page_id,
         "model": record.model,
@@ -93,11 +136,13 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
         "markdown": record.markdown,
         "text": record.text,
         "reference_text": record.reference.text if record.reference else None,
+        "reference_provenance_json": reference_provenance_json,
         "raw_payload": record.raw.payload,
         "tokens": record.raw.tokens,
         "error": record.raw.error,
         "metrics_json": json.dumps(record.metrics) if record.metrics else None,
-        "scores_json": json.dumps(record.scores) if record.scores else None,
+        "comparisons_json": comparisons_json,
+        **flat_metrics,
     }
 
 

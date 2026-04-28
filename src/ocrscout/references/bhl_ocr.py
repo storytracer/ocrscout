@@ -17,7 +17,7 @@ from typing import Any
 
 from ocrscout.errors import ScoutError
 from ocrscout.interfaces.reference import ReferenceAdapter
-from ocrscout.types import PageImage, Reference
+from ocrscout.types import PageImage, Reference, ReferenceProvenance
 
 log = logging.getLogger(__name__)
 
@@ -48,6 +48,14 @@ class BhlOcrReferenceAdapter(ReferenceAdapter):
         self.cache_dir = Path(cache_dir) if cache_dir else _default_cache_dir()
         self.storage_options = (
             dict(storage_options) if storage_options else {"anon": True}
+        )
+        # BHL pages are scanned books; the OCR sidecars on S3 are the
+        # legacy text layer (mostly Internet Archive / BHL pipelines from
+        # ~2010 onward, with idiosyncratic engines per scanning batch).
+        # Treat as OCR provenance — never assume oracle quality.
+        self._provenance = ReferenceProvenance(
+            method="ocr",
+            engine="bhl-legacy",
         )
 
     def get(self, page: PageImage) -> Reference | None:
@@ -91,7 +99,9 @@ class BhlOcrReferenceAdapter(ReferenceAdapter):
 
         if cache_path.is_file():
             text = cache_path.read_text(encoding="utf-8", errors="replace")
-            return Reference(page_id=page.page_id, text=text)
+            return Reference(
+                page_id=page.page_id, text=text, provenance=self._provenance,
+            )
 
         try:
             text = _fetch_ocr_text(url, self.storage_options)

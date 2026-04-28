@@ -1,4 +1,13 @@
-"""`ocrscout inspect` — side-by-side comparison of a previous run's output."""
+"""`ocrscout inspect` — read a previous run's output and surface comparisons.
+
+The summary view lists per-(page, model) stats with comparison-summary
+columns lifted from the parquet's flat metric columns (``text_similarity``,
+``layout_iou_mean``, etc.). The page view dumps each model's markdown and,
+when present, the page's reference text alongside its provenance.
+
+The compare view dispatches through the comparison-renderer registry, so
+its output stays in lockstep with the viewer's Compare mode.
+"""
 
 from __future__ import annotations
 
@@ -14,10 +23,17 @@ import typer
 from rich import print as rprint
 from rich.console import Console
 from rich.table import Table
-from rich.text import Text
 
+from ocrscout import registry
 from ocrscout.cli import app
-from ocrscout.viewer.diff import compute_diff, render_diff_page
+from ocrscout.interfaces.comparison import (
+    BaselineView,
+    ComparisonResult,
+    PredictionView,
+)
+from ocrscout.types import ReferenceProvenance
+
+REFERENCE_PSEUDO_MODEL = "reference"
 
 
 @app.command("inspect")
@@ -30,20 +46,25 @@ def inspect(
         help="Show the full per-model markdown for one page_id instead of "
              "the summary table.",
     ),
-    diff: str | None = typer.Option(
-        None, "--diff",
-        help="Show an inline word-level diff between two models for the page "
-             "given by --page. Format: 'modelA,modelB'. Use the literal "
-             "`reference` as either side to diff a model's text against the "
-             "reference adapter's ground truth (uses the flattened `text` "
-             "column on the model side, not `markdown`). Words only on the "
-             "left render red strikethrough; words only on the right render "
-             "green; common words render plain. Requires --page.",
+    compare: str | None = typer.Option(
+        None, "--compare",
+        help="Run a comparison between two artifacts for --page. Format "
+             "'A,B'. Each side can be a model name or the literal "
+             "`reference` to pull the row's reference_text + provenance. "
+             "Comparison type defaults to `text`; override with "
+             "--comparison-type.",
+    ),
+    comparison_type: str = typer.Option(
+        "text", "--comparison-type",
+        help="Comparison name from the registry (`text`, `document`, "
+             "`layout`). Each is rendered via the matching "
+             "ComparisonRenderer.",
     ),
     html: bool = typer.Option(
         False, "--html",
-        help="With --diff, serve a side-by-side HTML diff via a one-shot local "
-             "HTTP server and open it in your default browser. No files are "
+        help="With --compare, serve the rendered comparison as a self-"
+             "contained HTML page from a one-shot local HTTP server "
+             "and open it in your default browser. No files are "
              "written. Press Ctrl-C to stop the server.",
     ),
     snippet_length: int = typer.Option(
@@ -63,27 +84,33 @@ def inspect(
         rprint(f"[yellow]{output_dir} contains no rows.[/yellow]")
         return
 
-    if diff is not None:
+    if compare is not None:
         if page is None:
-            rprint("[red]--diff requires --page <page_id>[/red]")
+            rprint("[red]--compare requires --page <page_id>[/red]")
             raise typer.Exit(code=1)
-        parts = [s.strip() for s in diff.split(",") if s.strip()]
+        parts = [s.strip() for s in compare.split(",") if s.strip()]
         if len(parts) != 2:
             rprint(
-                f"[red]--diff expects exactly two comma-separated model names; "
+                f"[red]--compare expects exactly two comma-separated names; "
                 f"got {parts!r}[/red]"
             )
             raise typer.Exit(code=1)
         if parts[0] == parts[1]:
-            rprint(f"[red]--diff: model A and model B are the same ({parts[0]!r}); "
-                   f"nothing to compare[/red]")
+            rprint(
+                f"[red]--compare: side A and side B are the same "
+                f"({parts[0]!r}); nothing to compare[/red]"
+            )
             raise typer.Exit(code=1)
-        _show_page_diff(
-            rows, page_id=page, model_a=parts[0], model_b=parts[1],
+        _show_page_compare(
+            rows,
+            page_id=page,
+            label_a=parts[0],
+            label_b=parts[1],
+            comparison_type=comparison_type,
             html=html,
         )
     elif html:
-        rprint("[red]--html requires --diff (it serves a diff viewer)[/red]")
+        rprint("[red]--html requires --compare (it serves a comparison viewer)[/red]")
         raise typer.Exit(code=1)
     elif page is not None:
         _show_page(rows, page_id=page)
@@ -117,17 +144,43 @@ def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
             "markdown": raw.get("markdown"),
             "text": raw.get("text"),
             "reference_text": raw.get("reference_text"),
+            "reference_provenance_json": raw.get("reference_provenance_json"),
+            "comparisons_json": raw.get("comparisons_json"),
             "error": raw.get("error"),
             "metrics": metrics,
+            # Flat metric columns — pulled out so the summary table can render
+            # without parsing comparisons_json on every row.
+            "text_similarity": raw.get("text_similarity"),
+            "text_cer": raw.get("text_cer"),
+            "text_wer": raw.get("text_wer"),
+            "document_heading_count_delta": raw.get("document_heading_count_delta"),
+            "document_table_count_delta": raw.get("document_table_count_delta"),
+            "document_picture_count_delta": raw.get("document_picture_count_delta"),
+            "layout_iou_mean": raw.get("layout_iou_mean"),
         })
     return out
 
 
-REFERENCE_PSEUDO_MODEL = "reference"
+# Map flat-column name -> short header rendered in the summary table.
+_FLAT_COLUMN_HEADERS: dict[str, str] = {
+    "text_similarity": "text sim",
+    "text_cer": "cer",
+    "text_wer": "wer",
+    "document_heading_count_delta": "Δ headings",
+    "document_table_count_delta": "Δ tables",
+    "document_picture_count_delta": "Δ pictures",
+    "layout_iou_mean": "iou mean",
+}
 
 
 def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
     rows_sorted = sorted(rows, key=lambda r: (r["page_id"], r["model"]))
+
+    # Only show comparison columns that have at least one non-null value.
+    active_flat = [
+        col for col in _FLAT_COLUMN_HEADERS
+        if any(r.get(col) is not None for r in rows_sorted)
+    ]
 
     table = Table(title="ocrscout inspect — per-(page, model) summary")
     table.add_column("page_id", style="bold")
@@ -135,6 +188,8 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
     table.add_column("items", justify="right")
     table.add_column("chars", justify="right")
     table.add_column("s/page", justify="right")
+    for col in active_flat:
+        table.add_column(_FLAT_COLUMN_HEADERS[col], justify="right")
     table.add_column("snippet", overflow="fold")
 
     last_page: str | None = None
@@ -145,10 +200,13 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
         s_per_page = _fmt_seconds(m.get("run_seconds_per_page"))
         snippet = _snippet_from_doc(r["document_json"], snippet_length)
 
-        # Visually group rows by page: only show page_id on the first row of each group.
         page_label = r["page_id"] if r["page_id"] != last_page else ""
         last_page = r["page_id"]
-        table.add_row(page_label, r["model"], items, chars, s_per_page, snippet)
+        cells = [page_label, r["model"], items, chars, s_per_page]
+        for col in active_flat:
+            cells.append(_fmt_metric(col, r.get(col)))
+        cells.append(snippet)
+        table.add_row(*cells)
 
     Console().print(table)
 
@@ -178,44 +236,44 @@ def _show_page(rows: list[dict[str, Any]], *, page_id: str) -> None:
         else:
             rprint("[yellow](no rendered text available)[/yellow]")
 
-    # Reference is a per-page fact, not a per-model one — print it once
-    # at the bottom so spot-checks can see prediction(s) above and ground
-    # truth below in one go.
     reference = next(
         (r.get("reference_text") for r in matches if r.get("reference_text")),
         None,
     )
     if reference:
+        provenance = _parse_provenance(
+            next(
+                (r.get("reference_provenance_json") for r in matches if r.get("reference_provenance_json")),
+                None,
+            )
+        )
+        prov_label = _format_provenance(provenance)
         rprint(
             f"\n[bold magenta]=== {page_id}  ·  reference "
-            f"({len(reference)} chars) ===[/bold magenta]"
+            f"({len(reference)} chars{prov_label}) ===[/bold magenta]"
         )
         rprint(reference)
 
 
-def _show_page_diff(
+def _show_page_compare(
     rows: list[dict[str, Any]],
     *,
     page_id: str,
-    model_a: str,
-    model_b: str,
+    label_a: str,
+    label_b: str,
+    comparison_type: str,
     html: bool,
 ) -> None:
-    """Compute a word-level diff between two models; render to terminal or HTML.
-
-    Either side may be the literal ``"reference"`` to pull from the
-    ``reference_text`` column instead of a model output. When the
-    reference is involved we diff on the prediction's flattened ``text``
-    column (rather than ``markdown``) so the comparison is content-only.
-    """
+    """Run a Comparison between the two named artifacts and dispatch render."""
     page_rows = {r["model"]: r for r in rows if r["page_id"] == page_id}
     if not page_rows:
         all_pages = sorted({r["page_id"] for r in rows})
         rprint(f"[red]No rows for page_id={page_id!r}.[/red]")
         rprint(f"[dim]Available: {all_pages}[/dim]")
         raise typer.Exit(code=1)
+
     missing = [
-        m for m in (model_a, model_b)
+        m for m in (label_a, label_b)
         if m != REFERENCE_PSEUDO_MODEL and m not in page_rows
     ]
     if missing:
@@ -226,114 +284,137 @@ def _show_page_diff(
         rprint(f"[dim]Available for this page: {available}[/dim]")
         raise typer.Exit(code=1)
 
-    diff_against_reference = REFERENCE_PSEUDO_MODEL in (model_a, model_b)
-
-    def _side_text(model_name: str) -> str:
-        if model_name == REFERENCE_PSEUDO_MODEL:
-            # All rows for this page carry the same reference_text; any will do.
-            any_row = next(iter(page_rows.values()))
-            return any_row.get("reference_text") or ""
-        row = page_rows[model_name]
-        # When diffing against the reference, compare the prediction's
-        # plain-text projection — markdown headings/escape syntax would
-        # otherwise pollute every line of a content-level diff.
-        if diff_against_reference:
-            return row.get("text") or row.get("markdown") or ""
-        return row.get("markdown") or ""
-
-    text_a = _side_text(model_a)
-    text_b = _side_text(model_b)
-    if not text_a or not text_b:
-        empty = []
-        if not text_a:
-            empty.append(model_a)
-        if not text_b:
-            empty.append(model_b)
+    pred = _build_view(page_rows, label_a, kind="prediction")
+    base = _build_view(page_rows, label_b, kind="baseline")
+    if pred is None or base is None:
         rprint(
-            f"[yellow]Cannot diff: no text available for {empty}. "
-            f"({'reference adapter returned None for this page' if REFERENCE_PSEUDO_MODEL in empty else 'model produced empty output'})[/yellow]"
+            f"[yellow]Cannot run {comparison_type} comparison on {page_id!r}: "
+            f"missing data for one side.[/yellow]"
         )
         raise typer.Exit(code=1)
 
-    if html:
-        body = render_diff_page(
-            text_a, text_b,
-            page_id=page_id, model_a=model_a, model_b=model_b,
+    try:
+        cmp_cls = registry.get("comparisons", comparison_type)
+    except Exception as e:
+        rprint(
+            f"[red]Unknown --comparison-type {comparison_type!r}; "
+            f"available: {registry.list('comparisons')}[/red]"
         )
-        _serve_diff_html(body, page_id=page_id, model_a=model_a, model_b=model_b)
+        raise typer.Exit(code=1) from e
+    try:
+        renderer_cls = registry.get("comparison_renderers", comparison_type)
+    except Exception as e:
+        rprint(
+            f"[red]No renderer registered for comparison "
+            f"{comparison_type!r}.[/red]"
+        )
+        raise typer.Exit(code=1) from e
+
+    cmp = cmp_cls()
+    result = cmp.compare(pred, base)
+    if result is None:
+        rprint(
+            f"[yellow]{comparison_type} comparison returned no result — "
+            f"likely missing required input on one side (requires "
+            f"{getattr(cmp, 'requires', set())!r}).[/yellow]"
+        )
+        raise typer.Exit(code=1)
+
+    renderer = renderer_cls()
+    if html:
+        body = renderer.render_html(
+            result, prediction_label=label_a, baseline_label=label_b,
+        )
+        _serve_html(body, page_id=page_id, label_a=label_a, label_b=label_b)
         return
 
-    opcodes, tokens_a, tokens_b, stats = compute_diff(text_a, text_b)
-    _render_diff_terminal(
-        opcodes, tokens_a, tokens_b,
-        page_id=page_id, model_a=model_a, model_b=model_b,
-        similarity=stats.similarity,
-        common=stats.common,
-        removed=stats.removed,
-        added=stats.added,
+    renderer.render_terminal(
+        result,
+        prediction_label=label_a,
+        baseline_label=label_b,
+        console=Console(),
     )
 
 
-def _render_diff_terminal(
-    opcodes: list[tuple[str, int, int, int, int]],
-    tokens_a: list[str],
-    tokens_b: list[str],
+def _build_view(
+    page_rows: dict[str, dict[str, Any]],
+    label: str,
     *,
-    page_id: str,
-    model_a: str,
-    model_b: str,
-    similarity: float,
-    common: int,
-    removed: int,
-    added: int,
-) -> None:
-    rendered = Text()
-    for tag, i1, i2, j1, j2 in opcodes:
-        if tag == "equal":
-            for tok in tokens_a[i1:i2]:
-                _emit_diff_token(rendered, tok, style="")
-        elif tag == "delete":
-            for tok in tokens_a[i1:i2]:
-                _emit_diff_token(rendered, tok, style="red strike")
-        elif tag == "insert":
-            for tok in tokens_b[j1:j2]:
-                _emit_diff_token(rendered, tok, style="green")
-        elif tag == "replace":
-            for tok in tokens_a[i1:i2]:
-                _emit_diff_token(rendered, tok, style="red strike")
-            for tok in tokens_b[j1:j2]:
-                _emit_diff_token(rendered, tok, style="green")
-
-    console = Console()
-    console.print(
-        f"\n[bold cyan]=== {page_id}  ·  diff[/bold cyan]   "
-        f"[red strike]── {model_a}[/red strike]   [green]── {model_b}[/green]"
+    kind: str,
+) -> PredictionView | BaselineView | None:
+    """Translate a model name (or the ``reference`` pseudo-model) into the
+    appropriate Pydantic view object. Both view types are interchangeable
+    on the sides of a Comparison; ``kind`` only affects which class is
+    returned (so the caller can keep its naming clean).
+    """
+    if label == REFERENCE_PSEUDO_MODEL:
+        any_row = next(iter(page_rows.values()))
+        text = any_row.get("reference_text")
+        if not text:
+            return None
+        provenance = _parse_provenance(any_row.get("reference_provenance_json"))
+        page_id = any_row["page_id"]
+        if kind == "baseline":
+            return BaselineView(
+                page_id=page_id, label=label, text=text, provenance=provenance,
+            )
+        return PredictionView(page_id=page_id, label=label, text=text)
+    row = page_rows.get(label)
+    if row is None:
+        return None
+    text = row.get("text") or row.get("markdown")
+    document = _parse_document(row.get("document_json"))
+    if kind == "baseline":
+        return BaselineView(
+            page_id=row["page_id"], label=label, text=text, document=document,
+        )
+    return PredictionView(
+        page_id=row["page_id"], label=label, text=text, document=document,
     )
-    console.print(
-        f"[dim]similarity {similarity:.1f}%  ·  common {common} words  ·  "
-        f"removed {removed}  ·  added {added}[/dim]\n"
-    )
-    console.print(rendered)
 
 
-def _emit_diff_token(text_obj: Text, token: str, *, style: str) -> None:
-    """Append a diff token to a Rich Text, preserving newlines and word spacing."""
-    if "\n" in token:
-        # Paragraph break — emit unstyled so it isn't visually colored.
-        text_obj.append(token)
-    else:
-        text_obj.append(token + " ", style=style)
+def _parse_document(document_json: str | None) -> Any:
+    """Lazy-deserialize a DoclingDocument. Returns ``None`` on any failure
+    so the caller can fall back to text-only comparisons."""
+    if not document_json:
+        return None
+    try:
+        from docling_core.types.doc.document import DoclingDocument
+    except ImportError:
+        return None
+    try:
+        return DoclingDocument.model_validate_json(document_json)
+    except Exception:  # noqa: BLE001
+        return None
 
 
-def _serve_diff_html(
-    html: str, *, page_id: str, model_a: str, model_b: str
-) -> None:
+def _parse_provenance(raw: str | None) -> ReferenceProvenance | None:
+    if not raw:
+        return None
+    try:
+        return ReferenceProvenance.model_validate_json(raw)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _format_provenance(provenance: ReferenceProvenance | None) -> str:
+    if provenance is None:
+        return ""
+    bits: list[str] = [provenance.method]
+    if provenance.engine:
+        bits.append(provenance.engine)
+    if provenance.confidence is not None:
+        bits.append(f"conf={provenance.confidence:.2f}")
+    return ", " + ", ".join(bits)
+
+
+def _serve_html(html: str, *, page_id: str, label_a: str, label_b: str) -> None:
     """Serve ``html`` from a one-shot localhost HTTP server, open in browser."""
     body = html.encode("utf-8")
 
     class _Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self) -> None:
-            if self.path in ("/", "/diff", "/index.html"):
+            if self.path in ("/", "/diff", "/index.html", "/compare"):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -346,12 +427,8 @@ def _serve_diff_html(
                 self.end_headers()
 
         def log_message(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
-            pass  # silence default request logging — Rich prints what we want
+            pass
 
-    # Bind to 0.0.0.0 so the diff is reachable from other machines on the
-    # same LAN — useful when ocrscout is running on a headless GPU box and
-    # you want to view the diff in your laptop's browser. The server has
-    # no auth and accepts any GET; treat your network as trusted.
     server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), _Handler)
     port = server.server_address[1]
     local_url = f"http://127.0.0.1:{port}/"
@@ -359,8 +436,9 @@ def _serve_diff_html(
     lan_url = f"http://{lan_ip}:{port}/" if lan_ip else None
 
     rprint(
-        f"\n[bold cyan]Diff: {page_id}[/bold cyan]   "
-        f"[red strike]── {model_a}[/red strike]   [green]── {model_b}[/green]"
+        f"\n[bold cyan]Compare: {page_id}[/bold cyan]   "
+        f"[red strike]── {label_a}[/red strike]   "
+        f"[green]── {label_b}[/green]"
     )
     if lan_url:
         rprint(f"[cyan]Serving on LAN at  {lan_url}[/cyan]")
@@ -374,20 +452,12 @@ def _serve_diff_html(
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        rprint("\n[dim]Diff server stopped.[/dim]")
+        rprint("\n[dim]Compare server stopped.[/dim]")
     finally:
         server.server_close()
 
 
 def _detect_lan_ip() -> str | None:
-    """Best-effort LAN-reachable IP for the host running this server.
-
-    Uses the standard "open a UDP socket to a public IP and inspect the
-    local endpoint" trick — no packets are actually sent; we just ask the
-    kernel which interface would route to the destination, then read back
-    its address. Returns ``None`` if no usable interface can be detected
-    (e.g. fully offline host).
-    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.connect(("8.8.8.8", 80))
@@ -395,14 +465,12 @@ def _detect_lan_ip() -> str | None:
     except OSError:
         try:
             ip = socket.gethostbyname(socket.gethostname())
-            # Skip uninformative loopback fallbacks; caller will say "localhost".
             return ip if ip and not ip.startswith("127.") else None
         except OSError:
             return None
 
 
 def _snippet_from_doc(document_json: str | None, length: int) -> str:
-    """Extract a short single-line preview from the serialized DoclingDocument."""
     if not document_json:
         return "(empty)"
     try:
@@ -430,3 +498,24 @@ def _fmt_seconds(value: Any) -> str:
     if not isinstance(value, (int, float)):
         return "—"
     return f"{value:.2f}"
+
+
+def _fmt_metric(column: str, value: Any) -> str:
+    if value is None:
+        return "—"
+    if column == "text_similarity":
+        return f"{float(value):.1f}%"
+    if column in ("text_cer", "text_wer", "layout_iou_mean"):
+        return f"{float(value):.3f}"
+    if column.endswith("_delta"):
+        try:
+            n = int(value)
+        except (TypeError, ValueError):
+            return str(value)
+        return f"{n:+d}"
+    return str(value)
+
+
+# Used by ComparisonResult deserialization round-trip in callers — safe to
+# import name even if unused locally.
+__all__ = ["ComparisonResult"]

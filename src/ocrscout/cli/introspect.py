@@ -97,7 +97,7 @@ def _draft_yaml(info: HfScriptInfo) -> str:
     draft: dict = {
         "name": name,
         "source": source,
-        "model_id": info.default_model or f"TODO-set-model-id  # script default unknown",
+        "model_id": info.default_model or "TODO-set-model-id  # script default unknown",
         "model_size": "TODO  # e.g. 3B",
         "upstream_script": f"uv-scripts/ocr/{info.path.name}",
         "output_format": output_format,

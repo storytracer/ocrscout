@@ -25,12 +25,16 @@ from typing import Any
 
 import gradio as gr
 
-from ocrscout.viewer.diff import render_diff_table_fragment
-from ocrscout.viewer.store import ModelRow, PageRow, ViewerStore
+from ocrscout import registry as _registry
+from ocrscout.interfaces.comparison import BaselineView, PredictionView
+from ocrscout.viewer.store import BaselineRow, ModelRow, PageRow, ViewerStore
 
 log = logging.getLogger(__name__)
 
-VIEW_MODES = ["Single", "Side-by-side", "Diff"]
+VIEW_MODES = ["Single", "Side-by-side", "Compare"]
+# Pseudo-model token for the page's reference baseline. Mirrors the
+# inspector's REFERENCE_PSEUDO_MODEL convention.
+REFERENCE_PSEUDO_MODEL = "reference"
 STATIC_DIR = Path(__file__).parent / "static"
 
 
@@ -287,14 +291,19 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 return current[:1] or (
                     [store.all_models[0]] if store.all_models else []
                 )
-            if mode == "Diff":
+            if mode == "Compare":
                 seeded = current[:2]
-                if len(seeded) < 2:
-                    for m in store.all_models:
-                        if m not in seeded:
-                            seeded.append(m)
-                        if len(seeded) >= 2:
-                            break
+                # In Compare mode, B can be either a model or the
+                # `reference` pseudo-model. Default-seed B with reference
+                # if a baseline exists for the run; otherwise pick the
+                # next available model.
+                second_choices = (
+                    [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
+                ) + [m for m in store.all_models if m not in seeded]
+                if len(seeded) < 1 and store.all_models:
+                    seeded.append(store.all_models[0])
+                if len(seeded) < 2 and second_choices:
+                    seeded.append(second_choices[0])
                 return seeded[:2]
             # Side-by-side: keep selection, but ensure non-empty.
             return current or store.all_models[: min(2, len(store.all_models))]
@@ -473,44 +482,65 @@ def _draw_model_picker(
         )
         return
 
-    if mode == "Diff":
-        # Seed both sides; if the user has fewer than 2 picked, pad from
-        # all_models so neither dropdown starts empty.
+    if mode == "Compare":
+        # Compare mode pairs any two artifacts: another model, or the
+        # `reference` pseudo-token (which pulls the page's reference text
+        # via store.baselines_for()). Choices for Side B include
+        # baselines when any are registered in this run; the comparison-
+        # type dropdown filters which renderers fire.
+        baseline_choices = (
+            [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
+        )
+        a_choices = list(all_models)
+        b_choices = list(all_models) + baseline_choices
         seeded = list(current[:2])
-        for m in all_models:
-            if len(seeded) >= 2:
-                break
-            if m not in seeded:
-                seeded.append(m)
+        if len(seeded) < 1 and a_choices:
+            seeded.append(a_choices[0])
+        if len(seeded) < 2:
+            seeded.append(
+                next(
+                    (m for m in baseline_choices if m not in seeded),
+                    next((m for m in all_models if m not in seeded), None),
+                )
+            )
         a_val = seeded[0] if len(seeded) > 0 else None
         b_val = seeded[1] if len(seeded) > 1 else None
         with gr.Row(equal_height=True):
             dd_a = gr.Dropdown(
-                choices=all_models,
+                choices=a_choices,
                 value=a_val,
-                label="Model A",
+                label="Prediction",
                 interactive=True,
                 elem_classes=["ocrscout-model-picker"],
             )
             dd_b = gr.Dropdown(
-                choices=all_models,
+                choices=b_choices,
                 value=b_val,
-                label="Model B",
+                label="Baseline",
                 interactive=True,
                 elem_classes=["ocrscout-model-picker"],
             )
 
-        def _diff_pair(a: str | None, b: str | None) -> list[str]:
+        def _compare_pair(a: str | None, b: str | None) -> list[str]:
             return [m for m in (a, b) if m]
 
-        dd_a.change(_diff_pair, inputs=[dd_a, dd_b], outputs=[models_state])
-        dd_b.change(_diff_pair, inputs=[dd_a, dd_b], outputs=[models_state])
+        dd_a.change(_compare_pair, inputs=[dd_a, dd_b], outputs=[models_state])
+        dd_b.change(_compare_pair, inputs=[dd_a, dd_b], outputs=[models_state])
         return
 
-    # Side-by-side: free multi-select.
-    seeded = list(current) if current else (all_models[: min(2, len(all_models))])
+    # Side-by-side: free multi-select. Include `reference` as a checkable
+    # column when the run has baselines — it's a parallel text source the
+    # user is likely to want next to the model outputs even though it's
+    # not itself a model. It's still typed as a BaselineRow under the
+    # hood; only the picker UX treats it as another stream.
+    sidebyside_choices = list(all_models) + (
+        [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
+    )
+    seeded = list(current) if current else (
+        sidebyside_choices[: min(2, len(sidebyside_choices))]
+    )
     cg = gr.CheckboxGroup(
-        choices=all_models,
+        choices=sidebyside_choices,
         value=seeded,
         label="Models",
         interactive=True,
@@ -535,68 +565,66 @@ def _draw_text_pane(
         gr.Markdown("_Pick at least one model._")
         return
 
-    rows: dict[str, ModelRow] = {}
+    # Compare mode does its own validation and dispatches via the
+    # comparisons registry; it can handle `reference` directly via
+    # store.baselines_for(). Skip the columns-build below.
+    if mode == "Compare":
+        _draw_compare_pane(store, page_id, models)
+        return
+
+    # Build the list of columns to render. Order follows the user's
+    # selection. Each entry is either a ModelRow (an OCR model output for
+    # this page) or a BaselineRow (the page's reference, surfaced when the
+    # user ticked the `reference` box).
+    columns: list[tuple[str, ModelRow | BaselineRow]] = []
     for m in models:
-        r = store.get(page_id, m)
-        if r is not None:
-            rows[m] = r
-    if not rows:
-        gr.Markdown(f"_No model rows for page `{page_id}`._")
+        if m == REFERENCE_PSEUDO_MODEL:
+            baselines = store.baselines_for(page_id)
+            if baselines:
+                columns.append((m, baselines[0]))
+        else:
+            r = store.get(page_id, m)
+            if r is not None:
+                columns.append((m, r))
+    if not columns:
+        gr.Markdown(f"_No content for page `{page_id}` with the current selection._")
         return
 
     if mode == "Single":
-        # Use the first selected model.
-        first = next(iter(rows.values()))
-        _emit_stats_strip(first)
-        _emit_text_body(first, store, use_structured=_has_structure(first))
+        _label, row = columns[0]
+        if isinstance(row, BaselineRow):
+            _emit_baseline_stats_strip(row)
+            _emit_baseline_text_body(row)
+        else:
+            _emit_stats_strip(row)
+            _emit_text_body(row, store, use_structured=_has_structure(row))
         return
 
-    if mode == "Diff":
-        names = list(rows.keys())
-        if len(names) < 2:
-            gr.Markdown("_Diff needs exactly two models — pick another._")
-            return
-        a, b = names[0], names[1]
-        if len(names) > 2:
-            gr.Markdown(
-                f"_Diff uses the first two selected models: **{escape(a)}** vs **{escape(b)}**. "
-                "Deselect others to change the pair._"
-            )
-        fragment, stats = render_diff_table_fragment(
-            rows[a].markdown, rows[b].markdown, model_a=a, model_b=b
-        )
-        gr.HTML(
-            f'<div class="ocrscout-stats-strip">'
-            f'<span class="name">{escape(a)} ↔ {escape(b)}</span>'
-            f'<span>similarity {stats.similarity:.1f}%</span>'
-            f'<span>common {stats.common}</span>'
-            f'<span>removed {stats.removed}</span>'
-            f'<span>added {stats.added}</span>'
-            f"</div>"
-            + fragment
-        )
-        return
-
-    # Side-by-side: one column per model.
-    n = len(rows)
-    # Cap visible columns to avoid pathological sliver layouts. When more
-    # than 5 are picked, render the first 5 and surface a hint.
-    items = list(rows.items())
-    capped = items[:5]
+    # Side-by-side: one column per selected artifact (caps at 5).
+    n = len(columns)
+    capped = columns[:5]
     if n > 5:
         gr.Markdown(
-            f"_{n} models selected — showing first 5. Deselect some to see "
+            f"_{n} columns selected — showing first 5. Deselect some to see "
             "the rest._"
         )
     # Color-coded sections only when *every* visible row has layout — mixing
-    # structured and plain panes side-by-side reads inconsistently. If even
-    # one model is plain-markdown, all panes drop back to plain markdown.
-    all_structured = all(_has_structure(r) for _, r in capped)
+    # structured and plain panes side-by-side reads inconsistently. References
+    # never have layout, so a Side-by-side that includes one always falls
+    # back to plain markdown across the board.
+    all_structured = all(
+        isinstance(row, ModelRow) and _has_structure(row)
+        for _, row in capped
+    )
     with gr.Row(equal_height=False):
-        for _m, row in capped:
+        for _label, row in capped:
             with gr.Column(scale=1, min_width=200):
-                _emit_stats_strip(row)
-                _emit_text_body(row, store, use_structured=all_structured)
+                if isinstance(row, BaselineRow):
+                    _emit_baseline_stats_strip(row)
+                    _emit_baseline_text_body(row)
+                else:
+                    _emit_stats_strip(row)
+                    _emit_text_body(row, store, use_structured=all_structured)
 
 
 def _has_structure(row: ModelRow) -> bool:
@@ -611,6 +639,134 @@ def _has_structure(row: ModelRow) -> bool:
     markdown for those rows.
     """
     return len(row.bboxes) > 0
+
+
+def _draw_compare_pane(
+    store: ViewerStore, page_id: str, models: list[str]
+) -> None:
+    """Compare-mode rendering: build typed views for the two selected
+    artifacts, run every registered comparison whose ``requires`` set is
+    satisfiable, and dispatch each result through its registered renderer.
+
+    Stacks all firing comparisons vertically so a layout-comparison and a
+    text-comparison can both surface side-by-side without a separate UI
+    toggle. Renderers that can't handle the result type silently degrade.
+    """
+    if len(models) < 2:
+        gr.Markdown(
+            "_Compare needs two artifacts. Pick a Prediction and a Baseline._"
+        )
+        return
+    a_label, b_label = models[0], models[1]
+    if a_label == b_label:
+        gr.Markdown(
+            f"_Compare needs two different artifacts; both sides are `{escape(a_label)}`._"
+        )
+        return
+
+    pred = _build_compare_view(store, page_id, a_label, kind="prediction")
+    base = _build_compare_view(store, page_id, b_label, kind="baseline")
+    if pred is None or base is None:
+        gr.Markdown(
+            f"_Cannot build comparison views for "
+            f"`{escape(a_label)}` vs `{escape(b_label)}` on page `{escape(page_id)}`._"
+        )
+        return
+
+    if b_label == REFERENCE_PSEUDO_MODEL and isinstance(base, BaselineView):
+        prov = base.provenance
+        prov_bits: list[str] = []
+        if prov is not None:
+            prov_bits.append(prov.method)
+            if prov.engine:
+                prov_bits.append(prov.engine)
+            if prov.confidence is not None:
+                prov_bits.append(f"conf={prov.confidence:.2f}")
+        prov_label = " — " + ", ".join(prov_bits) if prov_bits else ""
+        gr.HTML(
+            '<div class="ocrscout-stats-strip">'
+            f'<span class="name">{escape(a_label)} vs '
+            f'{escape(b_label)}{escape(prov_label)}</span>'
+            "</div>"
+        )
+
+    comparison_names = _registry.list("comparisons")
+    rendered_any = False
+    for name in comparison_names:
+        try:
+            cmp_cls = _registry.get("comparisons", name)
+            renderer_cls = _registry.get("comparison_renderers", name)
+        except Exception:  # noqa: BLE001
+            continue
+        cmp = cmp_cls()
+        try:
+            result = cmp.compare(pred, base)
+        except Exception as e:  # noqa: BLE001
+            gr.Markdown(f"_{escape(name)} comparison failed: `{escape(str(e))}`_")
+            continue
+        if result is None:
+            continue
+        renderer = renderer_cls()
+        fragment = renderer.render_gradio(
+            result, prediction_label=a_label, baseline_label=b_label,
+        )
+        gr.HTML(
+            f'<h3 class="ocrscout-cmp-heading">{escape(name)} comparison</h3>'
+        )
+        gr.HTML(fragment)
+        rendered_any = True
+    if not rendered_any:
+        gr.Markdown(
+            f"_No comparison fired for `{escape(a_label)}` vs `{escape(b_label)}`. "
+            "Check that both sides have the required modality (text / "
+            "document / layout)._"
+        )
+
+
+def _build_compare_view(
+    store: ViewerStore, page_id: str, label: str, *, kind: str
+) -> PredictionView | BaselineView | None:
+    """Translate a label (model name or `reference` pseudo-token) into the
+    appropriate Pydantic view object for one side of a comparison.
+    """
+    if label == REFERENCE_PSEUDO_MODEL:
+        baselines = store.baselines_for(page_id)
+        if not baselines:
+            return None
+        bl = baselines[0]
+        if kind == "baseline":
+            return BaselineView(
+                page_id=page_id,
+                label=bl.label,
+                text=bl.text,
+                provenance=bl.provenance,
+            )
+        return PredictionView(page_id=page_id, label=bl.label, text=bl.text)
+    row = store.get(page_id, label)
+    if row is None:
+        return None
+    document = _document_from_row(row)
+    text = row.text or row.markdown
+    if kind == "baseline":
+        return BaselineView(
+            page_id=page_id, label=label, text=text, document=document,
+        )
+    return PredictionView(
+        page_id=page_id, label=label, text=text, document=document,
+    )
+
+
+def _document_from_row(row: ModelRow) -> Any:
+    if not row.document_json:
+        return None
+    try:
+        from docling_core.types.doc.document import DoclingDocument
+    except ImportError:
+        return None
+    try:
+        return DoclingDocument.model_validate_json(row.document_json)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _emit_text_body(
@@ -671,12 +827,50 @@ def _emit_stats_strip(row: ModelRow) -> None:
     )
 
 
+def _emit_baseline_stats_strip(baseline: BaselineRow) -> None:
+    """Stats strip for a reference column. Different shape from a model
+    row's strip — references have no run-time metrics or DoclingDocument
+    items, but their provenance is load-bearing context (the comparison
+    numbers downstream mean very different things if the baseline is
+    legacy OCR vs human transcription)."""
+    chars = len(baseline.text)
+    prov = baseline.provenance
+    prov_bits: list[str] = []
+    if prov is not None:
+        prov_bits.append(prov.method)
+        if prov.engine:
+            prov_bits.append(prov.engine)
+        if prov.confidence is not None:
+            prov_bits.append(f"conf={prov.confidence:.2f}")
+    prov_html = (
+        f'<span class="prov">{escape(", ".join(prov_bits))}</span>'
+        if prov_bits else ""
+    )
+    gr.HTML(
+        '<div class="ocrscout-stats-strip ocrscout-baseline-strip">'
+        f'<span class="name">{escape(baseline.label)}</span>'
+        '<span class="kind">(reference)</span>'
+        f"<span>chars: {chars}</span>"
+        f"{prov_html}"
+        "</div>"
+    )
+
+
+def _emit_baseline_text_body(baseline: BaselineRow) -> None:
+    """Render a reference baseline's text. References never have layout
+    structure, so we always fall through to plain markdown."""
+    gr.Markdown(
+        baseline.text or "_(empty)_",
+        elem_classes=["ocrscout-markdown-pane", "ocrscout-baseline-pane"],
+    )
+
+
 _HELP_HTML = """
 <div class="ocrscout-help">
 <h3>Keyboard shortcuts</h3>
 <dl>
   <dt>j / k</dt><dd>Next / previous page</dd>
-  <dt>1 / 2 / 3</dt><dd>Switch to Single / Side-by-side / Diff mode</dd>
+  <dt>1 / 2 / 3</dt><dd>Switch to Single / Side-by-side / Compare mode</dd>
   <dt>i</dt><dd>Toggle the image pane</dd>
   <dt>?</dt><dd>Show this help</dd>
 </dl>
@@ -685,11 +879,13 @@ _HELP_HTML = """
   <dt>Single</dt><dd>One model, full markdown — for reading.</dd>
   <dt>Side-by-side</dt><dd>One column per selected model (caps at 5).
     Synchronized scroll across columns.</dd>
-  <dt>Diff</dt><dd>Pairwise word-level diff between two models. Pick A and B
-    from the dropdowns.</dd>
+  <dt>Compare</dt><dd>Run text / document / layout comparisons between any
+    two artifacts. Side B can be a model or the page's <code>reference</code>
+    baseline (with provenance shown). Stacks every comparison whose
+    required modality is satisfied.</dd>
 </dl>
 <h3>URL parameters</h3>
-<p>Append <code>?page=...&amp;models=a,b&amp;mode=Diff</code> to share a
+<p>Append <code>?page=...&amp;models=a,b&amp;mode=Compare</code> to share a
 specific view.</p>
 </div>
 """

@@ -259,7 +259,9 @@ def _render_schema_section(has_image_column: bool) -> str:
         "| `tokens` | int | Generated tokens (when reported). |\n"
         "| `error` | string | Set when the page failed for this model. |\n"
         "| `metrics_json` | string | Per-row JSON metrics (timings, sizes, …). |\n"
-        "| `scores_json` | string | Reference-eval scores when an evaluator ran. |\n"
+        "| `comparisons_json` | string | Typed `ComparisonResult` envelope per (page, model) when comparisons ran. |\n"
+        "| `text_similarity` / `text_cer` / `text_wer` | float | Flat text-comparison metrics. |\n"
+        "| `reference_text` / `reference_provenance_json` | string | Reference content + its provenance (method/engine/confidence) — references are not necessarily ground truth. |\n"
     )
     return base
 

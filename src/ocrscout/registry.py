@@ -22,7 +22,8 @@ EntryGroup = Literal[
     "backends",
     "normalizers",
     "exports",
-    "evaluators",
+    "comparisons",
+    "comparison_renderers",
     "benchmarks",
     "reporters",
     "layout_detectors",
@@ -34,7 +35,8 @@ _GROUPS: tuple[EntryGroup, ...] = (
     "backends",
     "normalizers",
     "exports",
-    "evaluators",
+    "comparisons",
+    "comparison_renderers",
     "benchmarks",
     "reporters",
     "layout_detectors",
@@ -69,9 +71,15 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
         "exports": {
             "parquet": "ocrscout.exports.parquet:ParquetExportAdapter",
         },
-        "evaluators": {
-            "edit_distance": "ocrscout.evaluators.edit_distance:EditDistanceEvaluator",
-            "vlm_judge": "ocrscout.evaluators.vlm_judge:VlmJudgeEvaluator",
+        "comparisons": {
+            "text": "ocrscout.comparisons.text:TextComparison",
+            "document": "ocrscout.comparisons.document:DocumentComparison",
+            "layout": "ocrscout.comparisons.layout:LayoutComparison",
+        },
+        "comparison_renderers": {
+            "text": "ocrscout.comparisons.renderers.text_renderer:TextComparisonRenderer",
+            "document": "ocrscout.comparisons.renderers.document_renderer:DocumentComparisonRenderer",
+            "layout": "ocrscout.comparisons.renderers.layout_renderer:LayoutComparisonRenderer",
         },
         "benchmarks": {},
         "reporters": {

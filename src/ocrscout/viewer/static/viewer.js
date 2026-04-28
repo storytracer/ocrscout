@@ -110,7 +110,7 @@
         ev.preventDefault();
         break;
       case "3":
-        setRadioValueByLabel("ocrscout-view-mode", "Diff");
+        setRadioValueByLabel("ocrscout-view-mode", "Compare");
         ev.preventDefault();
         break;
       case "?":

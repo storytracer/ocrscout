@@ -175,7 +175,27 @@ The viewer code lives under [src/ocrscout/viewer/](src/ocrscout/viewer/):
 - `app.py` — `build_app(output_dir) -> gr.Blocks`. Three control groups in the top bar (Page navigation / View mode / Layout source / Actions); a sticky image column with custom legend; a text pane re-rendered via `@gr.render` based on view mode and selected models.
 - `static/viewer.css` and `static/viewer.js` — shipped via `force-include` in `pyproject.toml`. CSS handles the section-block coloring, sticky positioning, and control-group framing; JS provides keyboard shortcuts (j/k for prev/next page, 1/2/3 for view modes, i for image toggle), synchronized scroll across markdown panes, and URL ↔ state sync.
 
-When changing the viewer: do not write code that auto-hides the image pane on view-mode change — the image stays visible across all modes (Single / Side-by-side / Diff), and only the user's manual Toggle image button hides it.
+When changing the viewer: do not write code that auto-hides the image pane on view-mode change — the image stays visible across all modes (Single / Side-by-side / Compare), and only the user's manual Toggle image button hides it.
+
+## Comparisons subsystem
+
+Reference vs prediction agreement is a first-class concept, with three coupled abstractions in [src/ocrscout/interfaces/comparison.py](src/ocrscout/interfaces/comparison.py):
+
+- **`Comparison`** — one analytic axis (text / document / layout / future semantic). Takes `PredictionView` + `BaselineView`, returns a typed `ComparisonResult` subclass or `None` (when required modality isn't available on both sides). Built-ins under [src/ocrscout/comparisons/](src/ocrscout/comparisons/).
+- **`ComparisonResult`** — Pydantic discriminated union, ``comparison`` field is the literal name. Subclasses carry rich payload (diff opcodes, item-count breakdowns, per-category IoU); the ``summary: dict[str, float]`` projection lifts the most-queried numbers for cross-cutting consumers.
+- **`ComparisonRenderer`** — terminal/HTML/Gradio surface for one result type. Lives in [src/ocrscout/comparisons/renderers/](src/ocrscout/comparisons/renderers/), registered under the `comparison_renderers` registry group. Updating styling in one renderer updates the inspector's `--compare --html` page and the viewer's Compare mode in lockstep.
+
+**Reference is not ground truth.** Most references in the wild (BHL, IA legacy OCR) are themselves OCR output. `Reference.provenance` (`method`, `engine`, `confidence`) is mandatory in spirit and consumed by the inspector and Compare mode so users can interpret comparison numbers as agreement-vs-incumbent rather than accuracy-vs-truth. Reference adapters set provenance in their constructors (see [src/ocrscout/references/bhl_ocr.py](src/ocrscout/references/bhl_ocr.py): `method="ocr", engine="bhl-legacy"`).
+
+**Storage.** Per-page `ExportRecord.comparisons: dict[str, ComparisonResult]` round-trips through the parquet's `comparisons_json` column; canonical metrics also lift into flat top-level columns (`text_similarity`, `text_cer`, `text_wer`, `document_*_delta`, `layout_iou_mean`) for SQL ergonomics. `reference_provenance_json` carries the typed provenance.
+
+**Auto-firing.** When a reference adapter is configured and `--comparisons` is unset, the run loop runs every registered comparison whose `requires` set is satisfied. Pass `--comparisons text,layout` to whitelist or `--comparisons none` to skip. Optional CER/WER gated behind `pip install ocrscout[eval]` (jiwer).
+
+**Entry-point groups**: `ocrscout.comparisons`, `ocrscout.comparison_renderers`. Built-ins are registered in [src/ocrscout/registry.py](src/ocrscout/registry.py); third-party packages add via these groups without touching ocrscout's source tree.
+
+## BHL source adapter quirks
+
+The [`bhl`](src/ocrscout/sources/bhl.py) source adapter samples pages by joining BHL's TSV catalogs in DuckDB, then fetches JP2 images from `s3://bhl-open-data/images/{BarCode}/{SequenceOrder:04d}.jp2` and OCR sidecars from `s3://bhl-open-data/ocr/item-{ItemID:06d}/item-{ItemID:06d}-{PageID:08d}-{SequenceOrder:04d}.txt`. Per BHL's own README, a tiny historical minority of items used `_0000.jp2` instead of `_0001.jp2` for the first leaf — empirically not encountered in random sampling (0/100). The adapter trusts the modern convention universally; if a truly-legacy item slips through, the image fetch 404s and the page is cleanly skipped with a warning. Image and OCR sidecars share the same NNNN suffix per item by construction (the OCR pipeline names its output after the input image), so they cannot drift apart within an item — only relative to BHL's logical SequenceOrder, which would shift both by one in the legacy case. If/when a legacy item is empirically observed and matters, the cleanest fix is consulting IA-style scandata XML (BHL hosts it under `bhl-open-data/scandata/`) for authoritative per-leaf metadata.
 
 ## Tests are paused
 
@@ -186,8 +206,8 @@ The project is in rapid-prototyping mode. The previous test suite was deleted (r
 1. **Skeleton**: public API, ABCs, three normalizers, working sources/references/exports, CLI stubs.
 2. **Single-model run end-to-end** with `VllmBackend` (subprocess mode): manifest-based runner, output capture, normalization, export to parquet. First curated model: `dots-mocr`.
 3. **Multi-model scouting**: parallel runs, per-model metrics, side-by-side report.
-4. **Reference comparison**: ALTO/hOCR adapters, `EditDistanceEvaluator`, improvement/regression rates.
-5. **Benchmarks**: MDPBench plugin (source + reference + evaluator + canonical score).
+4. **Reference comparison**: ALTO/hOCR adapters; the `Comparison` subsystem (text/document/layout) is in place; remaining is corpus-level improvement/regression aggregation in a Reporter.
+5. **Benchmarks**: MDPBench plugin (source + reference + comparisons + canonical score).
 6. **Pipeline-mode YAML**: `ocrscout apply pipeline.yaml` with full DAG of stages.
 7. **Additional backends**: extended `DoclingBackend` for non-SmolDocling VLMs, OpenAI-compatible (Ollama, LM Studio, Gemini, Claude), Tesseract.
 8. **Ecosystem**: HF Hub publishing of results, VLM judge evaluator with ELO, more reporters (HTML, terminal, web).
