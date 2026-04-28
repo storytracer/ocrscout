@@ -58,10 +58,11 @@ cloud = [
 docling = ["docling"]
 serve = ["litellm[proxy]>=1.50.0"]
 viewer = [
-    # >=5.49 is the first line whose `gradio.oauth` uses `huggingface_hub.get_token`
-    # instead of the removed-in-hub-1.0 `HfFolder`. Older gradio crashes at
-    # import on machines with huggingface_hub>=1.0.
-    "gradio>=5.49.0",
+    # gradio 6+ moved css/head from the Blocks constructor onto Blocks.launch,
+    # which is the API our viewer / Space app target. Older gradio also fails
+    # to import against huggingface_hub>=1.0 (removed `HfFolder`). 6.13 is
+    # the current stable.
+    "gradio>=6.13.0",
 ]
 # Layout-aware OCR pipeline (ocrscout.backends.layout_chat + the
 # pp-doclayout-v3 detector). Uses the official Hugging Face Transformers
