@@ -520,16 +520,32 @@ def _draw_model_picker(
             [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
         )
         a_choices = list(all_models)
-        b_choices = list(all_models) + baseline_choices
+        # Reference at the top of the baseline dropdown — typical workflow
+        # is to compare prediction against the page's reference.
+        b_choices = baseline_choices + list(all_models)
         seeded = list(current[:2])
+        # Treat the picker's input as "default fill" (the user hasn't
+        # actively picked a baseline yet) when current carries the full
+        # all-models list, or when slot 1 is missing/duplicates slot 0. In
+        # those cases force the baseline to ``reference`` if available.
+        is_default_fill = (
+            list(current) == list(all_models)
+            or len(current) > 2
+        )
         if len(seeded) < 1 and a_choices:
             seeded.append(a_choices[0])
-        if len(seeded) < 2:
+        if baseline_choices and (
+            is_default_fill
+            or len(seeded) < 2
+            or (len(seeded) >= 2 and seeded[1] == seeded[0])
+        ):
+            if len(seeded) < 2:
+                seeded.append(REFERENCE_PSEUDO_MODEL)
+            else:
+                seeded[1] = REFERENCE_PSEUDO_MODEL
+        elif len(seeded) < 2:
             seeded.append(
-                next(
-                    (m for m in baseline_choices if m not in seeded),
-                    next((m for m in all_models if m not in seeded), None),
-                )
+                next((m for m in all_models if m not in seeded), None)
             )
         a_val = seeded[0] if len(seeded) > 0 else None
         b_val = seeded[1] if len(seeded) > 1 else None
