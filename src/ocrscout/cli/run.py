@@ -53,10 +53,11 @@ def run(
              "Hub) only fetch the sampled subset — they do not download "
              "the whole prefix. Use --seed for reproducibility.",
     ),
-    seed: int | None = typer.Option(
-        None, "--seed",
-        help="RNG seed for --sample. Default is unseeded — every run gets "
-             "a different subset. Pin to an integer to reproduce a scout.",
+    seed: int = typer.Option(
+        42, "--seed",
+        help="RNG seed for --sample. Defaults to 42 so re-running the same "
+             "command picks the same pages — pin to a different integer for "
+             "a different reproducible subset, or override per-run as needed.",
     ),
     benchmark: str | None = typer.Option(
         None, "--benchmark", help="Run a registered benchmark instead of --source."
