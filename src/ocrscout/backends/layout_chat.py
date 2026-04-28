@@ -34,6 +34,7 @@ from ocrscout.backends._openai_chat import (
     ChatCompletionError,
     build_base_payload,
     build_chat_request_body,
+    list_models,
     normalize_endpoint,
     post_chat_completion,
 )
@@ -47,6 +48,7 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_REGION_CONCURRENCY = 16
 _DEFAULT_REQUEST_TIMEOUT = 300.0
+_MODELS_PROBE_TIMEOUT = 15.0
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
 # small same-row jitter without conflating rows on tightly-packed pages.
 _READING_ORDER_ROW_PX = 50
@@ -80,11 +82,33 @@ class LayoutChatBackend(ModelBackend):
                 "Set --server-url, --managed, or profile.server_url. "
                 "Subprocess vLLM is not supported in layout mode."
             )
+        endpoint = normalize_endpoint(server_url)
+
+        # Probe /models before doing anything expensive: catches "wrong
+        # --server-url" and "model not loaded on this endpoint" up front,
+        # rather than after every region 404s silently inside _post_region.
+        session = requests.Session()
+        try:
+            served = list_models(session, endpoint, timeout=_MODELS_PROBE_TIMEOUT)
+        except ChatCompletionError as e:
+            session.close()
+            raise BackendError(
+                f"LayoutChatBackend: failed to query {endpoint}/models for "
+                f"profile {profile.name!r}: {e}"
+            ) from e
+        if profile.model_id not in served:
+            session.close()
+            raise BackendError(
+                f"LayoutChatBackend: profile {profile.name!r} expects model "
+                f"{profile.model_id!r} but {endpoint} serves {served!r}. "
+                f"Check --server-url (proxy URL when --managed runs multiple models)."
+            )
 
         detector_cls = registry.get("layout_detectors", profile.layout_detector)
         try:
             detector = detector_cls(**profile.layout_detector_args)
         except Exception as e:
+            session.close()
             raise BackendError(
                 f"LayoutChatBackend: failed to instantiate layout detector "
                 f"{profile.layout_detector!r}: {e}"
@@ -92,13 +116,13 @@ class LayoutChatBackend(ModelBackend):
 
         return BackendInvocation(
             kind="http",
-            endpoint=server_url.rstrip("/"),
+            endpoint=endpoint,
             profile=profile,
             pages=[p.page_id for p in pages],
             extra={
                 "pages_runtime": list(pages),
                 "detector": detector,
-                "session": requests.Session(),
+                "session": session,
             },
         )
 

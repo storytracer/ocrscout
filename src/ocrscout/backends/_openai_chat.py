@@ -118,3 +118,26 @@ def normalize_endpoint(endpoint: str) -> str:
     live behind a proxy with a different prefix.
     """
     return endpoint.rstrip("/")
+
+
+def list_models(
+    session: requests.Session, endpoint: str, *, timeout: float
+) -> list[str]:
+    """GET ``{endpoint}/models`` and return the served model ids.
+
+    Raises :class:`ChatCompletionError` on transport, HTTP, or parse failure.
+    Use this to fail fast when a backend is pointed at the wrong server URL.
+    """
+    url = f"{endpoint.rstrip('/')}/models"
+    try:
+        resp = session.get(url, timeout=timeout)
+    except requests.RequestException as e:
+        raise ChatCompletionError(f"GET {url}: {type(e).__name__}: {e}") from e
+    if resp.status_code >= 400:
+        body_text = resp.text or resp.reason or ""
+        raise ChatCompletionError(f"GET {url}: HTTP {resp.status_code}: {body_text}")
+    try:
+        data = resp.json()
+        return [entry["id"] for entry in data["data"]]
+    except (ValueError, KeyError, TypeError) as e:
+        raise ChatCompletionError(f"GET {url}: {type(e).__name__} parsing response: {e}") from e
