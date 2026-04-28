@@ -35,8 +35,8 @@ Behind the scenes:
 - **Runs each model for you.** Loads each one onto the GPU, runs your pages through it, and shuts down cleanly when it's done. Manages GPU memory if you load several at once.
 - **Normalises every output.** One model returns Markdown, another HTML, another its own custom token stream. ocrscout converts every result into a common document model so you can compare apples to apples.
 - **Writes one HuggingFace-shaped dataset.** One row per `(page, model)` in `data/train-*.parquet` with timings, success rates, output token counts, the normalised document, and a pre-rendered Markdown rendering ready for `grep`/diff/viewer.
-- **Has a browser viewer.** Flip through pages, switch between models, see bounding boxes overlaid on the source image, compare two models word-by-word in a side-by-side diff.
-- **Scores accuracy when you have ground truth.** Drop in a folder of reference transcriptions and ocrscout adds edit-distance scores per page and overall.
+- **Has a browser viewer.** Flip through pages, switch between models, see bounding boxes overlaid on the source image, compare two artifacts word-by-word, place the page's reference baseline alongside any model output for direct comparison.
+- **Scores predictions against any baseline.** Drop in a reference adapter (plain-text files, BHL legacy OCR, future ALTO/hOCR) and ocrscout runs a configurable suite of comparisons per page — text similarity always, character/word error rates with the `[eval]` extra, structural and layout deltas when both sides carry the relevant data. Reference is *not* assumed to be ground truth: provenance (`method`, `engine`, `confidence`) is captured so you can interpret the numbers as accuracy-vs-truth or agreement-vs-incumbent depending on the source.
 
 It's a *scout*, not a production system — the goal is to help you decide which model is worth using, or whether re-running your existing corpus through a newer one is worth the GPU-hours. Once you've picked a model, [Docling](https://github.com/docling-project/docling) is the toolchain for running it at scale.
 
@@ -65,9 +65,11 @@ The core install has **zero GPU or AI dependencies** and finishes in seconds on 
 | Extra | What it gives you | Add it when… |
 | --- | --- | --- |
 | `pdf` | Read PDF documents directly | Your source documents are PDFs (otherwise you need to convert them to images first) |
-| `alto` | Parse ALTO/hOCR ground-truth files | You have existing OCR transcriptions in ALTO/hOCR format and want to score against them |
+| `alto` | Parse ALTO/hOCR reference files | You have existing OCR transcriptions in ALTO/hOCR format and want to compare against them |
 | `iiif` | Read images from a IIIF-compliant server | Your documents live in a digital library / archive that exposes IIIF |
 | `cloud` | Read images from cloud storage | Your documents live on S3 (`s3://...`) or Google Cloud Storage (`gs://...`) |
+| `bhl` | Sample images and OCR from the [Biodiversity Heritage Library](https://registry.opendata.aws/bhl-open-data/) S3 bucket | You want to scout OCR models against BHL's 305K-volume / 67M-page open-data corpus (DuckDB-driven catalog sampling, anonymous S3, JP2 decode via `imagecodecs`) |
+| `eval` | Add character/word error rates to text comparisons | You want CER/WER (industry-standard OCR metrics from `jiwer`) on top of the always-on word-level similarity score |
 | `docling` | Add the [Docling](https://github.com/docling-project/docling) backend | You also want to test classical OCR (Tesseract, EasyOCR) alongside the AI models |
 | `serve` | Run several models behind one shared URL | You want to compare multiple models in one run (`--managed` mode) |
 | `viewer` | A browser-based inspector for your results | You want to flip through pages and compare models visually instead of reading raw output |
@@ -93,13 +95,23 @@ Here's what happens, in plain terms:
    - `pipeline.yaml` — the resolved configuration ocrscout actually ran (source, models, normalizer overrides, sample/seed), so the run is reproducible.
 6. A summary table is printed: how many pages each model handled, how often it failed, mean seconds per page, total output tokens.
 
-**Got ground-truth transcriptions?** If you have plain-text references (one `.txt` per page, matched by filename), add them and ocrscout also computes edit-distance accuracy scores:
+**Got reference transcriptions or legacy OCR?** Point ocrscout at a reference adapter — plain-text files matched by page-id, or one of the corpus-specific adapters like `bhl_ocr` — and ocrscout runs every applicable comparison per (page, model). The text comparison's word-level similarity is always present; CER/WER are added if you install the `[eval]` extra; document and layout comparisons fire when both sides supply the relevant data.
 
 ```bash
+# Plain-text references on disk
 uv run ocrscout run --source ./images/ \
                     --reference plain_text --reference-path ./txt/ \
                     --models dots-mocr,smoldocling
+
+# BHL legacy OCR as reference, sampled directly from the open-data S3 bucket
+uv run ocrscout run --source-name bhl --sample 20 \
+                    --source-arg 'languages=["eng"]' \
+                    --reference bhl_ocr \
+                    --models lighton-ocr2 \
+                    --server-url http://localhost:8000/v1
 ```
+
+ocrscout records each per-page comparison result in the parquet (rich JSON for renderer use, plus flat columns like `text_similarity`/`text_cer`/`text_wer`/`layout_iou_mean` for SQL ergonomics) and rolls per-model averages into the run summary table. References are not assumed to be ground truth — provenance (`method`/`engine`/`confidence`) flows through the parquet so you can interpret the numbers correctly.
 
 **Look at the results:**
 
@@ -194,20 +206,22 @@ After a run, your output directory contains `data/train-*.parquet` (one row per 
 A summary table you can read over SSH or paste into a bug report. Zero extra dependencies. Common uses:
 
 ```bash
-ocrscout inspect ./out/                           # per-model summary table
-ocrscout inspect ./out/ --page <page_id>          # dump every model's output for one page
-ocrscout inspect ./out/ --diff dots-ocr,glm-ocr   # side-by-side diff between two models
+ocrscout inspect ./out/                                    # per-model summary table (with comparison metric columns when present)
+ocrscout inspect ./out/ --page <page_id>                   # dump every model's output for one page (plus the reference, if any)
+ocrscout inspect ./out/ --page <id> --compare A,B          # word-level comparison between two models for that page
+ocrscout inspect ./out/ --page <id> --compare A,reference  # compare a model to the run's configured reference baseline
+ocrscout inspect ./out/ --page <id> --compare A,B --comparison-type document  # structural (heading/table/picture-count) deltas
 ```
 
-Add `--html` to the diff and ocrscout serves a one-shot HTML page over your LAN — handy when you want to share a comparison link without standing up the full viewer.
+Add `--html` to a `--compare` invocation and ocrscout serves a one-shot HTML page over your LAN — handy when you want to share a comparison link without standing up the full viewer.
 
 ### `ocrscout viewer <out>` — browser
 
 A long-lived web app for visual comparison (needs the `viewer` extra). Three view modes:
 
-- **Single** — one model at a time, full output, with the source page on the left and bounding boxes overlaid showing which regions the model detected.
-- **Side-by-side** — two or more models in parallel columns. See where they agree and disagree at a glance.
-- **Diff** — word-level color-coded diff between two models' output. Red for words only in A, green for words only in B, gray for words both produced.
+- **Single** — one artifact at a time (any model output, or the page's reference), full text, with the source page on the left and bounding boxes overlaid showing which regions the model detected.
+- **Side-by-side** — two or more artifacts in parallel columns. Pick any combination of models — and the run's `reference` baseline if one is configured — to see where they agree and disagree at a glance.
+- **Compare** — pick a Prediction (model output) and a Baseline (another model or the reference, with provenance shown), and ocrscout stacks every registered comparison whose required modality is satisfied: word-level text diff (always), structural deltas (when both sides have a `DoclingDocument`), per-category bbox IoU (when both sides have layout).
 
 Click through pages with `j`/`k`, switch modes with `1`/`2`/`3`, toggle the image pane with `i`. The current view is encoded in the URL, so you can share a link to a specific page-and-comparison with a teammate.
 
@@ -217,14 +231,15 @@ ocrscout is built to be plugged into without touching its source tree. If your s
 
 The extension points (each is a Python Abstract Base Class):
 
-- **`SourceAdapter`** — yields page images from somewhere. Built-in supports local folders, S3/GCS buckets, HuggingFace datasets. Add one for IIIF, PDF rasterization at scale, your in-house DAM, etc.
-- **`ReferenceAdapter`** — supplies ground-truth text or documents for accuracy scoring. Built-in supports plain `.txt` files; add ALTO, hOCR, page XML, etc.
+- **`SourceAdapter`** — yields page images from somewhere. Built-in supports local folders, S3/GCS buckets, HuggingFace datasets, and the Biodiversity Heritage Library (`bhl`). Add one for IIIF, PDF rasterization at scale, your in-house DAM, etc. Sources may optionally yield typed `Volume` metadata for catalog-driven corpora.
+- **`ReferenceAdapter`** — supplies a reference (text or `DoclingDocument`, with typed provenance) for a page. Built-in supports plain `.txt` files and BHL legacy OCR; add ALTO, hOCR, page XML, human transcription archives, etc.
 - **`ModelBackend`** — runs an OCR model and returns raw output. Add new backends for hosted APIs, on-prem services, or other inference runtimes.
 - **`LayoutDetector`** — finds typed regions on a page image. Used by layout-aware backends. Built-in: PP-DocLayoutV3.
 - **`Normalizer`** — converts a model's raw output into ocrscout's common document format. Add one when a new model emits a custom output dialect.
 - **`ExportAdapter`** — writes results somewhere. Built-in: parquet. Add a CSV or JSON-Lines exporter, or write to a database.
-- **`Evaluator`** — scores predictions against references. Built-in: edit distance. Add WER, character-level F1, table-cell F1, an LLM-judged score, anything you need.
-- **`Benchmark`** — bundles a fixed source + reference + evaluator into a named, citable benchmark.
+- **`Comparison`** — one analytic axis between a prediction and a baseline. Built-in: text similarity (with optional CER/WER), document structure deltas, layout IoU. Add a semantic comparison, an LLM-as-judge, table-cell F1, anything you need. Each `Comparison` produces a typed `ComparisonResult`.
+- **`ComparisonRenderer`** — renders a `ComparisonResult` for terminal, HTML, and the in-viewer Compare mode. Built-in renderers ship for each built-in comparison; downstream packages can register their own.
+- **`Benchmark`** — bundles a fixed source + reference adapter + comparison suite into a named, citable benchmark.
 - **`Reporter`** — turns a results directory into a human-readable report (HTML, terminal table, etc.).
 
 Subclass the relevant ABC, set a `name`, and either register in-process (`registry.register(...)`) or via a `pyproject.toml` entry point in your own package. ocrscout's built-ins can't be shadowed by third-party plugins. Full guide in [CLAUDE.md](CLAUDE.md).

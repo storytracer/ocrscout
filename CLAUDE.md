@@ -9,14 +9,15 @@ ocrscout is a toolkit for evaluating SOTA OCR models on user-supplied data and h
 ocrscout is extended through Abstract Base Classes and Python entry points.
 
 1. Subclass the relevant ABC in [src/ocrscout/interfaces/](src/ocrscout/interfaces/):
-   - `SourceAdapter` — yields `PageImage` objects from somewhere (a directory, an HF dataset, IIIF, PDF). The shipped `hf_dataset` adapter at [src/ocrscout/sources/hf_dataset.py](src/ocrscout/sources/hf_dataset.py) covers local dirs, fsspec URLs (`s3://`, `gs://`, `https://`, `hf://`), and HF Hub repo IDs (`org/dataset`) through one code path — extend it (or write a new adapter) for IIIF, PDF rasterisation, etc.
-   - `ReferenceAdapter` — returns ground-truth text or `DoclingDocument` for a `page_id`.
+   - `SourceAdapter` — yields `PageImage` objects from somewhere (a directory, an HF dataset, IIIF, PDF). The shipped `hf_dataset` adapter at [src/ocrscout/sources/hf_dataset.py](src/ocrscout/sources/hf_dataset.py) covers local dirs, fsspec URLs (`s3://`, `gs://`, `https://`, `hf://`), and HF Hub repo IDs (`org/dataset`) through one code path — extend it (or write a new adapter) for IIIF, PDF rasterisation, etc. The [`bhl`](src/ocrscout/sources/bhl.py) adapter shows how to handle a catalog-driven corpus (305K volumes, 67M pages on S3). Sources may optionally implement `iter_volumes()` to yield typed `Volume` metadata that lands as a parallel `volumes-*.parquet` sidecar.
+   - `ReferenceAdapter` — returns a `Reference` (text and/or `DoclingDocument`, with typed `provenance`) for a `PageImage`. Note "reference", not "ground truth": most references in the wild are themselves OCR — see "Comparisons subsystem" below.
    - `ModelBackend` — prepares a `BackendInvocation` and runs it, yielding `RawOutput`.
    - `LayoutDetector` — emits typed `LayoutRegion`s (bbox + native category) for a `PageImage`. Consumed by layout-aware backends like `LayoutChatBackend`. Built-in: `pp-doclayout-v3` (transformers + torch via the `[layout]` extra). See "Layout-aware OCR" below.
    - `Normalizer` — converts a `RawOutput` + `PageImage` into a `DoclingDocument`.
    - `ExportAdapter` — writes a stream of `ExportRecord` objects to a destination.
-   - `Evaluator` — scores a prediction `DoclingDocument` against a `Reference`.
-   - `Benchmark` — bundles a source, reference, and evaluator with a canonical scoring protocol.
+   - `Comparison` — one analytic axis (text / document / layout / future semantic). Takes typed `PredictionView` + `BaselineView`, returns a typed `ComparisonResult` subclass. See "Comparisons subsystem" below.
+   - `ComparisonRenderer` — terminal/HTML/Gradio surfaces for one `ComparisonResult` subclass. Same registry pattern as comparisons themselves.
+   - `Benchmark` — bundles a source, reference adapter, and a list of comparisons with a canonical summary protocol.
    - `Reporter` — turns a results directory into a report (HTML, markdown, terminal).
 
 2. Set the `name: ClassVar[str]` on your class — this is the lookup key in the registry.
@@ -27,7 +28,7 @@ ocrscout is extended through Abstract Base Classes and Python entry points.
      [project.entry-points."ocrscout.normalizers"]
      my_normalizer = "my_pkg.normalizers:MyNormalizer"
      ```
-     Entry-point groups: `ocrscout.sources`, `ocrscout.references`, `ocrscout.backends`, `ocrscout.normalizers`, `ocrscout.exports`, `ocrscout.evaluators`, `ocrscout.benchmarks`, `ocrscout.reporters`, `ocrscout.layout_detectors`.
+     Entry-point groups: `ocrscout.sources`, `ocrscout.references`, `ocrscout.backends`, `ocrscout.normalizers`, `ocrscout.exports`, `ocrscout.comparisons`, `ocrscout.comparison_renderers`, `ocrscout.benchmarks`, `ocrscout.reporters`, `ocrscout.layout_detectors`.
    - **In-process**: `from ocrscout import registry; registry.register("normalizers", "my_normalizer", MyNormalizer)`.
 
 Built-in components are registered in [src/ocrscout/registry.py](src/ocrscout/registry.py) and are protected from being shadowed by third-party entry points.
@@ -164,10 +165,10 @@ Two read-only post-mortem tools share the same input — a previous run's `outpu
 
 | Command | Where | Deps | Use case |
 | --- | --- | --- | --- |
-| `ocrscout inspect <out>` | terminal | core only | Rich summary table; `--page <id>` per-model markdown dump; `--diff a,b --html` serves a one-shot side-by-side diff over the LAN. Right tool for SSH, CI logs, and quick pokes. |
-| `ocrscout viewer <out>` | browser | `[viewer]` extra (`gradio`) | Long-lived Gradio app. Adapts to the comparison shape: page picker, mode-aware model picker (radio for Single, checkbox for Side-by-side, paired Model A / Model B dropdowns for Diff), source page with color-coded bbox overlay + deduplicated category legend, and matching color-coded section blocks in the text pane for layout-aware models. State (page / models / mode) persists via `gr.BrowserState` and can be supplied via URL query params for shareable views. |
+| `ocrscout inspect <out>` | terminal | core only | Rich summary table (with conditional comparison metric columns when present: `text_similarity`, `cer`, `wer`, `iou_mean`, …); `--page <id>` per-model markdown dump plus reference text when present; `--compare a,b [--html] [--comparison-type {text,document,layout}]` runs a typed `Comparison` and serves the result either inline (terminal-rendered) or as a one-shot HTML page over the LAN. Right tool for SSH, CI logs, and quick pokes. Either side of `--compare` may be the literal `reference` to compare against the run's reference adapter. |
+| `ocrscout viewer <out>` | browser | `[viewer]` extra (`gradio`) | Long-lived Gradio app. Three view modes: Single, Side-by-side, Compare. Page picker, mode-aware artifact picker (radio for Single, checkbox for Side-by-side — including a `reference` checkbox when the run has baselines, paired Prediction / Baseline dropdowns for Compare), source page with color-coded bbox overlay + deduplicated category legend, and matching color-coded section blocks in the text pane for layout-aware models. Compare mode stacks every registered comparison whose required modality is satisfied by both sides. State (page / models / mode) persists via `gr.BrowserState` and can be supplied via URL query params for shareable views. |
 
-The two share a code path for diff rendering: [src/ocrscout/viewer/diff.py](src/ocrscout/viewer/diff.py) holds `compute_diff`, `render_diff_page` (the standalone HTML page served by `inspect --html`), and `render_diff_table_fragment` (the same opcode-aligned table embedded inside the viewer's Diff mode). Updating the diff styling in one place updates both surfaces.
+Both surfaces share rendering through the comparison-renderer registry: every `ComparisonResult` subclass has a `ComparisonRenderer` registered under `comparison_renderers`, which exposes `render_html` (used by `inspect --compare --html`), `render_terminal` (used by `inspect --compare`), and `render_gradio` (embedded inside the viewer's Compare mode). Updating styling on a renderer updates both surfaces in lockstep. The legacy `viewer/diff.py` module is now reduced to the `tokenize()` helper used by `TextComparison` and the `publish/_stats.py` cross-model disagreement scorer.
 
 The viewer code lives under [src/ocrscout/viewer/](src/ocrscout/viewer/):
 
