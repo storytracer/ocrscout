@@ -663,54 +663,29 @@ def _draw_compare_pane(
         )
         return
 
-    if b_label == REFERENCE_PSEUDO_MODEL and isinstance(base, BaselineView):
-        prov = base.provenance
-        prov_bits: list[str] = []
-        if prov is not None:
-            prov_bits.append(prov.method)
-            if prov.engine:
-                prov_bits.append(prov.engine)
-            if prov.confidence is not None:
-                prov_bits.append(f"conf={prov.confidence:.2f}")
-        prov_label = " — " + ", ".join(prov_bits) if prov_bits else ""
-        gr.HTML(
-            '<div class="ocrscout-stats-strip">'
-            f'<span class="name">{escape(a_label)} vs '
-            f"{escape(b_label)}{escape(prov_label)}</span>"
-            "</div>"
-        )
-
-    comparison_names = _registry.list("comparisons")
-    rendered_any = False
-    for name in comparison_names:
-        try:
-            cmp_cls = _registry.get("comparisons", name)
-            renderer_cls = _registry.get("comparison_renderers", name)
-        except Exception:  # noqa: BLE001
-            continue
-        cmp = cmp_cls()
-        try:
-            result = cmp.compare(pred, base)
-        except Exception as e:  # noqa: BLE001
-            gr.Markdown(f"_{escape(name)} comparison failed: `{escape(str(e))}`_")
-            continue
-        if result is None:
-            continue
-        renderer = renderer_cls()
-        fragment = renderer.render_gradio(
-            result, prediction_label=a_label, baseline_label=b_label,
-        )
-        gr.HTML(
-            f'<h3 class="ocrscout-cmp-heading">{escape(name)} comparison</h3>'
-        )
-        gr.HTML(fragment)
-        rendered_any = True
-    if not rendered_any:
+    # Compare mode shows only the text-comparison block — the document
+    # and layout blocks aren't useful here and add noise.
+    try:
+        cmp_cls = _registry.get("comparisons", "text")
+        renderer_cls = _registry.get("comparison_renderers", "text")
+    except Exception:  # noqa: BLE001
+        gr.Markdown("_Text comparison is not registered._")
+        return
+    try:
+        result = cmp_cls().compare(pred, base)
+    except Exception as e:  # noqa: BLE001
+        gr.Markdown(f"_text comparison failed: `{escape(str(e))}`_")
+        return
+    if result is None:
         gr.Markdown(
-            f"_No comparison fired for `{escape(a_label)}` vs `{escape(b_label)}`. "
-            "Check that both sides have the required modality (text / "
-            "document / layout)._"
+            f"_No text comparison for `{escape(a_label)}` vs "
+            f"`{escape(b_label)}` — both sides need text._"
         )
+        return
+    fragment = renderer_cls().render_gradio(
+        result, prediction_label=a_label, baseline_label=b_label,
+    )
+    gr.HTML(fragment)
 
 
 def _build_compare_view(
@@ -847,10 +822,9 @@ _HELP_HTML = """
   <dt>Side-by-side</dt><dd>One column per selected model. All models
     selected by default; uncheck to narrow. The grid wraps responsively
     so 8 panes flow into multiple rows on narrow viewports.</dd>
-  <dt>Compare</dt><dd>Run text / document / layout comparisons between any
-    two artifacts. Side B can be a model or the page's <code>reference</code>
-    baseline (with provenance shown). Stacks every comparison whose
-    required modality is satisfied.</dd>
+  <dt>Compare</dt><dd>Side-by-side text diff between any two artifacts.
+    Baseline can be a model or the page's <code>reference</code> baseline
+    (with provenance shown).</dd>
 </dl>
 <h3>URL parameters</h3>
 <p>Append <code>?file=...&amp;models=a,b&amp;mode=Compare</code> to share a
