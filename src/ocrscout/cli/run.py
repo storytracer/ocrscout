@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import itertools
+import json
 import logging
 import os
 import time
@@ -19,6 +20,7 @@ from ocrscout import registry
 from ocrscout.cli import app
 from ocrscout.errors import BackendError, ManagedServerError, NormalizerError, ProfileNotFound
 from ocrscout.exports.layout import parquet_dest
+from ocrscout.interfaces.reference import ReferenceAdapter
 from ocrscout.log import VERBOSE, setup_logging
 from ocrscout.managed import managed_servers
 from ocrscout.metrics import MetricsCollector
@@ -30,18 +32,35 @@ log = logging.getLogger(__name__)
 
 @app.command("run")
 def run(
-    source: str = typer.Option(
-        ..., "--source", "-s",
+    source: str | None = typer.Option(
+        None, "--source", "-s",
         help="Image source: a local directory, a fsspec URL "
              "(s3://bucket/prefix/, gs://..., https://...), or a "
-             "HuggingFace Hub dataset id (org/name). All routes load "
-             "through the `hf_dataset` adapter.",
+             "HuggingFace Hub dataset id (org/name). Used by the default "
+             "`hf_dataset` adapter; ignored by source adapters with a "
+             "fixed corpus (e.g. `bhl`).",
+    ),
+    source_name: str = typer.Option(
+        "hf_dataset", "--source-name",
+        help="Source adapter name. Default `hf_dataset` covers local "
+             "dirs, fsspec URLs, and HF Hub IDs via `--source`. Use `bhl` "
+             "to sample the Biodiversity Heritage Library S3 bucket "
+             "(305K volumes, 67M pages); `--source` is then ignored. "
+             "Per-adapter knobs (e.g. `languages`, `max_pages_per_volume`) "
+             "go through `--source-arg key=value`.",
+    ),
+    source_arg: list[str] = typer.Option(
+        None, "--source-arg",
+        help="Repeatable `key=value` kwargs forwarded to the source "
+             "adapter constructor. Values are parsed as JSON when "
+             "possible, plain string otherwise. Example: "
+             "`--source-arg 'languages=[\"eng\"]' --source-arg max_pages_per_volume=4`.",
     ),
     models: str = typer.Option(
         ..., "--models", "-m", help="Comma-separated profile names."
     ),
     reference: str | None = typer.Option(
-        None, "--reference", help="Reference adapter name (e.g. plain_text)."
+        None, "--reference", help="Reference adapter name (e.g. plain_text, bhl_ocr)."
     ),
     reference_path: Path | None = typer.Option(
         None, "--reference-path", help="Path passed to the reference adapter."
@@ -122,8 +141,12 @@ def run(
 ) -> None:
     """Run multiple OCR models against a source and emit a comparison."""
     setup_logging(verbosity=verbose, quiet=quiet)
-    if benchmark is None and source is None:
-        raise typer.BadParameter("--source or --benchmark is required")
+    if benchmark is None and source is None and source_name == "hf_dataset":
+        raise typer.BadParameter(
+            "--source is required when using the default `hf_dataset` "
+            "source adapter. Pass --source-name to select a different "
+            "adapter (e.g. `bhl`), or use --benchmark."
+        )
 
     if managed and server_url:
         raise typer.BadParameter(
@@ -137,15 +160,25 @@ def run(
         os.environ["OCRSCOUT_VLLM_URL"] = server_url
         log.info("vLLM server: %s", server_url)
 
-    source_args: dict[str, Any] = {"path": source}
+    source_args: dict[str, Any] = _parse_source_args(source_arg or [])
+    if source_name == "hf_dataset":
+        # Only the default fsspec/HF-Hub adapter consumes `--source` as a
+        # path; corpus-bound adapters like `bhl` ignore it (warned below).
+        source_args["path"] = source
+    elif source is not None:
+        log.warning(
+            "--source is ignored by the %r source adapter (its corpus "
+            "is fixed). Use --source-arg for adapter-specific kwargs.",
+            source_name,
+        )
     if sample is not None:
         # Sampling is pushed down into the adapter so cheap pre-listing
         # avoids downloading the whole prefix just to discard most of it.
-        source_args["sample"] = sample
-        source_args["seed"] = seed
+        source_args.setdefault("sample", sample)
+        source_args.setdefault("seed", seed)
     cfg = PipelineConfig(
         name="run",
-        source=AdapterRef(name="hf_dataset", args=source_args),
+        source=AdapterRef(name=source_name, args=source_args),
         reference=(
             AdapterRef(
                 name=reference,
@@ -243,24 +276,36 @@ def _execute(
     else:
         pages = list(pages_iter)
     page_by_id = {p.page_id: p for p in pages}
-    log.info("Loaded %d page(s) from %r", len(pages), cfg.source.args.get("path"))
+    source_label = cfg.source.args.get("path") or cfg.source.name
+    log.info("Loaded %d page(s) from %r", len(pages), source_label)
     if not pages:
         log.error(
-            "No images found at %r. The hf_dataset adapter loads via the "
-            "`imagefolder` builder for filesystem/URL paths and via "
-            "`load_dataset(repo_id)` for HF Hub names — check that the path "
-            "contains image files (or rows with an Image-typed column).",
-            cfg.source.args.get("path"),
+            "No images found from source %r (args=%s). For `hf_dataset` "
+            "this means the `imagefolder` builder found no images and the "
+            "path is not an HF Hub dataset id. For other adapters, check "
+            "their --source-arg filters.",
+            cfg.source.name, cfg.source.args,
         )
         raise typer.Exit(code=1)
 
+    reference_adapter: ReferenceAdapter | None = None
     if cfg.reference is not None:
         ref_cls = registry.get("references", cfg.reference.name)
-        _ = ref_cls(**cfg.reference.args)  # reference adapter is not yet wired into the loop
+        reference_adapter = ref_cls(**cfg.reference.args)
+        log.info("Reference adapter: %s", cfg.reference.name)
 
     exporter_cls = registry.get("exports", cfg.export.name)
     exporter = exporter_cls()
     exporter.open(cfg.export.args["dest"])
+    # Volumes flow through the source's optional iter_volumes() — the run
+    # loop materializes them up-front so the per-volume sidecar parquet
+    # exists even if a backend later fails on a particular page.
+    volume_count = 0
+    for volume in source.iter_volumes():
+        exporter.write_volume(volume)
+        volume_count += 1
+    if volume_count:
+        log.info("Loaded %d volume(s) from source", volume_count)
 
     metrics = MetricsCollector(pipeline_id=cfg.name)
     # results[model_name] -> (ok, failed, run_seconds). We collect into a dict
@@ -275,6 +320,7 @@ def _execute(
             page_by_id=page_by_id,
             normalizer_overrides=cfg.normalizer_overrides,
             exporter=exporter,
+            reference_adapter=reference_adapter,
             metrics=metrics,
         )
         return name, ok, failed, run_seconds
@@ -305,6 +351,7 @@ def _run_one_model(
     page_by_id: dict,
     normalizer_overrides: dict,
     exporter,
+    reference_adapter: ReferenceAdapter | None,
     metrics: MetricsCollector,
 ) -> tuple[int, int, float]:
     try:
@@ -359,11 +406,22 @@ def _run_one_model(
 
         item_count, text_length, markdown = _doc_stats(doc)
 
+        reference = None
+        if reference_adapter is not None:
+            try:
+                reference = reference_adapter.get(page)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "reference adapter failed for %s/%s: %s",
+                    model_name, raw.page_id, e,
+                )
+
         record = ExportRecord(
             page=page,
             model=model_name,
             document=doc,
             raw=raw,
+            reference=reference,
             markdown=markdown,
             metrics={
                 "prepare_seconds": round(prepare_seconds, 4),
@@ -386,6 +444,29 @@ def _run_one_model(
         model_name, ok, ok + failed, run_seconds,
     )
     return ok, failed, run_seconds
+
+
+def _parse_source_args(raw: list[str]) -> dict[str, Any]:
+    """Parse repeated `--source-arg key=value` strings into a kwargs dict.
+
+    Values are JSON-parsed when possible (so list/dict/int/bool literals
+    work) and fall back to plain strings otherwise.
+    """
+    parsed: dict[str, Any] = {}
+    for entry in raw:
+        if "=" not in entry:
+            raise typer.BadParameter(
+                f"--source-arg expects 'key=value', got {entry!r}"
+            )
+        key, _, value = entry.partition("=")
+        key = key.strip()
+        if not key:
+            raise typer.BadParameter(f"--source-arg has empty key in {entry!r}")
+        try:
+            parsed[key] = json.loads(value)
+        except json.JSONDecodeError:
+            parsed[key] = value
+    return parsed
 
 
 def _print_summary(

@@ -47,9 +47,11 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
     return {
         "sources": {
             "hf_dataset": "ocrscout.sources.hf_dataset:HfDatasetSourceAdapter",
+            "bhl": "ocrscout.sources.bhl:BhlSourceAdapter",
         },
         "references": {
             "plain_text": "ocrscout.references.plain_text:PlainTextReferenceAdapter",
+            "bhl_ocr": "ocrscout.references.bhl_ocr:BhlOcrReferenceAdapter",
         },
         "backends": {
             "vllm": "ocrscout.backends.vllm:VllmBackend",

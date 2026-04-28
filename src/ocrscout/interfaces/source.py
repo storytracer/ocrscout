@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterator
 from typing import ClassVar
 
-from ocrscout.types import PageImage
+from ocrscout.types import PageImage, Volume
 
 
 class SourceAdapter(ABC):
@@ -17,6 +17,16 @@ class SourceAdapter(ABC):
     @abstractmethod
     def iter_pages(self) -> Iterator[PageImage]:
         """Yield pages in iteration order."""
+
+    def iter_volumes(self) -> Iterator[Volume]:
+        """Yield the ``Volume`` objects referenced by ``iter_pages()``.
+
+        Default: empty. Sources with a bibliographic-unit concept (BHL items,
+        IA items, HathiTrust volumes, IIIF manifests, multi-page PDFs)
+        override this so the run loop can write a ``volumes-NNNNN.parquet``
+        sidecar joinable to the per-page results on ``volume_id``.
+        """
+        return iter(())
 
     def __len__(self) -> int:  # type: ignore[override]
         """Return the number of pages, or raise ``TypeError`` if unknown."""

@@ -23,6 +23,10 @@ class PageImage(BaseModel):
 
     ``image`` is the live PIL.Image and is intentionally not serialized — it is
     runtime state. Use ``source_uri`` to recover the source if needed.
+
+    ``volume_id`` joins to ``Volume.volume_id`` for sources that group pages
+    into bibliographic units (BHL items, IA items, HathiTrust volumes, IIIF
+    manifests). It stays ``None`` for flat sources like ``hf_dataset``.
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -32,6 +36,30 @@ class PageImage(BaseModel):
     width: int
     height: int
     dpi: int | None = None
+    source_uri: str | None = None
+    volume_id: str | None = None
+    sequence: int | None = None
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class Volume(BaseModel):
+    """A logical bibliographic unit grouping pages.
+
+    Maps to: BHL Item, IA item, HathiTrust volume, IIIF Manifest, PDF document.
+    Sources that have a volume concept yield these from
+    ``SourceAdapter.iter_volumes()``; the run loop materializes them into a
+    ``volumes-NNNNN.parquet`` sidecar next to the per-page results parquet.
+    """
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    volume_id: str
+    title: str | None = None
+    creators: list[str] = Field(default_factory=list)
+    language: str | None = None
+    year: int | None = None
+    rights: str | None = None
+    page_count: int | None = None
     source_uri: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
@@ -106,6 +134,7 @@ class ExportRecord(BaseModel):
     model: str
     document: Any  # DoclingDocument at runtime
     raw: RawOutput
+    reference: Reference | None = None
     markdown: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     scores: dict[str, float] = Field(default_factory=dict)

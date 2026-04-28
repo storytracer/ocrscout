@@ -77,8 +77,19 @@ layout = [
     "transformers>=4.59.0",
     "torch>=2.0.0",
 ]
+# Biodiversity Heritage Library source + OCR reference adapter.
+# DuckDB streams the gzipped TSV catalogs (item.txt.gz / page.txt.gz /
+# title.txt.gz) for cheap catalog-driven sampling without enumerating
+# the 67M-page bucket; s3fs provides anonymous S3 access for both the
+# catalog files and the JP2/OCR sidecars; imagecodecs ships its own
+# OpenJPEG decoder so JP2 decoding doesn't depend on a system libopenjp2.
+bhl = [
+    "duckdb>=1.1.0",
+    "s3fs>=2024.0.0",
+    "imagecodecs>=2024.0.0",
+]
 all = [
-    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout]",
+    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout,bhl]",
 ]
 dev = [
     "ruff>=0.6.0",

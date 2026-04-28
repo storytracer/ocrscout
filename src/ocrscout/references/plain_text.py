@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ocrscout.interfaces.reference import ReferenceAdapter
-from ocrscout.types import Reference
+from ocrscout.types import PageImage, Reference
 
 
 class PlainTextReferenceAdapter(ReferenceAdapter):
@@ -21,7 +21,8 @@ class PlainTextReferenceAdapter(ReferenceAdapter):
         self.root = Path(root)
         self.suffix = suffix
 
-    def get(self, page_id: str) -> Reference | None:
+    def get(self, page: PageImage) -> Reference | None:
+        page_id = page.page_id
         rel = Path(page_id)
         candidate = self.root / rel.with_suffix(self.suffix)
         if not candidate.is_file():

@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import ClassVar
 
-from ocrscout.types import ExportRecord
+from ocrscout.types import ExportRecord, Volume
 
 
 class ExportAdapter(ABC):
@@ -13,6 +13,10 @@ class ExportAdapter(ABC):
 
     Implementations should buffer / batch internally and flush on ``close()``.
     Use as a context manager to guarantee close on exit.
+
+    ``write_volume`` carries the per-volume bibliographic metadata that
+    accompanies sources with an ``iter_volumes()`` implementation. Adapters
+    that don't care about volumes can leave the default no-op.
     """
 
     name: ClassVar[str]
@@ -22,6 +26,10 @@ class ExportAdapter(ABC):
 
     @abstractmethod
     def write(self, record: ExportRecord) -> None: ...
+
+    def write_volume(self, volume: Volume) -> None:
+        """Persist a single ``Volume`` row. Default: drop it."""
+        return None
 
     @abstractmethod
     def close(self) -> None: ...
