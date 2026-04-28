@@ -36,11 +36,18 @@ class BBoxItem:
 
 @dataclass(frozen=True)
 class TextItem:
-    """One labeled text item from a DoclingDocument, in document order."""
+    """One labeled text item from a DoclingDocument, in document order.
+
+    ``html`` is set for items that have a structured HTML rendering
+    (currently just ``TableItem``) — section panes embed it raw so browsers
+    render real ``<table>`` elements; everything else flows through the
+    plain-text escape path.
+    """
 
     label: str
     text: str
     item_idx: int
+    html: str | None = None
 
 
 @dataclass
@@ -344,13 +351,20 @@ class ViewerStore:
             label_str = label_value or (str(label) if label is not None else "item")
             text = (getattr(item, "text", "") or "").strip()
             cls = type(item).__name__
+            html: str | None = None
             if not text and cls == "TableItem":
                 # TableItems carry data in `.data.table_cells`, not `.text`.
-                # docling-core renders the cell grid as a GFM pipe-table.
+                # We compute BOTH a plain-text rendering (for diff/legend/
+                # plaintext-only consumers) and a structured HTML rendering
+                # (for the section pane to render a real <table> element).
                 try:
                     text = item.export_to_markdown(doc).strip() or "[table]"
                 except Exception:  # noqa: BLE001
                     text = "[table]"
+                try:
+                    html = item.export_to_html(doc, add_caption=False) or None
+                except Exception:  # noqa: BLE001
+                    html = None
             elif not text and cls == "PictureItem":
                 text = "[picture]"
             elif not text:
@@ -361,19 +375,19 @@ class ViewerStore:
                 # ``[picture]``/``[table]`` and keeps the section pane in
                 # one-to-one correspondence with the bbox overlay.
                 text = "[empty]"
-            yield item, idx, label_str, text
+            yield item, idx, label_str, text, html
 
     def _text_items_for(self, row: dict[str, Any]) -> list[TextItem]:
         """Labeled text items in document reading order (used by text panes)."""
         return [
-            TextItem(label=label, text=text, item_idx=idx)
-            for _item, idx, label, text in self._iter_doc_items(row)
+            TextItem(label=label, text=text, item_idx=idx, html=html)
+            for _item, idx, label, text, html in self._iter_doc_items(row)
         ]
 
     def _bboxes_for(self, row: dict[str, Any]) -> list[BBoxItem]:
         """Pull ``ProvenanceItem.bbox`` off every text/picture/table item."""
         out: list[BBoxItem] = []
-        for item, idx, label, text in self._iter_doc_items(row):
+        for item, idx, label, text, _html in self._iter_doc_items(row):
             provs = getattr(item, "prov", None) or []
             if not provs:
                 continue

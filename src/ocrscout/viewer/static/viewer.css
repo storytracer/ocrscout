@@ -174,10 +174,35 @@
   font-style: italic;
   font-size: 0.82rem;
 }
-.ocrscout-section[data-label="table"] .ocrscout-section-text {
-  /* TableItem text is a GFM pipe-table emitted by
-     TableItem.export_to_markdown(doc); proportional fonts mangle column
-     alignment, so force monospace for these blocks only. */
+/* TableItems normally render as a real <table> element via
+   TableItem.export_to_html(doc); the rules below style that. The monospace
+   fallback only kicks in when the HTML rendering failed and the section
+   pane fell back to the GFM pipe-table text (proportional fonts mangle
+   pipe-table column alignment). */
+.ocrscout-section[data-label="table"] .ocrscout-section-text > table {
+  border-collapse: collapse;
+  font-size: 0.82rem;
+  line-height: 1.35;
+  margin: 0.15rem 0;
+  width: 100%;
+}
+.ocrscout-section[data-label="table"] .ocrscout-section-text > table th,
+.ocrscout-section[data-label="table"] .ocrscout-section-text > table td {
+  border: 1px solid color-mix(in srgb, var(--section-color, #888) 35%, transparent);
+  padding: 0.18rem 0.4rem;
+  text-align: left;
+  vertical-align: top;
+}
+.ocrscout-section[data-label="table"] .ocrscout-section-text > table th {
+  background: color-mix(in srgb, var(--section-color, #888) 16%, transparent);
+  font-weight: 600;
+}
+.ocrscout-section[data-label="table"] .ocrscout-section-text > table tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--section-color, #888) 5%, transparent);
+}
+/* Monospace fallback for the rare case TableItem.export_to_html failed
+   and we fell through to pipe-table text. */
+.ocrscout-section[data-label="table"] .ocrscout-section-text:not(:has(> table)) {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.78rem;
   line-height: 1.4;

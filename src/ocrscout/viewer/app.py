@@ -601,17 +601,17 @@ def _draw_text_pane(
 
 
 def _has_structure(row: ModelRow) -> bool:
-    """Does this row carry layout/section info worth color-coding?
+    """Does this row carry true layout structure worth color-coding?
 
-    True when there's more than one item AND at least one label that isn't
-    the generic ``text`` / ``paragraph`` default — that's the signal that
-    the model is layout-aware (titles, captions, tables, etc.) rather than
-    a plain-markdown emitter that synthesises a single label per paragraph.
+    True iff the model emitted at least one bbox — i.e. the section labels
+    are backed by actual region detection rather than textual heuristics
+    (the markdown normalizer assigns ``title``/``section_header``/``table``
+    purely from ``#`` and ``<table>`` patterns; those labels exist but
+    describe text shape, not detected layout). Color-coded section blocks
+    would imply layout when none was performed, so we fall back to plain
+    markdown for those rows.
     """
-    if len(row.items) <= 1:
-        return False
-    distinct = {it.label for it in row.items if it.label}
-    return bool(distinct - {"text", "paragraph"})
+    return len(row.bboxes) > 0
 
 
 def _emit_text_body(
@@ -635,13 +635,17 @@ def _emit_text_body(
     parts = ['<div class="ocrscout-markdown-pane ocrscout-structured">']
     for item in row.items:
         color = store.LABEL_COLORS.get(item.label, "#888")
-        text_html = escape(item.text or "").replace("\n", "<br>")
+        # ``item.html`` is pre-rendered HTML (currently TableItems via
+        # TableItem.export_to_html) — docling-core escapes cell content,
+        # so it's safe to embed raw and the browser renders a real
+        # <table>. Otherwise fall through to the plain-text escape path.
+        body_html = item.html or escape(item.text or "").replace("\n", "<br>")
         parts.append(
             f'<div class="ocrscout-section" '
             f'data-label="{escape(item.label)}" '
             f'style="--section-color:{color}">'
             f'<span class="ocrscout-section-tag">{escape(item.label)}</span>'
-            f'<div class="ocrscout-section-text">{text_html}</div>'
+            f'<div class="ocrscout-section-text">{body_html}</div>'
             f'</div>'
         )
     parts.append('</div>')
