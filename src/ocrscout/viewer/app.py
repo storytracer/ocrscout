@@ -78,7 +78,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
             {
                 "page_id": initial_page,
                 "models": initial_models,
-                "mode": "Side-by-side",
+                "mode": "Single",
                 "show_image": True,
             }
         )
@@ -111,7 +111,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 gr.HTML('<div class="ocrscout-group-label">View mode</div>')
                 view_mode = gr.Radio(
                     choices=VIEW_MODES,
-                    value="Side-by-side",
+                    value="Single",
                     label=None,
                     show_label=False,
                     container=False,
@@ -329,9 +329,9 @@ def build_app(output_dir: Path) -> gr.Blocks:
             page_id = qp.get("page") or (state or {}).get("page_id") or initial_page
             if page_id not in page_choices:
                 page_id = initial_page
-            mode = qp.get("mode") or (state or {}).get("mode") or "Side-by-side"
+            mode = qp.get("mode") or (state or {}).get("mode") or "Single"
             if mode not in VIEW_MODES:
-                mode = "Side-by-side"
+                mode = "Single"
             models_raw = qp.get("models")
             if models_raw:
                 requested = [m.strip() for m in models_raw.split(",") if m.strip()]
