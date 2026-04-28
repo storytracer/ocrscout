@@ -343,12 +343,24 @@ class ViewerStore:
             label_value = getattr(label, "value", None)
             label_str = label_value or (str(label) if label is not None else "item")
             text = (getattr(item, "text", "") or "").strip()
-            if not text:
-                cls = type(item).__name__
-                if cls == "PictureItem":
-                    text = "[picture]"
-                elif cls == "TableItem":
+            cls = type(item).__name__
+            if not text and cls == "TableItem":
+                # TableItems carry data in `.data.table_cells`, not `.text`.
+                # docling-core renders the cell grid as a GFM pipe-table.
+                try:
+                    text = item.export_to_markdown(doc).strip() or "[table]"
+                except Exception:  # noqa: BLE001
                     text = "[table]"
+            elif not text and cls == "PictureItem":
+                text = "[picture]"
+            elif not text:
+                # Backends sometimes emit a region with a bbox but no
+                # recognised text (truncation, mid-block cut-off, OCR
+                # failure). Show a placeholder so the user can see that
+                # a region was detected without content — mirrors
+                # ``[picture]``/``[table]`` and keeps the section pane in
+                # one-to-one correspondence with the bbox overlay.
+                text = "[empty]"
             yield item, idx, label_str, text
 
     def _text_items_for(self, row: dict[str, Any]) -> list[TextItem]:
