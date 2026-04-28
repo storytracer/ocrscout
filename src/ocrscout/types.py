@@ -36,6 +36,23 @@ class PageImage(BaseModel):
     extra: dict[str, Any] = Field(default_factory=dict)
 
 
+class LayoutRegion(BaseModel):
+    """A typed region detected on a page by a ``LayoutDetector``.
+
+    The detector emits regions in page-pixel coordinates (top-left origin).
+    Cropping happens downstream in the layout-aware backend, which preserves
+    these page-coordinate bboxes through into the layout-JSON payload.
+    """
+
+    id: int
+    category: str
+    bbox: tuple[float, float, float, float]
+    score: float | None = None
+    polygon: list[tuple[float, float]] | None = None
+    reading_order: int | None = None
+    parent_id: int | None = None
+
+
 class Reference(BaseModel):
     """Ground-truth content for a single page.
 

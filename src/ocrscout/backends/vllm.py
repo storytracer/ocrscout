@@ -14,9 +14,7 @@ OpenAI-compatible ``/chat/completions`` endpoint of an externally-running
 
 from __future__ import annotations
 
-import base64
 import concurrent.futures
-import io
 import json
 import logging
 import os
@@ -28,9 +26,16 @@ from collections import deque
 from collections.abc import Iterator, Sequence
 from importlib.resources import files
 from pathlib import Path
-from urllib import error as urlerror
-from urllib import request as urlrequest
 
+import requests
+
+from ocrscout.backends._openai_chat import (
+    ChatCompletionError,
+    build_base_payload,
+    build_chat_request_body,
+    normalize_endpoint,
+    post_chat_completion,
+)
 from ocrscout.errors import BackendError
 from ocrscout.interfaces.backend import ModelBackend
 from ocrscout.profile import ModelProfile, effective_vllm_engine_args
@@ -236,7 +241,7 @@ class VllmBackend(ModelBackend):
     # --- server mode -------------------------------------------------------
 
     def _run_server(self, invocation: BackendInvocation) -> Iterator[RawOutput]:
-        endpoint = _normalize_endpoint(invocation.endpoint or "")
+        endpoint = normalize_endpoint(invocation.endpoint or "")
         if not endpoint:
             raise BackendError("VllmBackend: server mode requires endpoint URL")
 
@@ -249,28 +254,7 @@ class VllmBackend(ModelBackend):
             int(profile.backend_args.get("concurrent_requests", _DEFAULT_CONCURRENT_REQUESTS)),
         )
 
-        # Map our sampling_args (vLLM SamplingParams keys) to the OpenAI
-        # /chat/completions schema. The vLLM server accepts the standard
-        # OpenAI names plus a wider set of vLLM-extension keys (top_k,
-        # repetition_penalty, min_p, etc.) as top-level fields. We forward
-        # everything in the allowlist so profiles can express the full
-        # sampling regime their upstream recommends — e.g. GLM-OCR's
-        # repetition_penalty is required to avoid degenerate output on
-        # dense pages.
-        sampling = dict(profile.sampling_args)
-        request_payload_base: dict = {"model": profile.model_id}
-        for key in (
-            "max_tokens", "temperature", "top_p", "top_k",
-            "repetition_penalty", "frequency_penalty", "presence_penalty",
-            "min_p", "seed", "stop",
-        ):
-            if key in sampling:
-                request_payload_base[key] = sampling[key]
-        if profile.chat_template_content_format is not None:
-            request_payload_base["chat_template_content_format"] = (
-                profile.chat_template_content_format
-            )
-
+        base_payload = build_base_payload(profile)
         url = f"{endpoint}/chat/completions"
         prefix = f"[{profile.name}]"
 
@@ -280,21 +264,24 @@ class VllmBackend(ModelBackend):
         )
         log.debug("%s POST URL: %s", prefix, url)
 
-        def _post_one(page: PageImage) -> RawOutput:
-            return _post_page(
-                page=page,
-                url=url,
-                prompt=prompt,
-                base_payload=request_payload_base,
-                timeout=timeout,
-                output_format=profile.output_format,
-            )
-
         results: dict[str, RawOutput] = {}
         completed = 0
         total = len(pages)
         t0 = time.perf_counter()
-        with concurrent.futures.ThreadPoolExecutor(max_workers=concurrent_requests) as ex:
+        with requests.Session() as session, concurrent.futures.ThreadPoolExecutor(
+            max_workers=concurrent_requests
+        ) as ex:
+            def _post_one(page: PageImage) -> RawOutput:
+                return _post_page(
+                    page=page,
+                    session=session,
+                    url=url,
+                    prompt=prompt,
+                    base_payload=base_payload,
+                    timeout=timeout,
+                    output_format=profile.output_format,
+                )
+
             futures = {ex.submit(_post_one, page): page for page in pages}
             for fut in concurrent.futures.as_completed(futures):
                 page = futures[fut]
@@ -328,20 +315,10 @@ class VllmBackend(ModelBackend):
             yield results[page.page_id]
 
 
-def _normalize_endpoint(endpoint: str) -> str:
-    """Trim trailing slashes from the user-supplied URL.
-
-    Users typically write either ``http://host:port`` or ``http://host:port/v1``;
-    we don't auto-prepend ``/v1`` because some deployments live behind a proxy
-    with a different prefix. The OpenAI convention is that the base URL
-    *includes* ``/v1`` — document that and trust the caller.
-    """
-    return endpoint.rstrip("/")
-
-
 def _post_page(
     *,
     page: PageImage,
+    session: requests.Session,
     url: str,
     prompt: str,
     base_payload: dict,
@@ -350,68 +327,20 @@ def _post_page(
 ) -> RawOutput:
     """POST one page to the OpenAI-compatible endpoint and return RawOutput."""
     page_prompt = _per_page_prompt(prompt, page)
-    buf = io.BytesIO()
-    page.image.convert("RGB").save(buf, format="PNG")
-    data_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    payload = {
-        **base_payload,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                    {"type": "text", "text": page_prompt},
-                ],
-            }
-        ],
-    }
-    req = urlrequest.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
+    body = build_chat_request_body(page.image, page_prompt, base_payload)
     try:
-        with urlrequest.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8")
-    except urlerror.HTTPError as e:
-        # Surface the response body — vLLM returns useful detail under
-        # {"object":"error","message":"..."} on 4xx/5xx.
-        try:
-            err_body = e.read().decode("utf-8")
-        except Exception:  # noqa: BLE001
-            err_body = ""
+        text, tokens = post_chat_completion(session, url, body, timeout=timeout)
+    except ChatCompletionError as e:
         return RawOutput(
             page_id=page.page_id,
             output_format=output_format,
             payload="",
-            error=f"HTTPError {e.code}: {err_body or e.reason}",
+            error=str(e),
         )
-    except urlerror.URLError as e:
-        return RawOutput(
-            page_id=page.page_id,
-            output_format=output_format,
-            payload="",
-            error=f"URLError: {e.reason}",
-        )
-
-    try:
-        data = json.loads(body)
-        text = data["choices"][0]["message"]["content"]
-    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-        return RawOutput(
-            page_id=page.page_id,
-            output_format=output_format,
-            payload="",
-            error=f"{type(e).__name__} parsing response: {e}",
-        )
-
-    usage = data.get("usage") or {}
-    tokens = usage.get("completion_tokens")
     return RawOutput(
         page_id=page.page_id,
         output_format=output_format,
-        payload=text or "",
+        payload=text,
         tokens=tokens,
     )
 

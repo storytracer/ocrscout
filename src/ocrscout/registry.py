@@ -25,6 +25,7 @@ EntryGroup = Literal[
     "evaluators",
     "benchmarks",
     "reporters",
+    "layout_detectors",
 ]
 
 _GROUPS: tuple[EntryGroup, ...] = (
@@ -36,6 +37,7 @@ _GROUPS: tuple[EntryGroup, ...] = (
     "evaluators",
     "benchmarks",
     "reporters",
+    "layout_detectors",
 )
 
 
@@ -54,6 +56,7 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
             "openai_api": "ocrscout.backends.openai_api:OpenAIApiBackend",
             "tesseract": "ocrscout.backends.tesseract:TesseractBackend",
             "docling": "ocrscout.backends.docling:DoclingBackend",
+            "layout_chat": "ocrscout.backends.layout_chat:LayoutChatBackend",
         },
         "normalizers": {
             "markdown": "ocrscout.normalizers.markdown:MarkdownNormalizer",
@@ -71,6 +74,9 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
         "benchmarks": {},
         "reporters": {
             "html": "ocrscout.reporters.html:HtmlReporter",
+        },
+        "layout_detectors": {
+            "pp-doclayout-v3": "ocrscout.layout_detectors.pp_doclayout_v3:PpDocLayoutV3Detector",
         },
     }
 

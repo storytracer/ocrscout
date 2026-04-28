@@ -2934,6 +2934,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
+    { name = "requests" },
     { name = "rich" },
     { name = "typer" },
 ]
@@ -2950,6 +2951,8 @@ all = [
     { name = "pikepdf" },
     { name = "polars" },
     { name = "s3fs" },
+    { name = "torch" },
+    { name = "transformers" },
 ]
 alto = [
     { name = "lxml" },
@@ -2967,6 +2970,10 @@ docling = [
 ]
 iiif = [
     { name = "httpx" },
+]
+layout = [
+    { name = "torch" },
+    { name = "transformers" },
 ]
 pdf = [
     { name = "ocrmypdf" },
@@ -2994,7 +3001,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10.0" },
     { name = "nvitop", specifier = ">=1.3.0" },
     { name = "ocrmypdf", marker = "extra == 'pdf'", specifier = ">=16.0.0" },
-    { name = "ocrscout", extras = ["pdf", "alto", "iiif", "cloud", "docling", "serve", "viewer"], marker = "extra == 'all'" },
+    { name = "ocrscout", extras = ["pdf", "alto", "iiif", "cloud", "docling", "serve", "viewer", "layout"], marker = "extra == 'all'" },
     { name = "pikepdf", marker = "extra == 'pdf'", specifier = ">=9.0.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "polars", marker = "extra == 'viewer'", specifier = ">=1.0.0" },
@@ -3002,12 +3009,15 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
+    { name = "requests", specifier = ">=2.31.0" },
     { name = "rich", specifier = ">=13.0.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6.0" },
     { name = "s3fs", marker = "extra == 'cloud'", specifier = ">=2024.0.0" },
+    { name = "torch", marker = "extra == 'layout'", specifier = ">=2.0.0" },
+    { name = "transformers", marker = "extra == 'layout'", specifier = ">=4.59.0" },
     { name = "typer", specifier = ">=0.12.0" },
 ]
-provides-extras = ["pdf", "alto", "iiif", "cloud", "docling", "serve", "viewer", "all", "dev"]
+provides-extras = ["pdf", "alto", "iiif", "cloud", "docling", "serve", "viewer", "layout", "all", "dev"]
 
 [[package]]
 name = "omegaconf"

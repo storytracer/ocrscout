@@ -35,6 +35,10 @@ dependencies = [
     "typer>=0.12.0",
     "rich>=13.0.0",
     "pyarrow>=17.0.0",
+    # Used by VllmBackend and LayoutChatBackend for OpenAI-compatible
+    # chat-completions calls. Connection pooling matters under per-region
+    # fan-out in layout mode.
+    "requests>=2.31.0",
     # nvitop wraps libnvml.so via nvidia-ml-py; pure-Python install in seconds,
     # no GPU runtime deps. Used by managed-mode GPU budgeting/telemetry.
     # Gracefully returns no devices on CPU-only hosts.
@@ -58,8 +62,21 @@ viewer = [
     "gradio>=5.0.0",
     "polars>=1.0.0",
 ]
+# Layout-aware OCR pipeline (ocrscout.backends.layout_chat + the
+# pp-doclayout-v3 detector). Uses the official Hugging Face Transformers
+# integration of PP-DocLayoutV3 — pulls in transformers + torch (CPU-only
+# wheels by default; users with CUDA can install the GPU torch wheels
+# themselves). ~600 MB extra; the alternative was ~200 LOC of fragile
+# hand-maintained ONNX preprocessing/decoding.
+#
+# transformers>=4.59.0 is the first release that ships
+# PPDocLayoutV3ForObjectDetection / PPDocLayoutV3ImageProcessor.
+layout = [
+    "transformers>=4.59.0",
+    "torch>=2.0.0",
+]
 all = [
-    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer]",
+    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout]",
 ]
 dev = [
     "ruff>=0.6.0",
@@ -68,6 +85,13 @@ dev = [
 
 [project.scripts]
 ocrscout = "ocrscout.cli:main"
+
+# Entry-point group declarations for downstream packages that ship custom
+# components. Each group maps to ``EntryGroup`` in src/ocrscout/registry.py;
+# adding a new pluggable axis means adding a section header here too.
+[project.entry-points."ocrscout.layout_detectors"]
+# Built-in detectors are registered in src/ocrscout/registry.py;
+# third-party packages add entries under this header.
 
 [project.urls]
 Homepage = "https://github.com/storytracer/ocrscout"

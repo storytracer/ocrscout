@@ -1,0 +1,118 @@
+name: glm-ocr-layout
+source: layout_chat
+model_id: zai-org/GLM-OCR
+model_size: 0.9B
+upstream_script: uv-scripts/ocr/glm-ocr.py
+
+# Layout-aware orchestration: PP-DocLayout-V3 finds typed regions, the layout
+# backend crops each region and dispatches one chat-completion per region
+# with the matching task prompt (text/table/formula). The per-region outputs
+# are assembled into a single layout_json payload that the existing
+# LayoutJsonNormalizer turns into a structured DoclingDocument with proper
+# TableItems and bbox provenance.
+output_format: layout_json
+normalizer: layout_json
+has_bboxes: true
+has_layout: true
+
+layout_detector: pp-doclayout-v3
+layout_detector_args:
+  # device: 'cpu' (default) is portable; flip to 'cuda' on a GPU host.
+  device: cpu
+  # Score threshold below which detections are dropped at post-processing.
+  # PP-DocLayoutV3 outputs are well-calibrated; 0.5 is a sane starting point.
+  score_threshold: 0.5
+  # Optional: pin a specific HF revision once you know a known-good commit.
+  # revision: <commit-sha>
+
+# Map PP-DocLayoutV3 native labels (from model.config.id2label) → docling
+# category keys consumed by LayoutJsonNormalizer. Anything not listed falls
+# through to TEXT. Covers both compact (e.g. 'formula') and full v3
+# (e.g. 'display_formula' / 'inline_formula') vocabularies so revisions
+# that prune or expand the label set still map cleanly.
+category_mapping:
+  doc_title: title
+  paragraph_title: section_header
+  figure_title: caption
+  table_title: caption
+  text: text
+  abstract: text
+  content: text
+  aside_text: text
+  vertical_text: text
+  reference: reference
+  reference_content: text
+  footnote: footnote
+  vision_footnote: footnote
+  header: page_header
+  header_image: page_header
+  footer: page_footer
+  footer_image: page_footer
+  number: text
+  table: table
+  image: picture
+  chart: picture
+  seal: picture
+  formula: formula
+  display_formula: formula
+  inline_formula: formula
+  formula_number: text
+  algorithm: code
+
+# Per-region prompt routing. Keyed on the *detector-native* category (not
+# the docling-mapped one) — the lookup happens before category_mapping is
+# applied. Anything not listed uses preferred_prompt_mode below.
+prompt_mode_per_category:
+  table: table
+  formula: formula
+  display_formula: formula
+  inline_formula: formula
+
+# GLM-OCR's three task prompts, copied verbatim from upstream
+# uv-scripts/ocr/glm-ocr.py:71-75 TASK_PROMPTS. The model expects the prompt
+# as a prefix string; the matching task token determines what extraction it
+# performs. preferred_prompt_mode is the catch-all for anything not mapped
+# in prompt_mode_per_category above.
+preferred_prompt_mode: ocr
+prompt_templates:
+  ocr: "Text Recognition:"
+  formula: "Formula Recognition:"
+  table: "Table Recognition:"
+
+chat_template_content_format: null
+
+# vLLM tuning reused verbatim from glm-ocr.yaml. Crops are smaller than full
+# pages so this is conservative — see glm-ocr.yaml for the rationale on each
+# knob.
+vllm_engine_args:
+  max_model_len: 8192
+  limit_mm_per_prompt:
+    image: 1
+  kv_cache_memory_bytes: 2G
+  max_num_batched_tokens: 8192
+
+sampling_args:
+  temperature: 0.0
+  repetition_penalty: 1.1
+  max_tokens: 6000
+
+# Region-level concurrency: how many regions of one page are dispatched in
+# parallel to the chat endpoint. Pages stay sequential. Default 16.
+backend_args:
+  region_concurrency: 16
+
+metadata:
+  notes: |
+    Layout-aware variant of glm-ocr.yaml. Uses PP-DocLayout-V3 (the same
+    detector GLM-OCR's own SDK uses) to segment the page into typed regions
+    before calling the OCR model per region with the matching task prompt.
+    This recovers structured TableItems on table-heavy pages — plain glm-ocr
+    in 'ocr' mode flattens tables into prose because it can only do one task
+    per call.
+
+    Trade-off vs plain glm-ocr: per-page wall-clock is 2-3x higher because
+    each region is one HTTP call, but you get structured tables and bbox
+    provenance for the viewer overlay. Use plain glm-ocr if you only care
+    about prose pages.
+
+    Requires onnxruntime; install with `uv pip install ocrscout[layout]`.

@@ -12,11 +12,14 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from ocrscout.errors import ProfileError, ProfileNotFound
 
-ProfileSource = Literal["vllm", "openai_api", "tesseract", "docling", "custom"]
+# ``source`` selects a backend by registry name. We keep the type as a plain
+# ``str`` so adding a backend doesn't require touching this schema — the
+# registry validates the name at run time when it resolves the backend class.
+ProfileSource = str
 OutputFormat = Literal["markdown", "doctags", "layout_json", "docling_document"]
 
 DEFAULT_VLLM_ENGINE_ARGS: dict[str, Any] = {
@@ -121,6 +124,44 @@ class ModelProfile(BaseModel):
     # Free-form
     backend_args: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    # Layout-aware orchestration. Consumed by ``layout_chat`` and any future
+    # layout-aware backend. Optional and additive — empty/None for every
+    # existing profile.
+    layout_detector: str | None = None
+    """Registry name of a ``LayoutDetector`` (e.g. ``"pp-doclayout-v3"``).
+
+    Required when ``source == "layout_chat"``.
+    """
+    layout_detector_args: dict[str, Any] = Field(default_factory=dict)
+    """Constructor kwargs for the layout detector (device, score_threshold,
+    revision, etc.). Detector-specific."""
+    prompt_mode_per_category: dict[str, str] = Field(default_factory=dict)
+    """Detector-native category label → prompt-template key.
+
+    Keyed on the **detector's** raw category (not the docling-mapped one) so
+    the lookup happens before ``category_mapping`` is applied. Categories not
+    listed fall back to ``preferred_prompt_mode``.
+    """
+
+    @model_validator(mode="after")
+    def _validate_layout_chat(self) -> ModelProfile:
+        if self.source == "layout_chat":
+            if not self.layout_detector:
+                raise ValueError(
+                    "source='layout_chat' requires layout_detector to be set"
+                )
+            if self.output_format != "layout_json":
+                raise ValueError(
+                    "source='layout_chat' requires output_format='layout_json' "
+                    f"(got {self.output_format!r})"
+                )
+            if self.normalizer != "layout_json":
+                raise ValueError(
+                    "source='layout_chat' requires normalizer='layout_json' "
+                    f"(got {self.normalizer!r})"
+                )
+        return self
 
 
 def load_profile(path: str | Path) -> ModelProfile:

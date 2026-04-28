@@ -45,6 +45,7 @@ from nvitop import Device
 from ocrscout.errors import ManagedServerError
 from ocrscout.log import VERBOSE
 from ocrscout.profile import ModelProfile, effective_vllm_engine_args
+from ocrscout.registry import registry
 
 log = logging.getLogger(__name__)
 
@@ -56,6 +57,23 @@ _TEARDOWN_GRACE = 10.0  # seconds to wait after SIGTERM before SIGKILL
 _LITELLM_VERSION = ">=1.50.0"
 
 _PR_SET_PDEATHSIG = 1  # Linux: signal to send when parent dies
+
+
+def _needs_managed_vllm(profile: ModelProfile) -> bool:
+    """Whether this profile should have a managed vllm-serve spawned for it.
+
+    Includes ``source == "vllm"`` plus any backend class that opts in via the
+    class-level ``requires_managed_vllm`` flag (currently
+    ``LayoutChatBackend``). Failures to resolve fall through to the legacy
+    string check so we never break managed mode for unknown backends.
+    """
+    if profile.source == "vllm":
+        return True
+    try:
+        cls = registry.get("backends", profile.source)
+    except Exception:  # noqa: BLE001
+        return False
+    return bool(getattr(cls, "requires_managed_vllm", False))
 
 
 def _set_pdeathsig() -> None:
@@ -122,11 +140,13 @@ def managed_servers(
 ) -> Iterator[ManagedHandle]:
     """Spawn vllm-serves + (if N>=2) a LiteLLM proxy; tear down on exit.
 
-    Filters ``profiles`` to those with ``source == "vllm"``. If the filtered
-    set is empty, yields a handle with an empty proxy_url — callers should
-    detect this and skip the env-var injection.
+    Filters ``profiles`` to those whose backend needs a managed vLLM serve —
+    ``source == "vllm"`` plus any backend class that opts in via
+    ``requires_managed_vllm = True`` (e.g. ``LayoutChatBackend``). If the
+    filtered set is empty, yields a handle with an empty proxy_url — callers
+    should detect this and skip the env-var injection.
     """
-    vllm_profiles = [p for p in profiles if p.source == "vllm"]
+    vllm_profiles = [p for p in profiles if _needs_managed_vllm(p)]
 
     log_dir = Path(tempfile.mkdtemp(prefix=f"ocrscout-managed-{uuid.uuid4().hex[:6]}-"))
     children: list[_ManagedChild] = []
