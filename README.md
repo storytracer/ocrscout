@@ -25,14 +25,19 @@ It's a *scout*, not a production pipeline: the goal is to help you decide whethe
 ## Install
 
 ```bash
-uv add ocrscout
-# or, with optional extras:
-uv add 'ocrscout[pdf,docling,serve,viewer]'
+uv add 'ocrscout[all]'
 ```
 
-The core install has **zero GPU dependencies** and finishes in seconds on a CPU-only host. All GPU work happens in subprocess-isolated `vllm` workers (spawned via `uv run --with vllm …`) or against remote vLLM servers, so the package itself stays light.
+That's the recommended install — it pulls in every adapter, backend, and the viewer in one shot. The `all` extra is just a meta-bundle of the per-feature extras below; if you want a slimmer footprint, pick what you need:
 
-Optional extras:
+```bash
+uv add ocrscout                              # core only
+uv add 'ocrscout[pdf,docling,serve,viewer]'  # à la carte
+```
+
+The core install (`uv add ocrscout`) has **zero GPU dependencies** and finishes in seconds on a CPU-only host. All GPU work happens in subprocess-isolated `vllm` workers (spawned via `uv run --with vllm …`) or against remote vLLM servers, so the package itself stays light. The `all` install is heavier (Docling pulls torch + transformers, ~few-GB download).
+
+Per-feature extras:
 
 | Extra | Adds | When you need it |
 | --- | --- | --- |
@@ -42,6 +47,7 @@ Optional extras:
 | `docling` | `docling` | non-VLM OCR backend (Tesseract, EasyOCR, etc. via Docling) |
 | `serve` | `litellm[proxy]` | managed multi-model server mode |
 | `viewer` | `gradio`, `polars` | interactive browser inspector |
+| `all` | all of the above | recommended default |
 
 ## Quick start
 

@@ -51,6 +51,9 @@ viewer = [
     "gradio>=5.0.0",
     "polars>=1.0.0",
 ]
+all = [
+    "ocrscout[pdf,alto,iiif,docling,serve,viewer]",
+]
 dev = [
     "ruff>=0.6.0",
     "mypy>=1.10.0",
