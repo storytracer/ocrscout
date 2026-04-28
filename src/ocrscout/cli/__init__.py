@@ -19,6 +19,7 @@ from ocrscout.cli import introspect as _introspect  # noqa: E402, F401
 from ocrscout.cli import report as _report  # noqa: E402, F401
 from ocrscout.cli import run as _run  # noqa: E402, F401
 from ocrscout.cli import serve as _serve  # noqa: E402, F401
+from ocrscout.cli import viewer as _viewer  # noqa: E402, F401
 
 
 def main() -> None:

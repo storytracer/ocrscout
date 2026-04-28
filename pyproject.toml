@@ -47,6 +47,10 @@ alto = ["lxml>=5.0.0"]
 iiif = ["httpx>=0.27.0"]
 docling = ["docling"]
 serve = ["litellm[proxy]>=1.50.0"]
+viewer = [
+    "gradio>=5.0.0",
+    "polars>=1.0.0",
+]
 dev = [
     "ruff>=0.6.0",
     "mypy>=1.10.0",
@@ -64,6 +68,7 @@ packages = ["src/ocrscout"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/ocrscout/profiles" = "ocrscout/profiles"
+"src/ocrscout/viewer/static" = "ocrscout/viewer/static"
 
 [tool.hatch.build.targets.sdist]
 include = ["src/ocrscout", "README.md", "CLAUDE.md", "LICENSE"]

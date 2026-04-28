@@ -1,0 +1,219 @@
+/* Density tweaks for the ocrscout Gradio viewer.
+   Goals: tighter padding so more content fits, monospace markdown for OCR
+   readability, color-coded bbox legend, and the diff pane styles reused
+   inside gr.HTML. */
+
+.ocrscout-viewer .gradio-container {
+  max-width: 100% !important;
+}
+
+.ocrscout-stats-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  font-size: 0.78rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  padding: 0.4rem 0.6rem;
+  border-radius: 6px;
+  background: var(--block-background-fill, rgba(127, 127, 127, 0.06));
+  border: 1px solid var(--block-border-color, rgba(127, 127, 127, 0.18));
+  margin-bottom: 0.4rem;
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.ocrscout-stats-strip .name {
+  font-weight: 600;
+}
+
+.ocrscout-stats-strip .err {
+  color: #b02a37;
+  font-weight: 600;
+}
+
+.ocrscout-markdown-pane {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.86rem;
+  line-height: 1.55;
+  max-height: 78vh;
+  overflow: auto;
+}
+
+/* Keep the image column pinned to the top of the viewport while the user
+   scrolls through a long diff in the sibling column, *without* clipping
+   the column or making it a scroll container. We still cap the inner
+   AnnotatedImage height so the column itself doesn't grow taller than the
+   viewport — but the cap is on the image only, not the whole column, so
+   the bbox legend underneath stays visible. */
+#ocrscout-image-col {
+  position: sticky !important;
+  top: 0.4rem;
+  align-self: flex-start !important;
+}
+#ocrscout-annotated img,
+#ocrscout-annotated svg,
+#ocrscout-annotated canvas {
+  max-height: calc(100vh - 12rem) !important;
+  height: auto !important;
+  object-fit: contain;
+}
+
+/* Top control bar: visual grouping for page-nav, view-mode, and actions.
+   Each .ocrscout-control-group gets a subtle outline so the controls feel
+   organised rather than as an undifferentiated row. */
+.ocrscout-control-group {
+  border: 1px solid rgba(127, 127, 127, 0.18);
+  border-radius: 8px;
+  padding: 0.35rem 0.55rem;
+  background: var(--block-background-fill, rgba(127, 127, 127, 0.04));
+}
+.ocrscout-control-group .gradio-button {
+  margin: 0 0.15rem;
+}
+.ocrscout-group-label {
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--body-text-color-subdued, #888);
+  margin-bottom: 0.2rem;
+}
+
+/* Diff embedding inside gr.HTML. The outer scroller caps the rendered
+   height so a long diff doesn't make the parent row taller than the
+   viewport — the sticky image column relies on the row staying within
+   reach of the scroll viewport. */
+.ocrscout-diff-scroll {
+  max-height: 88vh;
+  overflow: auto;
+  border-radius: 6px;
+  border: 1px solid rgba(127, 127, 127, 0.18);
+}
+.ocrscout-diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+}
+.ocrscout-diff-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--block-background-fill, #fff);
+  text-align: left;
+  padding: 0.45rem 0.7rem;
+  border-bottom: 2px solid rgba(127, 127, 127, 0.2);
+  font-size: 0.85rem;
+}
+.ocrscout-diff-table thead th.left { color: #b02a37; }
+.ocrscout-diff-table thead th.right { color: #146c43; }
+.ocrscout-diff-table td {
+  padding: 0.35rem 0.7rem;
+  vertical-align: top;
+  width: 50%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+.ocrscout-diff-table td.left { border-right: 1px solid rgba(127, 127, 127, 0.18); }
+.ocrscout-diff-table tr.equal td { color: rgba(108, 117, 125, 0.95); }
+.ocrscout-diff-table tr.delete td.left,
+.ocrscout-diff-table tr.replace td.left {
+  background: rgba(176, 42, 55, 0.12);
+}
+.ocrscout-diff-table tr.insert td.right,
+.ocrscout-diff-table tr.replace td.right {
+  background: rgba(20, 108, 67, 0.12);
+}
+
+
+/* Color-coded section blocks for layout-aware models (e.g. dots-mocr).
+   Each section gets a left border + small label tag in the same color as
+   its bbox in the image overlay, so the user can scan visually between
+   image and text. Falls back to plain markdown for models that don't
+   emit per-item labels. */
+.ocrscout-structured {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+  padding-right: 0.2rem;
+}
+.ocrscout-section {
+  position: relative;
+  padding: 0.35rem 0.6rem 0.35rem 0.75rem;
+  border-left: 3px solid var(--section-color, #888);
+  background: color-mix(in srgb, var(--section-color, #888) 8%, transparent);
+  border-radius: 0 4px 4px 0;
+}
+.ocrscout-section-tag {
+  display: inline-block;
+  font-size: 0.65rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 0.05rem 0.35rem;
+  border-radius: 3px;
+  margin-bottom: 0.25rem;
+  background: color-mix(in srgb, var(--section-color, #888) 22%, transparent);
+  color: color-mix(in srgb, var(--section-color, #888) 90%, var(--body-text-color, #222));
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 600;
+}
+.ocrscout-section-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.ocrscout-section[data-label="title"] .ocrscout-section-text {
+  font-size: 1.05rem;
+  font-weight: 600;
+}
+.ocrscout-section[data-label="section_header"] .ocrscout-section-text,
+.ocrscout-section[data-label="heading"] .ocrscout-section-text {
+  font-weight: 600;
+}
+.ocrscout-section[data-label="caption"] .ocrscout-section-text,
+.ocrscout-section[data-label="footnote"] .ocrscout-section-text {
+  font-style: italic;
+  font-size: 0.82rem;
+}
+
+/* Help modal for keyboard shortcuts. */
+.ocrscout-help dt { font-weight: 600; font-family: ui-monospace, monospace; }
+.ocrscout-help dd { margin-bottom: 0.4rem; }
+
+/* Custom dedup'd legend below the AnnotatedImage. One chip per unique
+   label, with the same color as the bbox overlay and a ×N count of how
+   many boxes that label has on the current page. */
+.ocrscout-legend-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+  padding: 0.4rem 0.1rem 0.2rem;
+  font-size: 0.8rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.ocrscout-legend-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--chip-color) 18%, transparent);
+  border: 1px solid color-mix(in srgb, var(--chip-color) 40%, transparent);
+  color: var(--body-text-color, #222);
+}
+.ocrscout-legend-chip .dot {
+  width: 0.55rem;
+  height: 0.55rem;
+  border-radius: 50%;
+  display: inline-block;
+}
+.ocrscout-legend-chip .count {
+  opacity: 0.6;
+  font-size: 0.72rem;
+  margin-left: 0.1rem;
+}
+.ocrscout-legend-empty {
+  font-size: 0.78rem;
+  color: var(--body-text-color-subdued, #888);
+  font-style: italic;
+  padding: 0.4rem 0.1rem;
+}
