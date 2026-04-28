@@ -1,0 +1,65 @@
+name: rolm-ocr
+source: vllm
+model_id: reducto/RolmOCR
+model_size: 7B
+upstream_script: uv-scripts/ocr/rolm-ocr.py
+
+# RolmOCR outputs plain text (rendered as markdown — no special structure,
+# no bboxes, no layout JSON). Useful as a 7B reference point next to the
+# 1-3B layout-JSON dots models and the 1B image-only LightOn.
+output_format: markdown
+normalizer: markdown
+has_bboxes: false
+has_layout: false
+
+# Single fixed prompt copied verbatim from upstream rolm-ocr.py:62
+# (the default `prompt` arg of make_ocr_message). RolmOCR is fine-tuned
+# from Qwen2.5-VL-7B on document OCR; this prompt is what it was trained
+# to respond to.
+preferred_prompt_mode: ocr
+prompt_templates:
+  ocr: |
+    Return the plain text representation of this document as if you were reading it naturally.
+
+# Upstream uses standard OpenAI structured content list (image_url +
+# text) at rolm-ocr.py:80-92. Let vLLM auto-detect.
+chat_template_content_format: null
+
+# vLLM engine knobs ported from rolm-ocr.py:253-260: trust_remote_code,
+# max_model_len=16384 (upstream default), limit_mm_per_prompt restricts
+# to one image per request. Trimmed cudagraph capture sizes matching
+# the other profiles. KV cache budget set higher (4G) than the 1-3B
+# profiles because RolmOCR is 7B with more layers / wider hidden state
+# (per-token KV cost is larger), and the 16K context window is wider.
+vllm_engine_args:
+  trust_remote_code: true
+  max_model_len: 16384
+  limit_mm_per_prompt:
+    image: 1
+  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
+  kv_cache_memory_bytes: 4G
+
+# Upstream: temperature=0.0 (deterministic for OCR — explicit in
+# rolm-ocr.py:262), max_tokens=8192 (upstream default). max_tokens stays
+# strictly below max_model_len so the OpenAI server doesn't reject
+# prompt+output > ctx for dense pages.
+sampling_args:
+  temperature: 0.0
+  max_tokens: 8192
+vllm_version: ">=0.15.1"
+
+backend_args:
+  batch_size: 16
+
+metadata:
+  notes: |
+    Curated from upstream uv-scripts/ocr/rolm-ocr.py. RolmOCR is a 7B
+    OCR model from Reducto, fine-tuned from Qwen2.5-VL-7B on document
+    extraction. Outputs plain text in reading order (no markdown
+    formatting beyond what the prose itself contains, no bboxes, no
+    layout structure).
+
+    Notably larger than the dots and LightOn profiles (7B vs 1-3B), so
+    expect ~3-4× the per-engine memory footprint and slower per-page
+    times. Useful for evaluating whether the size premium yields
+    accuracy gains on your corpus.

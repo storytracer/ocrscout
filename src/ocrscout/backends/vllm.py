@@ -250,12 +250,20 @@ class VllmBackend(ModelBackend):
         )
 
         # Map our sampling_args (vLLM SamplingParams keys) to the OpenAI
-        # /chat/completions schema. The vLLM server accepts the OpenAI names;
-        # extra vLLM-specific keys (chat_template_content_format) are passed
-        # through as top-level fields, which the server picks up.
+        # /chat/completions schema. The vLLM server accepts the standard
+        # OpenAI names plus a wider set of vLLM-extension keys (top_k,
+        # repetition_penalty, min_p, etc.) as top-level fields. We forward
+        # everything in the allowlist so profiles can express the full
+        # sampling regime their upstream recommends — e.g. GLM-OCR's
+        # repetition_penalty is required to avoid degenerate output on
+        # dense pages.
         sampling = dict(profile.sampling_args)
         request_payload_base: dict = {"model": profile.model_id}
-        for key in ("max_tokens", "temperature", "top_p"):
+        for key in (
+            "max_tokens", "temperature", "top_p", "top_k",
+            "repetition_penalty", "frequency_penalty", "presence_penalty",
+            "min_p", "seed", "stop",
+        ):
             if key in sampling:
                 request_payload_base[key] = sampling[key]
         if profile.chat_template_content_format is not None:

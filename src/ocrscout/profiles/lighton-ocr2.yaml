@@ -1,0 +1,70 @@
+name: lighton-ocr2
+source: vllm
+model_id: lightonai/LightOnOCR-2-1B
+model_size: 1B
+upstream_script: uv-scripts/ocr/lighton-ocr2.py
+
+# LightOnOCR-2 outputs plain markdown — no bboxes, no structured layout JSON.
+# Useful as a small/fast counterpart to the dots VLMs in scouting runs.
+output_format: markdown
+normalizer: markdown
+has_bboxes: false
+has_layout: false
+
+# LightOnOCR-2 is image-only — the upstream script sends NO text prompt
+# (uv-scripts/ocr/lighton-ocr2.py:134-141, with comment "Unlike v1,
+# LightOnOCR-2 does NOT use an empty text prefix - just the image").
+# We emit an empty text content item alongside the image; LightOn ignores
+# it. Only the `ocr` mode is meaningful for this model.
+preferred_prompt_mode: ocr
+prompt_templates:
+  ocr: ""
+
+# Upstream uses the standard OpenAI structured content list
+# (image_url + base64 data URI) at lighton-ocr2.py:134-141. Let vLLM
+# auto-detect the chat template content format.
+chat_template_content_format: null
+
+# vLLM engine knobs ported from the upstream LLM(...) call
+# (lighton-ocr2.py:327-334): trust_remote_code, max_model_len=8192 (the
+# upstream default; LightOn's training context), limit_mm_per_prompt
+# restricts to one image per request. Trimmed cudagraph capture sizes
+# matching the dots profiles (no batches above ~32 with the default
+# 16-way client concurrency). Absolute 2 GiB KV cache budget — sized
+# to match dots-ocr for comparable scouting at this model class.
+vllm_engine_args:
+  trust_remote_code: true
+  max_model_len: 8192
+  limit_mm_per_prompt:
+    image: 1
+  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
+  kv_cache_memory_bytes: 2G
+
+# Upstream defaults: temperature=0.2, top_p=0.9, max_tokens=4096
+# (lighton-ocr2.py:567-577). Kept as-is — LightOn was trained/evaluated
+# with this regime; switching to greedy sampling can degrade quality
+# despite being more reproducible. max_tokens stays well below
+# max_model_len (8192) to leave headroom for image patches at LightOn's
+# native 1540px training resolution.
+sampling_args:
+  temperature: 0.2
+  top_p: 0.9
+  max_tokens: 4096
+vllm_version: ">=0.15.1"
+
+backend_args:
+  batch_size: 16
+
+metadata:
+  notes: |
+    Curated from upstream uv-scripts/ocr/lighton-ocr2.py. LightOnOCR-2 is
+    a 1B compact OCR model from LightOn — a Pixtral ViT vision tower paired
+    with a Qwen3 language model, RLVR-trained. Outputs plain markdown
+    (no bboxes, no layout JSON), which makes it a useful fast/small
+    reference point next to dots-ocr (1.7B layout JSON, similar size,
+    different family).
+
+    Native training resolution is 1540px longest edge at 200 DPI; if
+    feeding much larger scans, consider adding
+    `mm_processor_kwargs: {max_pixels: 2371600}` (≈1540²) under
+    vllm_engine_args to cap input resolution at the source.

@@ -1,0 +1,76 @@
+name: glm-ocr
+source: vllm
+model_id: zai-org/GLM-OCR
+model_size: 0.9B
+upstream_script: uv-scripts/ocr/glm-ocr.py
+
+# GLM-OCR outputs plain text/markdown for `ocr` mode, LaTeX for `formula`,
+# and HTML/markdown table syntax for `table`. No bboxes, no layout JSON.
+output_format: markdown
+normalizer: markdown
+has_bboxes: false
+has_layout: false
+
+# Three task-specific prompts copied verbatim from upstream
+# uv-scripts/ocr/glm-ocr.py:71-75 (TASK_PROMPTS dict). The model expects
+# the prompt as a prefix string; the matching task token determines what
+# extraction it performs.
+preferred_prompt_mode: ocr
+prompt_templates:
+  ocr: "Text Recognition:"
+  formula: "Formula Recognition:"
+  table: "Table Recognition:"
+
+# Upstream uses standard OpenAI structured content list (image_url + text)
+# at glm-ocr.py:118-126. Let vLLM auto-detect.
+chat_template_content_format: null
+
+# vLLM engine knobs ported from glm-ocr.py:279-285: trust_remote_code,
+# max_model_len=8192 (upstream default), limit_mm_per_prompt restricts to
+# one image per request. Trimmed cudagraph capture sizes matching the
+# other profiles. KV cache budget set to 2 GiB (matches the dots/lighton
+# small-model tier; GLM-OCR is the smallest of the bunch at 0.9B).
+vllm_engine_args:
+  trust_remote_code: true
+  max_model_len: 8192
+  limit_mm_per_prompt:
+    image: 1
+  cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]
+  kv_cache_memory_bytes: 2G
+
+# Sampling defaults from the GLM-OCR SDK (per upstream comment at
+# glm-ocr.py:287-291): temperature=0.01, top_p=0.00001, top_k=1,
+# repetition_penalty=1.1. The HF generation_config.json sets
+# do_sample=false (greedy), so temperature/top_p are effectively no-ops
+# at these tiny values. We use temperature=0.0 (true greedy) to be
+# explicit; repetition_penalty=1.1 is required to avoid degenerate
+# repetition on dense pages and is the model author's recommendation.
+#
+# max_tokens MUST be strictly less than max_model_len (8192): the vLLM
+# OpenAI server enforces prompt_tokens + max_tokens <= max_model_len.
+# Image patches + prompt prefix typically use 1-2K tokens for a page,
+# so 6000 leaves a comfortable headroom. The upstream script gets away
+# with max_tokens=8192 only because it uses LLM.chat() (offline API),
+# which silently clips; the server rejects with HTTP 400.
+sampling_args:
+  temperature: 0.0
+  repetition_penalty: 1.1
+  max_tokens: 6000
+vllm_version: ">=0.15.1"
+
+backend_args:
+  batch_size: 16
+
+metadata:
+  notes: |
+    Curated from upstream uv-scripts/ocr/glm-ocr.py. GLM-OCR is a 0.9B
+    OCR model from Z.ai (zai-org), the smallest in the current ocrscout
+    profile set. Task-driven via the prompt prefix: `ocr` for plain text,
+    `formula` for LaTeX, `table` for table extraction. Override
+    `preferred_prompt_mode` per run to switch tasks.
+
+    Upstream script header pins vLLM nightly + transformers>=5.1.0 via
+    a custom uv index. If the GLM-OCR architecture isn't recognized by
+    your installed stable vLLM, you'll see a "Resolved architecture"
+    error at startup — bump `vllm_version` here to a known-good nightly
+    or wait for the architecture to land in stable.
