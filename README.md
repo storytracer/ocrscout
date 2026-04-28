@@ -20,7 +20,7 @@ It is **not** a production OCR pipeline (that's [Docling](https://github.com/doc
 ```bash
 uv add ocrscout
 # or, with optional extras:
-uv add 'ocrscout[pdf,docling,viewer]'
+uv add 'ocrscout[pdf,docling,serve,viewer]'
 ```
 
 Optional extras:
@@ -51,6 +51,52 @@ uv run --extra viewer ocrscout viewer ./out/
 uv run ocrscout apply pipeline.yaml
 ```
 
+## Bundled model profiles
+
+Each model is described by a hand-curated YAML in [src/ocrscout/profiles/](src/ocrscout/profiles/). Out of the box:
+
+| Profile | Backend | Notes |
+| --- | --- | --- |
+| `dots-mocr` | vLLM | DocTags-style structured output, layout-aware |
+| `dots-ocr` | vLLM | Plain markdown + bboxes |
+| `glm-ocr` | vLLM | GLM-4V-based OCR |
+| `lighton-ocr2` | vLLM | LightOnOCR-2 |
+| `rolm-ocr` | vLLM | Reducto's RolmOCR |
+| `smoldocling` | vLLM | Layout-aware, low VRAM |
+
+Add a new model by dropping a YAML in `src/ocrscout/profiles/` (or shipping it via the `ocrscout.backends` / `ocrscout.normalizers` entry points from a downstream package). `uv run ocrscout introspect <name>` produces a draft profile from an [`uv-scripts/ocr`](https://huggingface.co/datasets/uv-scripts/ocr) reference script.
+
+## Running vLLM-backed models
+
+vLLM-source profiles can run in three modes — pick by what's already running:
+
+| Mode | Trigger | Lifecycle | Use case |
+| --- | --- | --- | --- |
+| **runner** | _(default)_ | per-invocation `uv run --with vllm …` subprocess; killed on exit | one-off scout, single model, no warm server available |
+| **external-server** | `--server-url URL` | not managed by ocrscout | a `vllm serve` you started by hand, or any OpenAI-compatible endpoint (incl. a LiteLLM proxy) |
+| **managed** | `ocrscout serve` (long-lived) **or** `ocrscout run --managed` (inline) | ocrscout owns N `vllm serve` + 1 LiteLLM proxy (when N≥2); torn down on exit | comparing multiple models with warm servers; one URL fronting many models |
+
+```bash
+# runner (default): spin up vllm just for this run
+uv run ocrscout run --source ./images/ --models dots-mocr
+
+# external-server: connect to a vllm-serve / proxy you already started
+uv run ocrscout run --source ./images/ --models dots-mocr \
+  --server-url http://localhost:8000/v1
+
+# managed inline: ocrscout spawns + tears down for this single run
+uv run ocrscout run --source ./images/ --models dots-mocr,dots-ocr,glm-ocr \
+  --managed
+
+# managed long-lived: keep warm servers up, drive runs from another terminal
+uv run ocrscout serve --models dots-mocr,dots-ocr,glm-ocr
+# in another terminal:
+uv run ocrscout run --source ./images/ --models dots-mocr \
+  --server-url http://localhost:4000/v1
+```
+
+`--managed` and `--server-url` are mutually exclusive. By default models execute sequentially even when several are managed (each gets the full GPU); override with `--parallel-models / -P` if you have separate GPUs per model. See [CLAUDE.md](CLAUDE.md) for the GPU-budget model and per-profile KV-cache sizing rules.
+
 ## Inspecting results
 
 Two ways to look at a previous run's `output_dir/results.parquet`:
@@ -59,6 +105,10 @@ Two ways to look at a previous run's `output_dir/results.parquet`:
 | --- | --- |
 | `ocrscout inspect <out>` | Terminal — Rich summary table, `--page <id>` per-model markdown dump, `--diff a,b --html` one-shot side-by-side diff page. Zero extra deps; works over SSH. |
 | `ocrscout viewer <out>` | Browser — long-lived Gradio app: page picker, adaptive model picker (radio for Single, checkbox for Side-by-side, paired dropdowns for Diff), source page with color-coded bbox overlay + deduplicated legend, color-matched section blocks in the text pane for layout-aware models. Pulls in `gradio` + `polars` from the `viewer` extra. |
+
+## Logging
+
+Status output uses stdlib `logging` under the `ocrscout` namespace. CLI commands accept `-q` (warnings only), default (info), `-v` (timestamps + verbose events), and `-vv` (debug + module:line). One logical line per record — grep-friendly, no Rich markup.
 
 See [CLAUDE.md](CLAUDE.md) for the implementation roadmap, design decisions, and contributor guide.
 
