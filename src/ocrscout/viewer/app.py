@@ -135,15 +135,6 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     elem_id="ocrscout-view-mode",
                 )
             with gr.Column(scale=2, elem_classes=["ocrscout-control-group"]):
-                gr.HTML('<div class="ocrscout-group-label">Layout source</div>')
-                layout_model_dd = gr.Dropdown(
-                    choices=_layout_choices(initial_layout_models),
-                    value=initial_layout_choice,
-                    label=None,
-                    show_label=False,
-                    container=False,
-                )
-            with gr.Column(scale=2, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">Actions</div>')
                 with gr.Row(equal_height=True):
                     image_toggle = gr.Button("Toggle image", size="sm")
@@ -160,6 +151,15 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 elem_id="ocrscout-image-col",
                 elem_classes=["ocrscout-image-col"],
             ) as image_col:
+                with gr.Column(elem_classes=["ocrscout-control-group"]):
+                    gr.HTML('<div class="ocrscout-group-label">Layout source</div>')
+                    layout_model_dd = gr.Dropdown(
+                        choices=_layout_choices(initial_layout_models),
+                        value=initial_layout_choice,
+                        label=None,
+                        show_label=False,
+                        container=False,
+                    )
                 annotated = image_annotator(
                     label="Source page (boxes from selected layout model)",
                     interactive=False,
