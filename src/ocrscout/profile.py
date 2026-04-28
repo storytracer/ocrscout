@@ -27,6 +27,10 @@ DEFAULT_VLLM_ENGINE_ARGS: dict[str, Any] = {
     # per-profile by setting ``cudagraph_capture_sizes`` in
     # ``vllm_engine_args``.
     "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32],
+    # Every shipped OCR VLM ships custom modeling code on the Hub and
+    # requires this. Override to ``false`` only for a profile that pins a
+    # model with a stock architecture.
+    "trust_remote_code": True,
 }
 
 
@@ -104,7 +108,7 @@ class ModelProfile(BaseModel):
 
     Examples: ``temperature``, ``top_p``, ``max_tokens``.
     """
-    vllm_version: str = ">=0.15.0"
+    vllm_version: str = ">=0.15.1"
     """Version specifier used by ``uv run --with "vllm{vllm_version}"`` for
     subprocess mode. Ignored in server mode."""
     server_url: str | None = None

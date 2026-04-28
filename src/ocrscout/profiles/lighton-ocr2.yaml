@@ -26,14 +26,11 @@ prompt_templates:
 chat_template_content_format: null
 
 # vLLM engine knobs ported from the upstream LLM(...) call
-# (lighton-ocr2.py:327-334): trust_remote_code, max_model_len=8192 (the
-# upstream default; LightOn's training context), limit_mm_per_prompt
-# restricts to one image per request. Trimmed cudagraph capture sizes
-# matching the dots profiles (no batches above ~32 with the default
-# 16-way client concurrency). Absolute 2 GiB KV cache budget — sized
-# to match dots-ocr for comparable scouting at this model class.
+# (lighton-ocr2.py:327-334): max_model_len=8192 (the upstream default;
+# LightOn's training context), limit_mm_per_prompt restricts to one
+# image per request. Absolute 2 GiB KV cache budget — sized to match
+# dots-ocr for comparable scouting at this model class.
 vllm_engine_args:
-  trust_remote_code: true
   max_model_len: 8192
   limit_mm_per_prompt:
     image: 1
@@ -49,10 +46,6 @@ sampling_args:
   temperature: 0.2
   top_p: 0.9
   max_tokens: 4096
-vllm_version: ">=0.15.1"
-
-backend_args:
-  batch_size: 16
 
 metadata:
   notes: |

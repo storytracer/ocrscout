@@ -58,7 +58,6 @@ chat_template_content_format: null
 # dots-mocr. limit_mm_per_prompt comes from the script's LLM(...) call
 # (line 302) — dots-ocr restricts to one image per request.
 vllm_engine_args:
-  trust_remote_code: true
   max_model_len: 24000
   limit_mm_per_prompt:
     image: 1
@@ -77,10 +76,6 @@ vllm_engine_args:
 sampling_args:
   temperature: 0.0
   max_tokens: 20000
-vllm_version: ">=0.15.1"
-
-backend_args:
-  batch_size: 16
 
 metadata:
   notes: |

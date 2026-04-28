@@ -25,14 +25,12 @@ prompt_templates:
 # text) at rolm-ocr.py:80-92. Let vLLM auto-detect.
 chat_template_content_format: null
 
-# vLLM engine knobs ported from rolm-ocr.py:253-260: trust_remote_code,
-# max_model_len=16384 (upstream default), limit_mm_per_prompt restricts
-# to one image per request. Trimmed cudagraph capture sizes matching
-# the other profiles. KV cache budget set higher (4G) than the 1-3B
-# profiles because RolmOCR is 7B with more layers / wider hidden state
-# (per-token KV cost is larger), and the 16K context window is wider.
+# vLLM engine knobs ported from rolm-ocr.py:253-260: max_model_len=16384
+# (upstream default), limit_mm_per_prompt restricts to one image per
+# request. KV cache budget set higher (4G) than the 1-3B profiles
+# because RolmOCR is 7B with more layers / wider hidden state (per-token
+# KV cost is larger), and the 16K context window is wider.
 vllm_engine_args:
-  trust_remote_code: true
   max_model_len: 16384
   limit_mm_per_prompt:
     image: 1
@@ -45,10 +43,6 @@ vllm_engine_args:
 sampling_args:
   temperature: 0.0
   max_tokens: 8192
-vllm_version: ">=0.15.1"
-
-backend_args:
-  batch_size: 16
 
 metadata:
   notes: |

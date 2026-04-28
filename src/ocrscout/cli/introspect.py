@@ -116,7 +116,6 @@ def _draft_yaml(info: HfScriptInfo) -> str:
             "TODO  # set to 'string' for dots.mocr-style models, else null"
         )
         draft["vllm_engine_args"] = {
-            "trust_remote_code": True,
             "max_model_len": "TODO  # script default; bump to ~24000 for dense pages",
             "gpu_memory_utilization": 0.8,
         }
@@ -125,7 +124,6 @@ def _draft_yaml(info: HfScriptInfo) -> str:
             "top_p": 0.9,
             "max_tokens": "TODO  # match max_model_len",
         }
-        draft["vllm_version"] = ">=0.15.0"
     else:
         draft["backend_args"] = {}
 

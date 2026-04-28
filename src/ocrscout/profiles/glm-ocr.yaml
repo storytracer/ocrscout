@@ -25,13 +25,11 @@ prompt_templates:
 # at glm-ocr.py:118-126. Let vLLM auto-detect.
 chat_template_content_format: null
 
-# vLLM engine knobs ported from glm-ocr.py:279-285: trust_remote_code,
-# max_model_len=8192 (upstream default), limit_mm_per_prompt restricts to
-# one image per request. Trimmed cudagraph capture sizes matching the
-# other profiles. KV cache budget set to 2 GiB (matches the dots/lighton
+# vLLM engine knobs ported from glm-ocr.py:279-285: max_model_len=8192
+# (upstream default), limit_mm_per_prompt restricts to one image per
+# request. KV cache budget set to 2 GiB (matches the dots/lighton
 # small-model tier; GLM-OCR is the smallest of the bunch at 0.9B).
 vllm_engine_args:
-  trust_remote_code: true
   max_model_len: 8192
   limit_mm_per_prompt:
     image: 1
@@ -55,10 +53,6 @@ sampling_args:
   temperature: 0.0
   repetition_penalty: 1.1
   max_tokens: 6000
-vllm_version: ">=0.15.1"
-
-backend_args:
-  batch_size: 16
 
 metadata:
   notes: |
