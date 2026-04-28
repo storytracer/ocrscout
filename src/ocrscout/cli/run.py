@@ -68,11 +68,6 @@ def run(
     export: str = typer.Option(
         "parquet", "--export", help="Export adapter name."
     ),
-    text: bool = typer.Option(
-        True, "--text/--no-text",
-        help="Also write a `text/<page>.<model>.md` rendering of every result "
-             "alongside the parquet (uses DoclingDocument.export_to_markdown).",
-    ),
     server_url: str | None = typer.Option(
         None, "--server-url",
         help="OpenAI-compatible vLLM server URL (e.g. http://localhost:8000/v1). "
@@ -189,8 +184,6 @@ def run(
     if benchmark:
         log.warning("(stub) would run benchmark %r", benchmark)
 
-    text_dir = (output_dir / "text") if text else None
-
     # Resolve parallelism. Default 1 (sequential): the GPU is the bottleneck
     # in single-GPU setups, so concurrent model execution just splits compute
     # and bandwidth and yields slowed, contended per-model s/page numbers
@@ -228,18 +221,17 @@ def run(
                         "--managed requested but no vllm profiles; running "
                         "docling/in-process backends only."
                     )
-                _execute(cfg, text_dir=text_dir, parallel_models=parallel_models)
+                _execute(cfg, parallel_models=parallel_models)
         except ManagedServerError as e:
             log.error("Managed stack failed: %s", e)
             raise typer.Exit(code=1) from e
     else:
-        _execute(cfg, text_dir=text_dir, parallel_models=parallel_models)
+        _execute(cfg, parallel_models=parallel_models)
 
 
 def _execute(
     cfg: PipelineConfig,
     *,
-    text_dir: Path | None = None,
     parallel_models: int = 1,
 ) -> None:
     source_cls = registry.get("sources", cfg.source.name)
@@ -283,7 +275,6 @@ def _execute(
             normalizer_overrides=cfg.normalizer_overrides,
             exporter=exporter,
             metrics=metrics,
-            text_dir=text_dir,
         )
         return name, ok, failed, run_seconds
 
@@ -304,8 +295,6 @@ def _execute(
 
     summary_rows = [(m, *results[m]) for m in cfg.models if m in results]
     _print_summary(summary_rows, dest=cfg.export.args["dest"])
-    if text_dir is not None:
-        log.info("Wrote per-(page, model) markdown to %s", text_dir)
 
 
 def _run_one_model(
@@ -316,7 +305,6 @@ def _run_one_model(
     normalizer_overrides: dict,
     exporter,
     metrics: MetricsCollector,
-    text_dir: Path | None = None,
 ) -> tuple[int, int, float]:
     try:
         profile = resolve(model_name)
@@ -390,9 +378,6 @@ def _run_one_model(
         exporter.write(record)
         ok += 1
 
-        if text_dir is not None:
-            _write_markdown(text_dir, page.page_id, model_name, markdown)
-
     metrics.add_pages(ok=ok, failed=failed)
     run_seconds = metrics.stage_seconds.get(f"{model_name}.run", 0.0)
     log.info(
@@ -446,16 +431,3 @@ def _doc_stats(doc) -> tuple[int, int, str]:
         log.warning("export_to_markdown failed: %s", e)
         markdown = ""
     return item_count, text_length, markdown
-
-
-def _write_markdown(text_dir: Path, page_id: str, model_name: str, markdown: str) -> None:
-    """Write `<text_dir>/<sanitized_page_stem>.<model>.md`.
-
-    page_id may contain slashes (subdir-relative) and the original suffix
-    (e.g. `.jp2`); we strip the suffix and replace path separators with `_`
-    so the filename is flat and predictable.
-    """
-    stem = Path(page_id).stem.replace("/", "_").replace("\\", "_")
-    target = text_dir / f"{stem}.{model_name}.md"
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(markdown, encoding="utf-8")

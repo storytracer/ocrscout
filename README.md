@@ -34,7 +34,7 @@ Behind the scenes:
 
 - **Runs each model for you.** Loads each one onto the GPU, runs your pages through it, and shuts down cleanly when it's done. Manages GPU memory if you load several at once.
 - **Normalises every output.** One model returns Markdown, another HTML, another its own custom token stream. ocrscout converts every result into a common document model so you can compare apples to apples.
-- **Writes one results file.** One row per `(page, model)` in `results.parquet` with timings, success rates, output token counts, and the normalised document. Optional Markdown sidecars per page for `grep`-friendly skimming.
+- **Writes one HuggingFace-shaped dataset.** One row per `(page, model)` in `data/train-*.parquet` with timings, success rates, output token counts, the normalised document, and a pre-rendered Markdown rendering ready for `grep`/diff/viewer.
 - **Has a browser viewer.** Flip through pages, switch between models, see bounding boxes overlaid on the source image, compare two models word-by-word in a side-by-side diff.
 - **Scores accuracy when you have ground truth.** Drop in a folder of reference transcriptions and ocrscout adds edit-distance scores per page and overall.
 
@@ -89,8 +89,8 @@ Here's what happens, in plain terms:
 3. It picks 20 pages from your image folder and sends every page through every model.
 4. Whatever the models emit (markdown, HTML tables, custom token streams), ocrscout converts into one common document format so you can compare them apples-to-apples.
 5. Everything goes into `./ocrscout-results/`:
-   - `results.parquet` — one row per (page, model) with timings, token counts, success/failure, and the normalized output. Open it with any Parquet-aware tool (Pandas, DuckDB, Polars).
-   - `text/<page>.<model>.md` — a markdown rendering of each result, one file per (page, model), so you can `grep`, `diff`, or skim them in your editor.
+   - `data/train-*.parquet` — one row per (page, model) with timings, token counts, success/failure, the normalized document, and a pre-rendered `markdown` column. The directory is laid out exactly like a HuggingFace Hub dataset, so `datasets.load_dataset("./ocrscout-results", split="train")` works without further conversion.
+   - `pipeline.yaml` — the resolved configuration ocrscout actually ran (source, models, normalizer overrides, sample/seed), so the run is reproducible.
 6. A summary table is printed: how many pages each model handled, how often it failed, mean seconds per page, total output tokens.
 
 **Got ground-truth transcriptions?** If you have plain-text references (one `.txt` per page, matched by filename), add them and ocrscout also computes edit-distance accuracy scores:
@@ -187,7 +187,7 @@ For the GPU-memory bookkeeping rules and per-profile sizing knobs, see [CLAUDE.m
 
 ## Looking at results
 
-After a run, your output directory contains a `results.parquet` (one row per page-and-model with timings, output, and accuracy if you provided ground truth) plus optional markdown sidecars per page. ocrscout has two ways to look at all this:
+After a run, your output directory contains `data/train-*.parquet` (one row per page-and-model with timings, the normalized document, a pre-rendered `markdown` column, and accuracy scores if you provided ground truth) plus the resolved `pipeline.yaml`. The layout is HF-Hub-compatible, so `datasets.load_dataset(<out>, split="train")` works directly. ocrscout has two ways to browse it:
 
 ### `ocrscout inspect <out>` — terminal
 

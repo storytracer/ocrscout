@@ -77,13 +77,13 @@ def inspect(
             raise typer.Exit(code=1)
         _show_page_diff(
             rows, page_id=page, model_a=parts[0], model_b=parts[1],
-            output_dir=output_dir, html=html,
+            html=html,
         )
     elif html:
         rprint("[red]--html requires --diff (it serves a diff viewer)[/red]")
         raise typer.Exit(code=1)
     elif page is not None:
-        _show_page(rows, page_id=page, output_dir=output_dir)
+        _show_page(rows, page_id=page)
     else:
         _show_summary(rows, snippet_length=snippet_length)
 
@@ -107,7 +107,7 @@ def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
             metrics = {}
         out.append({
             "page_id": raw["page_id"],
-            "model": raw.get("model") or metrics.get("model", "?"),
+            "model": raw["model"],
             "source_uri": raw.get("source_uri"),
             "output_format": raw.get("output_format"),
             "document_json": raw.get("document_json"),
@@ -145,9 +145,7 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
     Console().print(table)
 
 
-def _show_page(
-    rows: list[dict[str, Any]], *, page_id: str, output_dir: Path
-) -> None:
+def _show_page(rows: list[dict[str, Any]], *, page_id: str) -> None:
     matches = [r for r in rows if r["page_id"] == page_id]
     if not matches:
         all_pages = sorted({r["page_id"] for r in rows})
@@ -156,7 +154,6 @@ def _show_page(
         raise typer.Exit(code=1)
 
     matches.sort(key=lambda r: r["model"])
-    text_dir = output_dir / "text"
     for r in matches:
         rprint(
             f"\n[bold cyan]=== {r['page_id']}  ·  {r['model']} "
@@ -167,7 +164,7 @@ def _show_page(
             f"[dim]items={m.get('item_count')}  chars={m.get('text_length')}  "
             f"s/page={_fmt_seconds(m.get('run_seconds_per_page'))}[/dim]"
         )
-        markdown = _markdown_for(r, text_dir=text_dir)
+        markdown = r.get("markdown") or ""
         if markdown:
             rprint(markdown)
         else:
@@ -180,7 +177,6 @@ def _show_page_diff(
     page_id: str,
     model_a: str,
     model_b: str,
-    output_dir: Path,
     html: bool,
 ) -> None:
     """Compute a word-level diff between two models; render to terminal or HTML."""
@@ -199,9 +195,8 @@ def _show_page_diff(
         rprint(f"[dim]Available for this page: {available}[/dim]")
         raise typer.Exit(code=1)
 
-    text_dir = output_dir / "text"
-    text_a = _markdown_for(page_rows[model_a], text_dir=text_dir)
-    text_b = _markdown_for(page_rows[model_b], text_dir=text_dir)
+    text_a = page_rows[model_a].get("markdown") or ""
+    text_b = page_rows[model_b].get("markdown") or ""
     if not text_a or not text_b:
         rprint(
             "[yellow]Cannot diff: one or both models produced no rendered text.[/yellow]"
@@ -352,27 +347,6 @@ def _detect_lan_ip() -> str | None:
             return ip if ip and not ip.startswith("127.") else None
         except OSError:
             return None
-
-
-def _markdown_for(row: dict[str, Any], *, text_dir: Path) -> str:
-    """Resolve markdown for a row: parquet column → text sidecar → JSON re-render."""
-    md = row.get("markdown")
-    if md:
-        return md
-    stem = Path(row["page_id"]).stem.replace("/", "_").replace("\\", "_")
-    sidecar = text_dir / f"{stem}.{row['model']}.md"
-    if sidecar.is_file():
-        return sidecar.read_text(encoding="utf-8")
-    doc_json = row["document_json"]
-    if not doc_json:
-        return ""
-    try:
-        from docling_core.types.doc import DoclingDocument
-
-        doc = DoclingDocument.model_validate_json(doc_json)
-        return doc.export_to_markdown()
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 def _snippet_from_doc(document_json: str | None, length: int) -> str:

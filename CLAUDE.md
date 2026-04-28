@@ -160,12 +160,12 @@ All status output flows through Python's stdlib `logging` module under the `ocrs
 
 ## Inspecting results
 
-Two read-only post-mortem tools share the same input — a previous run's `output_dir/results.parquet` (plus the optional `text/<page>.<model>.md` sidecars):
+Two read-only post-mortem tools share the same input — a previous run's `output_dir/data/train-*.parquet`. Each row carries its own pre-rendered markdown in the `markdown` column (no on-disk sidecars; the column is populated at write time from `DoclingDocument.export_to_markdown`):
 
 | Command | Where | Deps | Use case |
 | --- | --- | --- | --- |
 | `ocrscout inspect <out>` | terminal | core only | Rich summary table; `--page <id>` per-model markdown dump; `--diff a,b --html` serves a one-shot side-by-side diff over the LAN. Right tool for SSH, CI logs, and quick pokes. |
-| `ocrscout viewer <out>` | browser | `[viewer]` extra (`gradio`, `polars`) | Long-lived Gradio app. Adapts to the comparison shape: page picker, mode-aware model picker (radio for Single, checkbox for Side-by-side, paired Model A / Model B dropdowns for Diff), source page with color-coded bbox overlay + deduplicated category legend, and matching color-coded section blocks in the text pane for layout-aware models. State (page / models / mode) persists via `gr.BrowserState` and can be supplied via URL query params for shareable views. |
+| `ocrscout viewer <out>` | browser | `[viewer]` extra (`gradio`) | Long-lived Gradio app. Adapts to the comparison shape: page picker, mode-aware model picker (radio for Single, checkbox for Side-by-side, paired Model A / Model B dropdowns for Diff), source page with color-coded bbox overlay + deduplicated category legend, and matching color-coded section blocks in the text pane for layout-aware models. State (page / models / mode) persists via `gr.BrowserState` and can be supplied via URL query params for shareable views. |
 
 The two share a code path for diff rendering: [src/ocrscout/viewer/diff.py](src/ocrscout/viewer/diff.py) holds `compute_diff`, `render_diff_page` (the standalone HTML page served by `inspect --html`), and `render_diff_table_fragment` (the same opcode-aligned table embedded inside the viewer's Diff mode). Updating the diff styling in one place updates both surfaces.
 

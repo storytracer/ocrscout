@@ -100,7 +100,6 @@ class ViewerStore:
 
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir
-        self.text_dir = output_dir / "text"
         shards = find_parquet_files(output_dir)
         if not shards:
             raise FileNotFoundError(
@@ -277,7 +276,7 @@ class ViewerStore:
             out.append(
                 {
                     "page_id": raw["page_id"],
-                    "model": raw.get("model") or metrics.get("model", "?"),
+                    "model": raw["model"],
                     "source_uri": raw.get("source_uri"),
                     "output_format": raw.get("output_format"),
                     "document_json": raw.get("document_json"),
@@ -332,34 +331,13 @@ class ViewerStore:
         return compute_page_disagreement(materialized)
 
     def _markdown_for(self, row: dict[str, Any]) -> str:
-        """Resolve the markdown body for a row.
+        """Return the row's pre-rendered markdown (parquet ``markdown`` column).
 
-        Order: parquet ``markdown`` column → on-disk text sidecar → re-render
-        from ``document_json``. Modern parquets (post-schema-swap) populate
-        the ``markdown`` column at write time, so the sidecar/JSON paths are
-        only hit for older runs or for rows where Docling's
-        ``export_to_markdown`` failed at run time.
+        The writer populates this column from
+        ``DoclingDocument.export_to_markdown`` at run time and falls back to
+        ``""`` on failure, so the column is always present.
         """
-        md = row.get("markdown")
-        if md:
-            return md
-        stem = Path(row["page_id"]).stem.replace("/", "_").replace("\\", "_")
-        sidecar = self.text_dir / f"{stem}.{row['model']}.md"
-        if sidecar.is_file():
-            try:
-                return sidecar.read_text(encoding="utf-8")
-            except OSError:
-                pass
-        doc_json = row["document_json"]
-        if not doc_json:
-            return ""
-        try:
-            from docling_core.types.doc import DoclingDocument
-
-            doc = DoclingDocument.model_validate_json(doc_json)
-            return doc.export_to_markdown()
-        except Exception:  # noqa: BLE001
-            return ""
+        return row.get("markdown") or ""
 
     def _iter_doc_items(self, row: dict[str, Any]):
         """Yield ``(item, item_idx, label_str, text_str)`` in body reading order.
