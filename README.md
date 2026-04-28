@@ -20,8 +20,15 @@ It is **not** a production OCR pipeline (that's [Docling](https://github.com/doc
 ```bash
 uv add ocrscout
 # or, with optional extras:
-uv add 'ocrscout[pdf,docling]'
+uv add 'ocrscout[pdf,docling,viewer]'
 ```
+
+Optional extras:
+
+- `pdf` / `alto` / `iiif` — extra source/reference adapters
+- `docling` — `DoclingBackend` for non-VLM OCR
+- `serve` — `litellm[proxy]` for managed multi-model server mode
+- `viewer` — Gradio-based interactive inspector (see below)
 
 ## Quick start
 
@@ -34,12 +41,24 @@ uv run ocrscout run --source ./images/ \
                      --reference plain_text --reference-path ./txt/ \
                      --models dots-mocr
 
-# Refresh auto-generated profiles from uv-scripts/ocr
-uv run ocrscout sync
+# Inspect a previous run's results in the terminal
+uv run ocrscout inspect ./out/
+
+# …or open the same results in an interactive Gradio viewer
+uv run --extra viewer ocrscout viewer ./out/
 
 # Apply a full pipeline from a YAML config
 uv run ocrscout apply pipeline.yaml
 ```
+
+## Inspecting results
+
+Two ways to look at a previous run's `output_dir/results.parquet`:
+
+| Command | When to use |
+| --- | --- |
+| `ocrscout inspect <out>` | Terminal — Rich summary table, `--page <id>` per-model markdown dump, `--diff a,b --html` one-shot side-by-side diff page. Zero extra deps; works over SSH. |
+| `ocrscout viewer <out>` | Browser — long-lived Gradio app: page picker, adaptive model picker (radio for Single, checkbox for Side-by-side, paired dropdowns for Diff), source page with color-coded bbox overlay + deduplicated legend, color-matched section blocks in the text pane for layout-aware models. Pulls in `gradio` + `polars` from the `viewer` extra. |
 
 See [CLAUDE.md](CLAUDE.md) for the implementation roadmap, design decisions, and contributor guide.
 

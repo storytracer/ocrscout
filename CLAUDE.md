@@ -124,6 +124,25 @@ All status output flows through Python's stdlib `logging` module under the `ocrs
 
 **Subprocess output.** `VllmBackend` runner mode streams the vllm child's stdout to the parent terminal at INFO level (via `log.isEnabledFor` — the firehose is suppressed at `-q`). The `managed.py` lifecycle writes each child's output to a per-model log file under `/tmp/ocrscout-managed-<uuid>/` regardless of verbosity, so post-mortem debugging always has the full picture.
 
+## Inspecting results
+
+Two read-only post-mortem tools share the same input — a previous run's `output_dir/results.parquet` (plus the optional `text/<page>.<model>.md` sidecars):
+
+| Command | Where | Deps | Use case |
+| --- | --- | --- | --- |
+| `ocrscout inspect <out>` | terminal | core only | Rich summary table; `--page <id>` per-model markdown dump; `--diff a,b --html` serves a one-shot side-by-side diff over the LAN. Right tool for SSH, CI logs, and quick pokes. |
+| `ocrscout viewer <out>` | browser | `[viewer]` extra (`gradio`, `polars`) | Long-lived Gradio app. Adapts to the comparison shape: page picker, mode-aware model picker (radio for Single, checkbox for Side-by-side, paired Model A / Model B dropdowns for Diff), source page with color-coded bbox overlay + deduplicated category legend, and matching color-coded section blocks in the text pane for layout-aware models. State (page / models / mode) persists via `gr.BrowserState` and can be supplied via URL query params for shareable views. |
+
+The two share a code path for diff rendering: [src/ocrscout/viewer/diff.py](src/ocrscout/viewer/diff.py) holds `compute_diff`, `render_diff_page` (the standalone HTML page served by `inspect --html`), and `render_diff_table_fragment` (the same opcode-aligned table embedded inside the viewer's Diff mode). Updating the diff styling in one place updates both surfaces.
+
+The viewer code lives under [src/ocrscout/viewer/](src/ocrscout/viewer/):
+
+- `store.py` — `ViewerStore`: loads the parquet via Polars, walks each `DoclingDocument` in body order via `iterate_items()` (so picture/table items stay interleaved with their surrounding text), exposes `pages()` / `get(page_id, model)` / `image_for(page_id)` / `annotated_for(page_id, model)`. Source images are resolved from the row's `source_uri` and LRU-cached.
+- `app.py` — `build_app(output_dir) -> gr.Blocks`. Three control groups in the top bar (Page navigation / View mode / Layout source / Actions); a sticky image column with custom legend; a text pane re-rendered via `@gr.render` based on view mode and selected models.
+- `static/viewer.css` and `static/viewer.js` — shipped via `force-include` in `pyproject.toml`. CSS handles the section-block coloring, sticky positioning, and control-group framing; JS provides keyboard shortcuts (j/k for prev/next page, 1/2/3 for view modes, i for image toggle), synchronized scroll across markdown panes, and URL ↔ state sync.
+
+When changing the viewer: do not write code that auto-hides the image pane on view-mode change — the image stays visible across all modes (Single / Side-by-side / Diff), and only the user's manual Toggle image button hides it.
+
 ## Tests are paused
 
 The project is in rapid-prototyping mode. The previous test suite was deleted (recoverable from git history if needed) and `pytest` is removed from the `dev` extras. Do not write new tests or run pytest until the user explicitly re-enables them.
