@@ -202,8 +202,8 @@
   text-align: right;
   padding-right: 0.4rem;
 }
-.ocrscout-diff-pane th.side .lab.pred { color: #cf222e; }
-.ocrscout-diff-pane th.side .lab.base { color: #1a7f37; }
+.ocrscout-diff-pane th.side .lab.base { color: #cf222e; }
+.ocrscout-diff-pane th.side .lab.pred { color: #1a7f37; }
 .ocrscout-diff-pane th.side .lab-sep {
   padding: 0 0.5rem;
   color: var(--body-text-color-subdued, #8c959f);

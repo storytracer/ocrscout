@@ -11,15 +11,17 @@ Produces a ``TextComparisonResult`` carrying:
 * ``pred_lines`` / ``base_lines`` / ``line_opcodes`` — the line-level diff,
   consumed by the VSCode-style renderer (split + unified). ``line_opcodes``
   is a list of ``(tag, i1, i2, j1, j2)`` tuples where indices reference
-  ``pred_lines`` (i) and ``base_lines`` (j).
+  ``base_lines`` (i) and ``pred_lines`` (j).
 * ``inline_word_opcodes`` — for each ``replace`` line opcode, the per-line
   word-level diff used to highlight the actual changed words inside a
-  modified line. Keyed by pred-line index (str — JSON dict keys must be
+  modified line. Keyed by base-line index (str — JSON dict keys must be
   strings). Each value is a list of ``(tag, i1, i2, j1, j2)`` over the
-  *line's* tokens.
+  *line's* tokens (i indexes baseline, j indexes prediction).
 
-Diff direction: ``prediction`` is the left/A side, ``baseline`` is the
-right/B side.
+Diff direction: ``baseline`` is the left/A side (the "from" / incumbent),
+``prediction`` is the right/B side (the "to" / candidate). ``"delete"``
+opcodes describe content removed from baseline; ``"insert"`` opcodes
+describe content added in prediction.
 """
 
 from __future__ import annotations
@@ -68,16 +70,23 @@ class TextComparison(Comparison):
     def compare(
         self, prediction: PredictionView, baseline: BaselineView
     ) -> TextComparisonResult | None:
-        a = (prediction.text or "").strip()
-        b = (baseline.text or "").strip()
-        if not a or not b:
+        # Treat baseline as the "from" / A side and prediction as the "to" /
+        # B side so difflib's tags read naturally: "delete" = removed from
+        # baseline, "insert" = added in prediction. Schema fields keep their
+        # semantics (pred_* holds prediction content, base_* holds baseline)
+        # but in the resulting opcodes, i indexes base_*, j indexes pred_*.
+        base_text = (baseline.text or "").strip()
+        pred_text = (prediction.text or "").strip()
+        if not base_text or not pred_text:
             return None
 
         # Word-level diff (legacy payload). Used by the terminal renderer
         # and as a small-diff fallback.
-        toks_a = tokenize(a)
-        toks_b = tokenize(b)
-        word_matcher = difflib.SequenceMatcher(None, toks_a, toks_b, autojunk=False)
+        base_tokens = tokenize(base_text)
+        pred_tokens = tokenize(pred_text)
+        word_matcher = difflib.SequenceMatcher(
+            None, base_tokens, pred_tokens, autojunk=False
+        )
         opcodes: list[tuple[str, int, int, int, int]] = [
             (str(tag), i1, i2, j1, j2)
             for tag, i1, i2, j1, j2 in word_matcher.get_opcodes()
@@ -96,10 +105,10 @@ class TextComparison(Comparison):
         # level deeper and run a per-line word diff (greedy 1:1 pairing,
         # overflow is flushed as solo delete/insert lines so the line-pair
         # word diff stays cheap).
-        pred_lines = a.split("\n")
-        base_lines = b.split("\n")
+        base_lines = base_text.split("\n")
+        pred_lines = pred_text.split("\n")
         line_matcher = difflib.SequenceMatcher(
-            None, pred_lines, base_lines, autojunk=False
+            None, base_lines, pred_lines, autojunk=False
         )
         line_opcodes: list[tuple[str, int, int, int, int]] = [
             (str(tag), i1, i2, j1, j2)
@@ -113,16 +122,16 @@ class TextComparison(Comparison):
                 continue
             pairs = min(i2 - i1, j2 - j1)
             for k in range(pairs):
-                pred_idx = i1 + k
-                base_idx = j1 + k
-                pred_toks = tokenize(pred_lines[pred_idx])
+                base_idx = i1 + k
+                pred_idx = j1 + k
                 base_toks = tokenize(base_lines[base_idx])
-                if not pred_toks and not base_toks:
+                pred_toks = tokenize(pred_lines[pred_idx])
+                if not base_toks and not pred_toks:
                     continue
                 m = difflib.SequenceMatcher(
-                    None, pred_toks, base_toks, autojunk=False
+                    None, base_toks, pred_toks, autojunk=False
                 )
-                inline_word_opcodes[str(pred_idx)] = [
+                inline_word_opcodes[str(base_idx)] = [
                     (str(t), ii1, ii2, jj1, jj2)
                     for t, ii1, ii2, jj1, jj2 in m.get_opcodes()
                 ]
@@ -141,8 +150,8 @@ class TextComparison(Comparison):
         result = TextComparisonResult(
             similarity=similarity,
             opcodes=opcodes,
-            pred_tokens=toks_a,
-            base_tokens=toks_b,
+            pred_tokens=pred_tokens,
+            base_tokens=base_tokens,
             common=common,
             removed=removed,
             added=added,
@@ -156,12 +165,14 @@ class TextComparison(Comparison):
             summary={"similarity": similarity},
         )
         # CER/WER from jiwer when [eval] is installed. Lazy-imported so the
-        # core install stays cheap.
+        # core install stays cheap. jiwer.cer(reference, hypothesis) — pass
+        # baseline first so CER reads as "error rate of prediction vs
+        # baseline reference."
         try:
             import jiwer
 
-            cer = float(jiwer.cer(b, a))
-            wer = float(jiwer.wer(b, a))
+            cer = float(jiwer.cer(base_text, pred_text))
+            wer = float(jiwer.wer(base_text, pred_text))
         except ImportError:
             return result
         result.cer = cer

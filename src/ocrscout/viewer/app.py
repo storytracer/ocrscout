@@ -259,13 +259,24 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 )
             if mode == "Compare":
                 seeded = current[:2]
-                second_choices = (
-                    [REFERENCE_PSEUDO_MODEL] if store.has_any_baseline() else []
-                ) + [m for m in store.all_models if m not in seeded]
                 if len(seeded) < 1 and store.all_models:
                     seeded.append(store.all_models[0])
-                if len(seeded) < 2 and second_choices:
-                    seeded.append(second_choices[0])
+                # Default the baseline (slot 1) to the reference whenever one
+                # is available — typical workflow is "compare prediction
+                # against reference." A user who picks a different baseline
+                # via the dropdown keeps that selection until they next
+                # toggle view mode.
+                if store.has_any_baseline():
+                    if len(seeded) < 2:
+                        seeded.append(REFERENCE_PSEUDO_MODEL)
+                    else:
+                        seeded[1] = REFERENCE_PSEUDO_MODEL
+                elif len(seeded) < 2:
+                    fallback = next(
+                        (m for m in store.all_models if m not in seeded), None
+                    )
+                    if fallback:
+                        seeded.append(fallback)
                 return seeded[:2]
             # Side-by-side: default to ALL models if nothing is selected.
             return current or list(store.all_models)
@@ -318,11 +329,23 @@ def build_app(output_dir: Path) -> gr.Blocks:
             if models_raw:
                 requested = [m.strip() for m in models_raw.split(",") if m.strip()]
                 models = [m for m in requested if m in store.all_models]
+                explicit_models = True
             else:
                 models = (state or {}).get("models") or initial_models
+                explicit_models = False
             models = [m for m in models if m in store.all_models]
             if not models and store.all_models:
                 models = list(store.all_models)
+            # Compare mode: default the baseline (slot 1) to the reference
+            # when one is available, unless the URL pinned an explicit set.
+            if (
+                mode == "Compare"
+                and not explicit_models
+                and store.has_any_baseline()
+                and store.all_models
+            ):
+                pred = models[0] if models else store.all_models[0]
+                models = [pred, REFERENCE_PSEUDO_MODEL]
             layout_models = store.layout_models_for(requested_id)
             layout_choice = layout_models[0] if layout_models else None
             img, anns = (
@@ -510,18 +533,21 @@ def _draw_model_picker(
             )
         a_val = seeded[0] if len(seeded) > 0 else None
         b_val = seeded[1] if len(seeded) > 1 else None
+        # Baseline left, prediction right — matches the diff renderer's
+        # column orientation (baseline = removed/red on the left,
+        # prediction = added/green on the right).
         with gr.Row(equal_height=True):
-            dd_a = gr.Dropdown(
-                choices=a_choices,
-                value=a_val,
-                label="Prediction",
-                interactive=True,
-                elem_classes=["ocrscout-model-picker"],
-            )
             dd_b = gr.Dropdown(
                 choices=b_choices,
                 value=b_val,
                 label="Baseline",
+                interactive=True,
+                elem_classes=["ocrscout-model-picker"],
+            )
+            dd_a = gr.Dropdown(
+                choices=a_choices,
+                value=a_val,
+                label="Prediction",
                 interactive=True,
                 elem_classes=["ocrscout-model-picker"],
             )

@@ -78,8 +78,8 @@ class TextComparisonRenderer(ComparisonRenderer):
 
         console.print(
             f"\n[bold cyan]=== diff[/bold cyan]   "
-            f"[red]── {prediction_label}[/red]   "
-            f"[green]── {baseline_label}[/green]"
+            f"[red]── {baseline_label}[/red]   "
+            f"[green]── {prediction_label}[/green]"
         )
         line_summary = (
             f"+{result.lines_added} −{result.lines_removed} "
@@ -112,65 +112,65 @@ class TextComparisonRenderer(ComparisonRenderer):
 def _render_terminal_unified(result: TextComparisonResult) -> Text:
     """Unified line diff with `+`/`−` prefixes, VSCode-style tints."""
     out = Text()
-    pred = result.pred_lines
     base = result.base_lines
+    pred = result.pred_lines
     for tag, i1, i2, j1, j2 in result.line_opcodes:
         if tag == "equal":
             for k in range(i1, i2):
-                out.append("  " + pred[k] + "\n", style="dim")
+                out.append("  " + base[k] + "\n", style="dim")
         elif tag == "delete":
             for k in range(i1, i2):
-                out.append("- " + pred[k] + "\n", style="red")
+                out.append("- " + base[k] + "\n", style="red")
         elif tag == "insert":
             for k in range(j1, j2):
-                out.append("+ " + base[k] + "\n", style="green")
+                out.append("+ " + pred[k] + "\n", style="green")
         elif tag == "replace":
             pairs = min(i2 - i1, j2 - j1)
             for k in range(pairs):
                 inline = result.inline_word_opcodes.get(str(i1 + k))
                 if inline:
                     _emit_replace_pair_terminal(
-                        out, pred[i1 + k], base[j1 + k], inline,
+                        out, base[i1 + k], pred[j1 + k], inline,
                     )
                 else:
-                    out.append("- " + pred[i1 + k] + "\n", style="red")
-                    out.append("+ " + base[j1 + k] + "\n", style="green")
+                    out.append("- " + base[i1 + k] + "\n", style="red")
+                    out.append("+ " + pred[j1 + k] + "\n", style="green")
             for k in range(pairs, i2 - i1):
-                out.append("- " + pred[i1 + k] + "\n", style="red")
+                out.append("- " + base[i1 + k] + "\n", style="red")
             for k in range(pairs, j2 - j1):
-                out.append("+ " + base[j1 + k] + "\n", style="green")
+                out.append("+ " + pred[j1 + k] + "\n", style="green")
     return out
 
 
 def _emit_replace_pair_terminal(
     out: Text,
-    pred_line: str,
     base_line: str,
+    pred_line: str,
     inline_opcodes: list[tuple[str, int, int, int, int]],
 ) -> None:
     """Render a `replace` line pair with word-level highlighting."""
     from ocrscout.viewer.diff import tokenize
 
-    pred_toks = tokenize(pred_line)
     base_toks = tokenize(base_line)
+    pred_toks = tokenize(pred_line)
 
     out.append("- ", style="red")
     for tag, i1, i2, _j1, _j2 in inline_opcodes:
         if tag == "equal":
-            for tok in pred_toks[i1:i2]:
+            for tok in base_toks[i1:i2]:
                 _emit_token(out, tok, style="red")
         elif tag in ("delete", "replace"):
-            for tok in pred_toks[i1:i2]:
+            for tok in base_toks[i1:i2]:
                 _emit_token(out, tok, style="red bold underline")
     out.append("\n")
 
     out.append("+ ", style="green")
     for tag, _i1, _i2, j1, j2 in inline_opcodes:
         if tag == "equal":
-            for tok in base_toks[j1:j2]:
+            for tok in pred_toks[j1:j2]:
                 _emit_token(out, tok, style="green")
         elif tag in ("insert", "replace"):
-            for tok in base_toks[j1:j2]:
+            for tok in pred_toks[j1:j2]:
                 _emit_token(out, tok, style="green bold underline")
     out.append("\n")
 
@@ -180,18 +180,18 @@ def _render_terminal_word_level(result: TextComparisonResult) -> Text:
     rendered = Text()
     for tag, i1, i2, j1, j2 in result.opcodes:
         if tag == "equal":
-            for tok in result.pred_tokens[i1:i2]:
+            for tok in result.base_tokens[i1:i2]:
                 _emit_token(rendered, tok, style="")
         elif tag == "delete":
-            for tok in result.pred_tokens[i1:i2]:
+            for tok in result.base_tokens[i1:i2]:
                 _emit_token(rendered, tok, style="red strike")
         elif tag == "insert":
-            for tok in result.base_tokens[j1:j2]:
+            for tok in result.pred_tokens[j1:j2]:
                 _emit_token(rendered, tok, style="green")
         elif tag == "replace":
-            for tok in result.pred_tokens[i1:i2]:
+            for tok in result.base_tokens[i1:i2]:
                 _emit_token(rendered, tok, style="red strike")
-            for tok in result.base_tokens[j1:j2]:
+            for tok in result.pred_tokens[j1:j2]:
                 _emit_token(rendered, tok, style="green")
     return rendered
 
@@ -226,9 +226,9 @@ def _render_diff_html(
         '<table class="ocrscout-diff-split">'
         f"<thead><tr>"
         f'<th class="ln"></th>'
-        f'<th class="side pred">{escape(prediction_label)}</th>'
-        f'<th class="ln"></th>'
         f'<th class="side base">{escape(baseline_label)}</th>'
+        f'<th class="ln"></th>'
+        f'<th class="side pred">{escape(prediction_label)}</th>'
         f"</tr></thead>"
         f"<tbody>{''.join(split_rows)}</tbody>"
         "</table>"
@@ -239,9 +239,9 @@ def _render_diff_html(
         f'<th class="ln"></th>'
         f'<th class="ln"></th>'
         f'<th class="side">'
-        f'<span class="lab pred">{escape(prediction_label)}</span>'
-        f'<span class="lab-sep">↔</span>'
         f'<span class="lab base">{escape(baseline_label)}</span>'
+        f'<span class="lab-sep">↔</span>'
+        f'<span class="lab pred">{escape(prediction_label)}</span>'
         "</th>"
         "</tr></thead>"
         f"<tbody>{''.join(unified_rows)}</tbody>"
@@ -290,8 +290,8 @@ def _render_header(
         f'<span class="stat dim">{result.lines_unchanged} unchanged</span>'
         f"{cer_html}{wer_html}"
         '<span class="diff-legend">'
-        f'<span class="legend-chip pred">■ {escape(prediction_label)}</span>'
         f'<span class="legend-chip base">■ {escape(baseline_label)}</span>'
+        f'<span class="legend-chip pred">■ {escape(prediction_label)}</span>'
         f'<span class="legend-chip word-key">▪ word diff</span>'
         "</span>"
         "</div>"
@@ -315,50 +315,53 @@ def _build_rows(
 
     Equal-line runs share a CSS class so the "changes only" toggle can
     collapse them via a single attribute switch on the parent.
+
+    Index convention: i indexes ``base_lines`` (left, removed/red),
+    j indexes ``pred_lines`` (right, added/green).
     """
-    pred = result.pred_lines
     base = result.base_lines
+    pred = result.pred_lines
     inline = result.inline_word_opcodes
 
     split_rows: list[str] = []
     unified_rows: list[str] = []
     minimap_rows: list[str] = []
 
-    pred_n = 1
     base_n = 1
+    pred_n = 1
     for tag, i1, i2, j1, j2 in result.line_opcodes:
         if tag == "equal":
             for k in range(i2 - i1):
-                line = pred[i1 + k]
-                pn = pred_n + k
+                line = base[i1 + k]
                 bn = base_n + k
+                pn = pred_n + k
                 escaped = _escape_line(line)
                 split_rows.append(
                     f'<tr class="row equal">'
-                    f'<td class="ln">{pn}</td>'
-                    f'<td class="line equal">{escaped}</td>'
                     f'<td class="ln">{bn}</td>'
+                    f'<td class="line equal">{escaped}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line equal">{escaped}</td>'
                     f"</tr>"
                 )
                 unified_rows.append(
                     f'<tr class="row equal">'
-                    f'<td class="ln">{pn}</td>'
                     f'<td class="ln">{bn}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line equal"><span class="marker"> </span>{escaped}</td>'
                     f"</tr>"
                 )
                 minimap_rows.append('<span class="mm equal"></span>')
-            pred_n += i2 - i1
-            base_n += j2 - j1
+            base_n += i2 - i1
+            pred_n += j2 - j1
         elif tag == "delete":
             for k in range(i2 - i1):
-                line = pred[i1 + k]
-                pn = pred_n + k
+                line = base[i1 + k]
+                bn = base_n + k
                 escaped = _escape_line(line)
                 split_rows.append(
                     f'<tr class="row delete">'
-                    f'<td class="ln">{pn}</td>'
+                    f'<td class="ln">{bn}</td>'
                     f'<td class="line delete">{escaped}</td>'
                     f'<td class="ln"></td>'
                     f'<td class="line empty"></td>'
@@ -366,60 +369,60 @@ def _build_rows(
                 )
                 unified_rows.append(
                     f'<tr class="row delete">'
-                    f'<td class="ln">{pn}</td>'
+                    f'<td class="ln">{bn}</td>'
                     f'<td class="ln"></td>'
                     f'<td class="line delete"><span class="marker">−</span>{escaped}</td>'
                     f"</tr>"
                 )
                 minimap_rows.append('<span class="mm delete"></span>')
-            pred_n += i2 - i1
+            base_n += i2 - i1
         elif tag == "insert":
             for k in range(j2 - j1):
-                line = base[j1 + k]
-                bn = base_n + k
+                line = pred[j1 + k]
+                pn = pred_n + k
                 escaped = _escape_line(line)
                 split_rows.append(
                     f'<tr class="row insert">'
                     f'<td class="ln"></td>'
                     f'<td class="line empty"></td>'
-                    f'<td class="ln">{bn}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line insert">{escaped}</td>'
                     f"</tr>"
                 )
                 unified_rows.append(
                     f'<tr class="row insert">'
                     f'<td class="ln"></td>'
-                    f'<td class="ln">{bn}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line insert"><span class="marker">+</span>{escaped}</td>'
                     f"</tr>"
                 )
                 minimap_rows.append('<span class="mm insert"></span>')
-            base_n += j2 - j1
+            pred_n += j2 - j1
         elif tag == "replace":
             pairs = min(i2 - i1, j2 - j1)
             # Paired modified lines: word-level highlights on both sides.
             for k in range(pairs):
-                pred_idx = i1 + k
-                base_idx = j1 + k
-                pn = pred_n + k
+                base_idx = i1 + k
+                pred_idx = j1 + k
                 bn = base_n + k
-                pred_line = pred[pred_idx]
+                pn = pred_n + k
                 base_line = base[base_idx]
-                opcodes = inline.get(str(pred_idx), [])
+                pred_line = pred[pred_idx]
+                opcodes = inline.get(str(base_idx), [])
                 left_html, right_html = _render_word_pair_html(
-                    pred_line, base_line, opcodes,
+                    base_line, pred_line, opcodes,
                 )
                 split_rows.append(
                     f'<tr class="row replace">'
-                    f'<td class="ln">{pn}</td>'
-                    f'<td class="line delete">{left_html}</td>'
                     f'<td class="ln">{bn}</td>'
+                    f'<td class="line delete">{left_html}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line insert">{right_html}</td>'
                     f"</tr>"
                 )
                 unified_rows.append(
                     f'<tr class="row delete">'
-                    f'<td class="ln">{pn}</td>'
+                    f'<td class="ln">{bn}</td>'
                     f'<td class="ln"></td>'
                     f'<td class="line delete"><span class="marker">−</span>{left_html}</td>'
                     f"</tr>"
@@ -427,19 +430,19 @@ def _build_rows(
                 unified_rows.append(
                     f'<tr class="row insert">'
                     f'<td class="ln"></td>'
-                    f'<td class="ln">{bn}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line insert"><span class="marker">+</span>{right_html}</td>'
                     f"</tr>"
                 )
                 minimap_rows.append('<span class="mm replace"></span>')
             # Overflow (uneven pair) flushed as solo delete/insert lines.
             for k in range(pairs, i2 - i1):
-                pred_idx = i1 + k
-                pn = pred_n + k
-                escaped = _escape_line(pred[pred_idx])
+                base_idx = i1 + k
+                bn = base_n + k
+                escaped = _escape_line(base[base_idx])
                 split_rows.append(
                     f'<tr class="row delete">'
-                    f'<td class="ln">{pn}</td>'
+                    f'<td class="ln">{bn}</td>'
                     f'<td class="line delete">{escaped}</td>'
                     f'<td class="ln"></td>'
                     f'<td class="line empty"></td>'
@@ -447,58 +450,62 @@ def _build_rows(
                 )
                 unified_rows.append(
                     f'<tr class="row delete">'
-                    f'<td class="ln">{pn}</td>'
+                    f'<td class="ln">{bn}</td>'
                     f'<td class="ln"></td>'
                     f'<td class="line delete"><span class="marker">−</span>{escaped}</td>'
                     f"</tr>"
                 )
                 minimap_rows.append('<span class="mm delete"></span>')
             for k in range(pairs, j2 - j1):
-                base_idx = j1 + k
-                bn = base_n + k
-                escaped = _escape_line(base[base_idx])
+                pred_idx = j1 + k
+                pn = pred_n + k
+                escaped = _escape_line(pred[pred_idx])
                 split_rows.append(
                     f'<tr class="row insert">'
                     f'<td class="ln"></td>'
                     f'<td class="line empty"></td>'
-                    f'<td class="ln">{bn}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line insert">{escaped}</td>'
                     f"</tr>"
                 )
                 unified_rows.append(
                     f'<tr class="row insert">'
                     f'<td class="ln"></td>'
-                    f'<td class="ln">{bn}</td>'
+                    f'<td class="ln">{pn}</td>'
                     f'<td class="line insert"><span class="marker">+</span>{escaped}</td>'
                     f"</tr>"
                 )
                 minimap_rows.append('<span class="mm insert"></span>')
-            pred_n += i2 - i1
-            base_n += j2 - j1
+            base_n += i2 - i1
+            pred_n += j2 - j1
 
     return split_rows, unified_rows, minimap_rows
 
 
 def _render_word_pair_html(
-    pred_line: str,
     base_line: str,
+    pred_line: str,
     inline_opcodes: list[tuple[str, int, int, int, int]],
 ) -> tuple[str, str]:
     """Render the left/right HTML for a `replace` line pair with word-level
-    highlighting. Falls back to the whole line tinted when no opcodes."""
+    highlighting. Falls back to the whole line tinted when no opcodes.
+
+    Index convention: ``i`` indexes baseline tokens (left), ``j`` indexes
+    prediction tokens (right).
+    """
     from ocrscout.viewer.diff import tokenize
 
-    pred_toks = tokenize(pred_line)
     base_toks = tokenize(base_line)
+    pred_toks = tokenize(pred_line)
 
     if not inline_opcodes:
-        return _escape_line(pred_line), _escape_line(base_line)
+        return _escape_line(base_line), _escape_line(pred_line)
 
     left_parts: list[str] = []
     right_parts: list[str] = []
     for tag, i1, i2, j1, j2 in inline_opcodes:
-        left_segment = " ".join(pred_toks[i1:i2])
-        right_segment = " ".join(base_toks[j1:j2])
+        left_segment = " ".join(base_toks[i1:i2])
+        right_segment = " ".join(pred_toks[j1:j2])
         if tag == "equal":
             left_parts.append(escape(left_segment))
             right_parts.append(escape(right_segment))
@@ -547,8 +554,8 @@ def _render_word_only_html(
     """
     rows: list[str] = []
     for tag, i1, i2, j1, j2 in result.opcodes:
-        left = _tokens_to_html(result.pred_tokens[i1:i2])
-        right = _tokens_to_html(result.base_tokens[j1:j2])
+        left = _tokens_to_html(result.base_tokens[i1:i2])
+        right = _tokens_to_html(result.pred_tokens[j1:j2])
         if tag == "equal":
             rows.append(
                 f'<tr class="row equal"><td class="line">{left}</td>'
@@ -577,8 +584,8 @@ def _render_word_only_html(
         '<div class="ocrscout-diff-pane">'
         '<table class="ocrscout-diff-split">'
         "<thead><tr>"
-        f'<th class="side pred">{escape(prediction_label)}</th>'
         f'<th class="side base">{escape(baseline_label)}</th>'
+        f'<th class="side pred">{escape(prediction_label)}</th>'
         "</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table></div></div></div>"
     )
@@ -666,8 +673,8 @@ body {
   font-size: 0.75rem;
 }
 .legend-chip { font-weight: 600; }
-.legend-chip.pred { color: #cf222e; }
-.legend-chip.base { color: #1a7f37; }
+.legend-chip.base { color: #cf222e; }
+.legend-chip.pred { color: #1a7f37; }
 .legend-chip.word-key { color: #59636e; font-weight: 400; font-style: italic; }
 .diff-controls { display: flex; align-items: center; gap: 0.75rem; }
 .diff-mode { display: inline-flex; border: 1px solid #d0d7de; border-radius: 6px; overflow: hidden; }
@@ -711,11 +718,11 @@ body {
   color: #59636e;
 }
 .ocrscout-diff-pane th.ln { width: 3rem; text-align: right; padding-right: 0.5rem; color: #8c959f; }
-.ocrscout-diff-pane th.side.pred { color: #cf222e; }
-.ocrscout-diff-pane th.side.base { color: #1a7f37; }
+.ocrscout-diff-pane th.side.base { color: #cf222e; }
+.ocrscout-diff-pane th.side.pred { color: #1a7f37; }
 .ocrscout-diff-pane th.side .lab { font-weight: 600; }
-.ocrscout-diff-pane th.side .lab.pred { color: #cf222e; }
-.ocrscout-diff-pane th.side .lab.base { color: #1a7f37; }
+.ocrscout-diff-pane th.side .lab.base { color: #cf222e; }
+.ocrscout-diff-pane th.side .lab.pred { color: #1a7f37; }
 .ocrscout-diff-pane th.side .lab-sep { color: #8c959f; padding: 0 0.5rem; font-weight: 400; }
 .ocrscout-diff-pane td.ln {
   width: 3rem;
