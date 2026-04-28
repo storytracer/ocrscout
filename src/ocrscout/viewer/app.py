@@ -1,28 +1,16 @@
 """Gradio Blocks app for ocrscout's interactive inspector.
 
-Layout — three independently-collapsible zones:
-
-    ┌─ Sidebar ─────┬─ Image pane ──────────┬─ Text pane ──────────────┐
-    │ File list +   │ AnnotatedImage with   │ Dynamic columns rendered │
-    │ search +      │ bbox overlay (the     │ via @gr.render — count   │
-    │ filter chips  │ first selected model  │ matches selected models. │
-    │ + sort        │ supplies layout)      │ Mode determines content. │
-    └───────────────┴───────────────────────┴──────────────────────────┘
-
-The sidebar lists every page in the run (one row per file_id) with
-search/filter/sort. Volume-grouped sections appear when the source is
-volume-aware (BHL etc.); flat sources just get a plain list. Each row
-shows file_id plus indicators for errors, references, and disagreement.
-
-The text pane has three modes (Single / Side-by-side / Compare) and the
-image pane stays visible across all of them. State (page, models, mode,
-sort, filters) persists in BrowserState; URL query params override on
+Top bar carries page navigation (Prev / typeable Dropdown / Next), view
+mode, layout-source picker, and the image-toggle action. Below that, a
+volume header (when the source has volume metadata) and a two-column
+body: image pane and text panes. The text pane has three modes (Single
+/ Side-by-side / Compare) and the image pane stays visible across all
+of them. State persists in BrowserState; URL query params override on
 first load.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from html import escape
 from pathlib import Path
@@ -37,7 +25,6 @@ from ocrscout.viewer.store import BaselineRow, ModelRow, PageRow, ViewerStore
 log = logging.getLogger(__name__)
 
 VIEW_MODES = ["Single", "Side-by-side", "Compare"]
-SORT_CHOICES = ["file_id", "disagreement", "errors", "chars"]
 # Pseudo-model token for the page's reference baseline.
 REFERENCE_PSEUDO_MODEL = "reference"
 STATIC_DIR = Path(__file__).parent / "static"
@@ -76,8 +63,6 @@ def build_app(output_dir: Path) -> gr.Blocks:
     initial_layout_models = store.layout_models_for(initial_file)
     initial_layout_choice = initial_layout_models[0] if initial_layout_models else None
 
-    sidebar_payload = _serialize_sidebar(store)
-
     with gr.Blocks(
         title="ocrscout viewer",
         elem_classes="ocrscout-viewer",
@@ -91,21 +76,30 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 "models": initial_models,
                 "mode": "Single",
                 "show_image": True,
-                "sidebar_collapsed": False,
-                "sort": "file_id",
-                "filter_has_error": False,
-                "filter_has_reference": False,
-                "filter_disagreement_min": 0.0,
             }
         )
         current_file = gr.State(initial_file)
 
-        # ----- Top bar: view mode + layout source + actions -----
+        # ----- Top bar: page nav + view mode + layout source + actions -----
         with gr.Row(equal_height=True):
-            with gr.Column(scale=0, min_width=80):
-                prev_btn = gr.Button("‹ Prev", size="sm")
-            with gr.Column(scale=0, min_width=80):
-                next_btn = gr.Button("Next ›", size="sm")
+            with gr.Column(scale=5, elem_classes=["ocrscout-control-group"]):
+                gr.HTML('<div class="ocrscout-group-label">Page</div>')
+                with gr.Row(equal_height=True):
+                    with gr.Column(scale=0, min_width=80):
+                        prev_btn = gr.Button("‹ Prev", size="sm")
+                    with gr.Column(scale=4):
+                        page_dd = gr.Dropdown(
+                            choices=file_choices,
+                            value=initial_file,
+                            label=None,
+                            show_label=False,
+                            container=False,
+                            interactive=True,
+                            allow_custom_value=False,
+                            filterable=True,
+                        )
+                    with gr.Column(scale=0, min_width=80):
+                        next_btn = gr.Button("Next ›", size="sm")
             with gr.Column(scale=4, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">View mode</div>')
                 view_mode = gr.Radio(
@@ -128,70 +122,16 @@ def build_app(output_dir: Path) -> gr.Blocks:
             with gr.Column(scale=2, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">Actions</div>')
                 with gr.Row(equal_height=True):
-                    sidebar_toggle = gr.Button("Toggle list", size="sm")
                     image_toggle = gr.Button("Toggle image", size="sm")
                     help_btn = gr.Button("Help", size="sm")
 
         # ----- Volume / page header -----
         page_summary = gr.HTML(_render_page_summary(store, initial_file))
 
-        # ----- Three-column body: sidebar | image | text panes -----
+        # ----- Two-column body: image | text panes -----
         with gr.Row(equal_height=False):
-
-            # --- Sidebar: searchable, sortable, filterable file list ---
             with gr.Column(
                 scale=2,
-                min_width=240,
-                visible=True,
-                elem_id="ocrscout-sidebar-col",
-                elem_classes=["ocrscout-sidebar-col"],
-            ) as sidebar_col:
-                with gr.Row(equal_height=True):
-                    sort_dd = gr.Dropdown(
-                        choices=SORT_CHOICES,
-                        value="file_id",
-                        label="Sort",
-                        interactive=True,
-                        scale=2,
-                    )
-                with gr.Row(equal_height=True):
-                    filter_err = gr.Checkbox(
-                        label="errors",
-                        value=False,
-                        scale=1,
-                    )
-                    filter_ref = gr.Checkbox(
-                        label="reference",
-                        value=False,
-                        scale=1,
-                    )
-                disagreement_slider = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
-                    step=0.05,
-                    value=0.0,
-                    label="min disagreement",
-                )
-                # Hidden selection round-trip — the sidebar list is a
-                # plain HTML widget; clicking a row writes the file_id
-                # into this Textbox via JS, whose .change is wired to
-                # _on_file_change on the Python side.
-                sidebar_selected = gr.Textbox(
-                    value="",
-                    visible=False,
-                    elem_id="ocrscout-sidebar-selected",
-                    interactive=True,
-                )
-                # The visible list — populated client-side from
-                # sidebar_payload_state via JS render.
-                sidebar_html = gr.HTML(
-                    _initial_sidebar_html(sidebar_payload, initial_file),
-                    elem_id="ocrscout-sidebar-list",
-                    elem_classes=["ocrscout-sidebar-list"],
-                )
-
-            with gr.Column(
-                scale=3,
                 visible=True,
                 elem_id="ocrscout-image-col",
                 elem_classes=["ocrscout-image-col"],
@@ -207,7 +147,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     _render_legend([], store),
                     elem_classes=["ocrscout-legend"],
                 )
-            with gr.Column(scale=6):
+            with gr.Column(scale=5):
                 models_state = gr.State(initial_models)
 
                 @gr.render(
@@ -246,9 +186,9 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 gr.update(choices=layout_models or [""], value=layout_choice),
             )
 
-        sidebar_selected.change(
+        page_dd.change(
             _on_file_change,
-            inputs=[sidebar_selected],
+            inputs=[page_dd],
             outputs=[current_file, page_summary, layout_model_dd],
         )
 
@@ -263,21 +203,21 @@ def build_app(output_dir: Path) -> gr.Blocks:
             layout_models = store.layout_models_for(new_file)
             layout_choice = layout_models[0] if layout_models else None
             return (
+                gr.update(value=new_file, choices=ids),
                 new_file,
                 _render_page_summary(store, new_file),
                 gr.update(choices=layout_models or [""], value=layout_choice),
-                new_file,  # write back into hidden sidebar_selected for state
             )
 
         prev_btn.click(
             lambda p: _step(-1, p),
             inputs=[current_file],
-            outputs=[current_file, page_summary, layout_model_dd, sidebar_selected],
+            outputs=[page_dd, current_file, page_summary, layout_model_dd],
         )
         next_btn.click(
             lambda p: _step(+1, p),
             inputs=[current_file],
-            outputs=[current_file, page_summary, layout_model_dd, sidebar_selected],
+            outputs=[page_dd, current_file, page_summary, layout_model_dd],
         )
 
         def _on_layout_change(file_id: str, model: str | None):
@@ -311,17 +251,6 @@ def build_app(output_dir: Path) -> gr.Blocks:
             outputs=[image_col, image_visible_state],
         )
 
-        sidebar_visible_state = gr.State(True)
-
-        def _toggle_sidebar(visible_state: bool):
-            return gr.update(visible=not visible_state), not visible_state
-
-        sidebar_toggle.click(
-            _toggle_sidebar,
-            inputs=[sidebar_visible_state],
-            outputs=[sidebar_col, sidebar_visible_state],
-        )
-
         def _normalize_models_for_mode(mode: str, current: list[str]) -> list[str]:
             current = list(current or [])
             if mode == "Single":
@@ -350,20 +279,12 @@ def build_app(output_dir: Path) -> gr.Blocks:
         help_btn.click(lambda: gr.update(visible=True), outputs=[help_box])
         help_close.click(lambda: gr.update(visible=False), outputs=[help_box])
 
-        def _save_state(
-            file_id, models, mode, show_image, sidebar_collapsed,
-            sort, has_error, has_reference, disagreement_min,
-        ):
+        def _save_state(file_id, models, mode, show_image):
             return {
                 "file_id": file_id,
                 "models": models,
                 "mode": mode,
                 "show_image": show_image,
-                "sidebar_collapsed": not sidebar_collapsed,
-                "sort": sort,
-                "filter_has_error": has_error,
-                "filter_has_reference": has_reference,
-                "filter_disagreement_min": float(disagreement_min or 0.0),
             }
 
         for trigger in (
@@ -371,48 +292,11 @@ def build_app(output_dir: Path) -> gr.Blocks:
             models_state.change,
             view_mode.change,
             image_visible_state.change,
-            sidebar_visible_state.change,
-            sort_dd.change,
-            filter_err.change,
-            filter_ref.change,
-            disagreement_slider.change,
         ):
             trigger(
                 _save_state,
-                inputs=[
-                    current_file, models_state, view_mode,
-                    image_visible_state, sidebar_visible_state,
-                    sort_dd, filter_err, filter_ref, disagreement_slider,
-                ],
+                inputs=[current_file, models_state, view_mode, image_visible_state],
                 outputs=[browser_state],
-            )
-
-        def _refresh_sidebar(
-            sort: str, has_err: bool, has_ref: bool, min_dis: float, current: str
-        ) -> str:
-            return _render_sidebar_filtered(
-                store,
-                sort=sort,
-                has_error=has_err,
-                has_reference=has_ref,
-                disagreement_min=float(min_dis or 0.0),
-                current_file=current,
-            )
-
-        for trigger in (
-            sort_dd.change,
-            filter_err.change,
-            filter_ref.change,
-            disagreement_slider.change,
-            current_file.change,
-        ):
-            trigger(
-                _refresh_sidebar,
-                inputs=[
-                    sort_dd, filter_err, filter_ref,
-                    disagreement_slider, current_file,
-                ],
-                outputs=[sidebar_html],
             )
 
         # Initial load: read URL query params and BrowserState, settle the UI.
@@ -439,14 +323,6 @@ def build_app(output_dir: Path) -> gr.Blocks:
             models = [m for m in models if m in store.all_models]
             if not models and store.all_models:
                 models = list(store.all_models)
-            sort_value = (state or {}).get("sort") or "file_id"
-            if sort_value not in SORT_CHOICES:
-                sort_value = "file_id"
-            has_err = bool((state or {}).get("filter_has_error", False))
-            has_ref = bool((state or {}).get("filter_has_reference", False))
-            disagreement_min = float(
-                (state or {}).get("filter_disagreement_min", 0.0) or 0.0
-            )
             layout_models = store.layout_models_for(requested_id)
             layout_choice = layout_models[0] if layout_models else None
             img, anns = (
@@ -455,6 +331,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 else (store.image_for(requested_id), [])
             )
             return (
+                gr.update(value=requested_id, choices=store.file_ids()),
                 requested_id,
                 models,
                 gr.update(value=mode),
@@ -462,17 +339,13 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 _render_page_summary(store, requested_id),
                 (img, anns) if img is not None else None,
                 _render_legend(anns, store),
-                gr.update(value=sort_value),
-                gr.update(value=has_err),
-                gr.update(value=has_ref),
-                gr.update(value=disagreement_min),
-                gr.update(value=requested_id),  # sidebar_selected
             )
 
         demo.load(
             _on_load,
             inputs=[browser_state],
             outputs=[
+                page_dd,
                 current_file,
                 models_state,
                 view_mode,
@@ -480,11 +353,6 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 page_summary,
                 annotated,
                 legend_html,
-                sort_dd,
-                filter_err,
-                filter_ref,
-                disagreement_slider,
-                sidebar_selected,
             ],
         )
 
@@ -599,166 +467,6 @@ def _render_page_summary(store: ViewerStore, file_id: str) -> str:
         f'<span>max chars: {page.char_count}</span>'
         f"{err_html}"
         "</div>"
-    )
-
-
-def _serialize_sidebar(store: ViewerStore) -> str:
-    """JSON-encode the page list for the JS-rendered sidebar.
-
-    Each entry carries the file_id, volume context, indicators, and the
-    aggregate metrics needed for client-side sorting/filtering. The JS
-    side handles search and filter without round-tripping to Python.
-    """
-    pages = store.pages(sort="file_id")
-    rows: list[dict[str, Any]] = []
-    for p in pages:
-        volume = store.volume_for(p.file_id) if p.volume_id else None
-        rows.append({
-            "file_id": p.file_id,
-            "volume_id": p.volume_id,
-            "volume_title": volume.title if volume else None,
-            "volume_year": volume.year if volume else None,
-            "sequence": p.sequence,
-            "n_models": len(p.models),
-            "n_errors": len(p.error_models),
-            "has_reference": p.has_reference,
-            "disagreement": round(p.disagreement, 4),
-            "char_count": p.char_count,
-            "comparison_summary": p.comparison_summary,
-        })
-    return json.dumps({"rows": rows})
-
-
-def _initial_sidebar_html(payload: str, current_file: str) -> str:
-    """Server-side initial render of the sidebar list. The JS side takes
-    over from here and re-renders on filter/sort changes; this initial
-    render keeps the page useful before JS boots and acts as the no-JS
-    fallback."""
-    try:
-        data = json.loads(payload)
-    except json.JSONDecodeError:
-        data = {"rows": []}
-    rows = data.get("rows", [])
-
-    # Group rows by volume_id when at least one row has volume metadata.
-    has_volumes = any(r.get("volume_id") for r in rows)
-    out: list[str] = ['<div class="ocrscout-sidebar-list-inner">']
-    if has_volumes:
-        groups: dict[str, list[dict[str, Any]]] = {}
-        order: list[str] = []
-        for r in rows:
-            key = r.get("volume_id") or "__flat__"
-            if key not in groups:
-                groups[key] = []
-                order.append(key)
-            groups[key].append(r)
-        for key in order:
-            group = groups[key]
-            first = group[0]
-            label = (
-                f"Volume {escape(first.get('volume_id') or '')}"
-                if first.get("volume_id") else "Pages"
-            )
-            title = first.get("volume_title")
-            n_pages = len(group)
-            n_err = sum(r.get("n_errors") or 0 for r in group)
-            avg_disagree = (
-                sum(r.get("disagreement") or 0 for r in group) / n_pages
-                if n_pages else 0.0
-            )
-            out.append(
-                f'<div class="vol-group">'
-                f'<div class="vol-group-head">'
-                f"<span>{label}</span>"
-                + (
-                    f'<span class="vol-group-title">{escape(title)}</span>'
-                    if title else ""
-                )
-                + f'<span class="vol-group-stats">'
-                f"{n_pages} · {n_err} err · {avg_disagree:.2f}"
-                "</span>"
-                "</div>"
-            )
-            for r in group:
-                out.append(_render_sidebar_row(r, r["file_id"] == current_file))
-            out.append("</div>")
-    else:
-        for r in rows:
-            out.append(_render_sidebar_row(r, r["file_id"] == current_file))
-    out.append("</div>")
-    return "".join(out)
-
-
-def _render_sidebar_filtered(
-    store: ViewerStore,
-    *,
-    sort: str,
-    has_error: bool,
-    has_reference: bool,
-    disagreement_min: float,
-    current_file: str,
-) -> str:
-    """Server-side filter+sort+render of the sidebar list. Cheap enough
-    for ~1000 pages; for larger runs we'd want to swap to JS-side rendering
-    against a streamed JSON blob (deferred)."""
-    sort_key = sort if sort in SORT_CHOICES else "file_id"
-    pages = store.pages(sort=sort_key)
-    rows: list[dict[str, Any]] = []
-    for p in pages:
-        if has_error and not p.error_models:
-            continue
-        if has_reference and not p.has_reference:
-            continue
-        if disagreement_min > 0 and p.disagreement < disagreement_min:
-            continue
-        volume = store.volume_for(p.file_id) if p.volume_id else None
-        rows.append({
-            "file_id": p.file_id,
-            "volume_id": p.volume_id,
-            "volume_title": volume.title if volume else None,
-            "volume_year": volume.year if volume else None,
-            "sequence": p.sequence,
-            "n_models": len(p.models),
-            "n_errors": len(p.error_models),
-            "has_reference": p.has_reference,
-            "disagreement": round(p.disagreement, 4),
-            "char_count": p.char_count,
-            "comparison_summary": p.comparison_summary,
-        })
-    payload = json.dumps({"rows": rows})
-    return _initial_sidebar_html(payload, current_file)
-
-
-def _render_sidebar_row(r: dict[str, Any], active: bool) -> str:
-    klass = "row" + (" active" if active else "")
-    indicators: list[str] = []
-    if r.get("n_errors"):
-        indicators.append(
-            f'<span class="ind err" title="{r["n_errors"]} model error(s)">⚠</span>'
-        )
-    if r.get("has_reference"):
-        indicators.append(
-            '<span class="ind ref" title="has reference">📄</span>'
-        )
-    disagreement = float(r.get("disagreement") or 0.0)
-    if disagreement > 0:
-        bar_pct = min(100.0, disagreement * 100)
-        indicators.append(
-            f'<span class="ind bar" title="disagreement {disagreement:.2f}">'
-            f'<span class="bar-fill" style="width:{bar_pct:.0f}%"></span>'
-            "</span>"
-        )
-    return (
-        f'<div class="{klass}" data-file-id="{escape(r["file_id"])}" '
-        f'data-disagreement="{disagreement}" '
-        f'data-has-error="{1 if r.get("n_errors") else 0}" '
-        f'data-has-ref="{1 if r.get("has_reference") else 0}">'
-        f'<span class="fid">{escape(r["file_id"])}</span>'
-        + (
-            f'<span class="ind-row">{"".join(indicators)}</span>'
-            if indicators else ""
-        )
-        + "</div>"
     )
 
 
@@ -1105,7 +813,6 @@ _HELP_HTML = """
   <dt>j / k</dt><dd>Next / previous page</dd>
   <dt>1 / 2 / 3</dt><dd>Switch to Single / Side-by-side / Compare mode</dd>
   <dt>i</dt><dd>Toggle the image pane</dd>
-  <dt>/</dt><dd>Focus the sidebar search</dd>
   <dt>?</dt><dd>Show this help</dd>
 </dl>
 <h3>View modes</h3>
@@ -1119,11 +826,6 @@ _HELP_HTML = """
     baseline (with provenance shown). Stacks every comparison whose
     required modality is satisfied.</dd>
 </dl>
-<h3>Sidebar</h3>
-<p>Search by file_id or volume title. Use the filter checkboxes to show
-only pages with errors or references. The slider raises the disagreement
-floor (handy for finding pages where models diverge most). Sort by
-file_id, disagreement (most-divergent first), errors, or output volume.</p>
 <h3>URL parameters</h3>
 <p>Append <code>?file=...&amp;models=a,b&amp;mode=Compare</code> to share a
 specific view.</p>
