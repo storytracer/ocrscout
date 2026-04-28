@@ -40,8 +40,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
     Loads the parquet eagerly at startup; image/markdown are resolved on
     demand. Returns the un-launched ``Blocks``; the ``css`` and ``head``
     strings are attached as ``demo.ocrscout_css`` / ``demo.ocrscout_head``
-    so the CLI can pass them to ``launch()`` (Gradio 6.0 moves these from
-    the constructor onto ``launch``).
+    so the launcher can pass them to ``Blocks.launch(...)`` (gradio 6 API).
     """
     store = ViewerStore(Path(output_dir))
 

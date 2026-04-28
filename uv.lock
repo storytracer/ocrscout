@@ -2990,7 +2990,7 @@ requires-dist = [
     { name = "docling", marker = "extra == 'docling'" },
     { name = "docling-core", specifier = ">=2.50.0" },
     { name = "gcsfs", marker = "extra == 'cloud'", specifier = ">=2024.0.0" },
-    { name = "gradio", marker = "extra == 'viewer'", specifier = ">=5.0.0" },
+    { name = "gradio", marker = "extra == 'viewer'", specifier = ">=6.13.0" },
     { name = "httpx", marker = "extra == 'iiif'", specifier = ">=0.27.0" },
     { name = "huggingface-hub", specifier = ">=0.25.0" },
     { name = "litellm", extras = ["proxy"], marker = "extra == 'serve'", specifier = ">=1.50.0" },
