@@ -2930,7 +2930,6 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "nvitop" },
     { name = "pillow" },
-    { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "pyyaml" },
@@ -2949,7 +2948,6 @@ all = [
     { name = "lxml" },
     { name = "ocrmypdf" },
     { name = "pikepdf" },
-    { name = "polars" },
     { name = "s3fs" },
     { name = "torch" },
     { name = "transformers" },
@@ -2984,7 +2982,6 @@ serve = [
 ]
 viewer = [
     { name = "gradio" },
-    { name = "polars" },
 ]
 
 [package.metadata]
@@ -3004,8 +3001,6 @@ requires-dist = [
     { name = "ocrscout", extras = ["pdf", "alto", "iiif", "cloud", "docling", "serve", "viewer", "layout"], marker = "extra == 'all'" },
     { name = "pikepdf", marker = "extra == 'pdf'", specifier = ">=9.0.0" },
     { name = "pillow", specifier = ">=10.0.0" },
-    { name = "polars", marker = "extra == 'viewer'", specifier = ">=1.0.0" },
-    { name = "pyarrow", specifier = ">=17.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pydantic-settings", specifier = ">=2.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },

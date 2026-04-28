@@ -18,6 +18,7 @@ from rich.table import Table
 from ocrscout import registry
 from ocrscout.cli import app
 from ocrscout.errors import BackendError, ManagedServerError, NormalizerError, ProfileNotFound
+from ocrscout.exports.layout import parquet_dest
 from ocrscout.log import VERBOSE, setup_logging
 from ocrscout.managed import managed_servers
 from ocrscout.metrics import MetricsCollector
@@ -158,7 +159,7 @@ def run(
             else None
         ),
         models=[m.strip() for m in models.split(",") if m.strip()],
-        export=AdapterRef(name=export, args={"dest": str(output_dir / "results.parquet")}),
+        export=AdapterRef(name=export, args={"dest": str(parquet_dest(output_dir))}),
         sample=sample,
         output_dir=output_dir,
     )
@@ -371,10 +372,11 @@ def _run_one_model(
 
         record = ExportRecord(
             page=page,
+            model=model_name,
             document=doc,
             raw=raw,
+            markdown=markdown,
             metrics={
-                "model": model_name,
                 "prepare_seconds": round(prepare_seconds, 4),
                 "run_seconds_total": round(run_seconds_total, 4),
                 "run_seconds_per_page": round(run_seconds_per_page, 4),

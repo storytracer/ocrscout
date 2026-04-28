@@ -34,7 +34,6 @@ dependencies = [
     "pyyaml>=6.0",
     "typer>=0.12.0",
     "rich>=13.0.0",
-    "pyarrow>=17.0.0",
     # Used by VllmBackend and LayoutChatBackend for OpenAI-compatible
     # chat-completions calls. Connection pooling matters under per-region
     # fan-out in layout mode.
@@ -60,7 +59,6 @@ docling = ["docling"]
 serve = ["litellm[proxy]>=1.50.0"]
 viewer = [
     "gradio>=5.0.0",
-    "polars>=1.0.0",
 ]
 # Layout-aware OCR pipeline (ocrscout.backends.layout_chat + the
 # pp-doclayout-v3 detector). Uses the official Hugging Face Transformers

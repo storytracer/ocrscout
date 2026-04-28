@@ -103,8 +103,10 @@ class ExportRecord(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     page: PageImage
+    model: str
     document: Any  # DoclingDocument at runtime
     raw: RawOutput
+    markdown: str | None = None
     metrics: dict[str, Any] = Field(default_factory=dict)
     scores: dict[str, float] = Field(default_factory=dict)
 

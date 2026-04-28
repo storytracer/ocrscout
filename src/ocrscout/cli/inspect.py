@@ -10,7 +10,6 @@ import webbrowser
 from pathlib import Path
 from typing import Any
 
-import pyarrow.parquet as pq
 import typer
 from rich import print as rprint
 from rich.console import Console
@@ -24,7 +23,7 @@ from ocrscout.viewer.diff import compute_diff, render_diff_page
 @app.command("inspect")
 def inspect(
     output_dir: Path = typer.Argument(
-        ..., help="A previous run's --output-dir (must contain results.parquet)."
+        ..., help="A previous run's --output-dir (must contain data/train-*.parquet)."
     ),
     page: str | None = typer.Option(
         None, "--page", "-p",
@@ -49,15 +48,16 @@ def inspect(
         help="Characters of text preview shown in the summary table.",
     ),
 ) -> None:
-    """Read a previous run's results.parquet and print a per-page comparison."""
-    parquet_path = output_dir / "results.parquet"
-    if not parquet_path.is_file():
-        rprint(f"[red]No results.parquet at {parquet_path}[/red]")
+    """Read a previous run's parquet shards and print a per-page comparison."""
+    from ocrscout.exports.layout import find_parquet_files
+
+    if not find_parquet_files(output_dir):
+        rprint(f"[red]No data/train-*.parquet under {output_dir}[/red]")
         raise typer.Exit(code=1)
 
-    rows = _load_rows(parquet_path)
+    rows = _load_rows(output_dir)
     if not rows:
-        rprint(f"[yellow]{parquet_path} is empty.[/yellow]")
+        rprint(f"[yellow]{output_dir} contains no rows.[/yellow]")
         return
 
     if diff is not None:
@@ -88,19 +88,31 @@ def inspect(
         _show_summary(rows, snippet_length=snippet_length)
 
 
-def _load_rows(parquet_path: Path) -> list[dict[str, Any]]:
-    table = pq.read_table(parquet_path)
+def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
+    from datasets import load_dataset
+
+    from ocrscout.exports.layout import parquet_data_files
+
+    ds = load_dataset(
+        "parquet",
+        data_files=parquet_data_files(output_dir),
+        split="train",
+    )
     out: list[dict[str, Any]] = []
-    for i in range(table.num_rows):
-        metrics_raw = table["metrics_json"][i].as_py()
-        metrics = json.loads(metrics_raw) if metrics_raw else {}
+    for raw in ds:
+        metrics_raw = raw.get("metrics_json") or ""
+        try:
+            metrics = json.loads(metrics_raw) if metrics_raw else {}
+        except json.JSONDecodeError:
+            metrics = {}
         out.append({
-            "page_id": table["page_id"][i].as_py(),
-            "source_uri": table["source_uri"][i].as_py(),
-            "output_format": table["output_format"][i].as_py(),
-            "document_json": table["document_json"][i].as_py(),
-            "error": table["error"][i].as_py(),
-            "model": metrics.get("model", "?"),
+            "page_id": raw["page_id"],
+            "model": raw.get("model") or metrics.get("model", "?"),
+            "source_uri": raw.get("source_uri"),
+            "output_format": raw.get("output_format"),
+            "document_json": raw.get("document_json"),
+            "markdown": raw.get("markdown"),
+            "error": raw.get("error"),
             "metrics": metrics,
         })
     return out
@@ -343,7 +355,10 @@ def _detect_lan_ip() -> str | None:
 
 
 def _markdown_for(row: dict[str, Any], *, text_dir: Path) -> str:
-    """Prefer the on-disk markdown sidecar; fall back to re-rendering."""
+    """Resolve markdown for a row: parquet column → text sidecar → JSON re-render."""
+    md = row.get("markdown")
+    if md:
+        return md
     stem = Path(row["page_id"]).stem.replace("/", "_").replace("\\", "_")
     sidecar = text_dir / f"{stem}.{row['model']}.md"
     if sidecar.is_file():

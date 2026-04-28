@@ -144,7 +144,7 @@ class HfDatasetSourceAdapter(SourceAdapter):
             raw_path = record.get("path") if isinstance(record, dict) else None
             raw_bytes = record.get("bytes") if isinstance(record, dict) else None
             if raw_bytes is None and raw_path:
-                raw_bytes = _read_path(raw_path, self.storage_options)
+                raw_bytes = read_path_or_url(raw_path, self.storage_options)
             if not raw_bytes:
                 log.warning(
                     "hf_dataset: row %d has no image bytes (path=%r); skipping",
@@ -334,16 +334,21 @@ def _detect_id_column(features: Any, *, exclude: str) -> str | None:
     return None
 
 
-def _read_path(path: str, storage_options: dict[str, Any] | None) -> bytes:
-    """Fetch raw bytes from a path/URL via fsspec when datasets hands us a path
-    without inlined bytes (typical in streaming mode)."""
+def read_path_or_url(path: str, storage_options: dict[str, Any] | None = None) -> bytes:
+    """Fetch raw bytes from a local path or any fsspec-recognised URL.
+
+    Used by ``HfDatasetSourceAdapter`` (when ``datasets`` hands us a path
+    without inlined bytes — typical in streaming mode) and by the publish
+    pipeline (when bundling source images into a dataset repo). Local paths
+    skip the fsspec import entirely.
+    """
     if "://" not in path:
         return Path(path).read_bytes()
     try:
         import fsspec
     except ImportError as e:
         raise ScoutError(
-            f"hf_dataset: fsspec needed to fetch {path!r}: {e}. "
+            f"fsspec needed to fetch {path!r}: {e}. "
             "Install the relevant extra (e.g. `pip install ocrscout[cloud]` for S3)."
         ) from e
     with fsspec.open(path, "rb", **(storage_options or {})) as f:

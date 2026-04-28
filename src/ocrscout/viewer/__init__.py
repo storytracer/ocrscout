@@ -1,7 +1,7 @@
 """Gradio-based interactive viewer for ocrscout results.
 
-Loaded lazily by the `ocrscout viewer` CLI command — gradio and polars are
-only needed for the viewer optional extra and aren't pulled in by core.
+Loaded lazily by the `ocrscout viewer` CLI command — gradio is only needed
+for the viewer optional extra and isn't pulled in by core.
 """
 
 from __future__ import annotations

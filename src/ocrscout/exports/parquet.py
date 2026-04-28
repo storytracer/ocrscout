@@ -1,8 +1,10 @@
 """ParquetExportAdapter: append ExportRecord rows to a parquet file.
 
-Buffers in memory and flushes on ``close()``. Each row stores the full
-DoclingDocument as serialized JSON in the ``document_json`` column so the
-parquet remains self-contained.
+Buffers in memory and flushes on ``close()`` via ``datasets.Dataset.to_parquet``.
+Each row stores the full DoclingDocument as serialized JSON in
+``document_json`` plus a pre-rendered markdown string in ``markdown`` so the
+parquet remains self-contained for both ``ocrscout viewer`` and HF Hub
+publishing.
 """
 
 from __future__ import annotations
@@ -11,10 +13,10 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pyarrow as pa
-import pyarrow.parquet as pq
+from datasets import Dataset
 
 from ocrscout.errors import ScoutError
+from ocrscout.exports.schema import RESULTS_FEATURES
 from ocrscout.interfaces.export import ExportAdapter
 from ocrscout.types import ExportRecord
 
@@ -43,12 +45,8 @@ class ParquetExportAdapter(ExportAdapter):
             return
         path = Path(self._dest)
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not self._rows:
-            # Write an empty file with the schema so downstream tooling sees it.
-            table = pa.Table.from_pylist([], schema=_SCHEMA)
-        else:
-            table = pa.Table.from_pylist(self._rows, schema=_SCHEMA)
-        pq.write_table(table, path)
+        ds = Dataset.from_list(self._rows, features=RESULTS_FEATURES)
+        ds.to_parquet(str(path))
         self._rows = []
         self._opened = False
 
@@ -56,21 +54,6 @@ class ParquetExportAdapter(ExportAdapter):
         if self._dest is not None and not self._opened:
             self.open(self._dest)
         return self
-
-
-_SCHEMA = pa.schema(
-    [
-        ("page_id", pa.string()),
-        ("source_uri", pa.string()),
-        ("output_format", pa.string()),
-        ("document_json", pa.string()),
-        ("raw_payload", pa.string()),
-        ("tokens", pa.int64()),
-        ("error", pa.string()),
-        ("metrics_json", pa.string()),
-        ("scores_json", pa.string()),
-    ]
-)
 
 
 def _record_to_row(record: ExportRecord) -> dict[str, Any]:
@@ -83,9 +66,11 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
         document_json = json.dumps(doc) if doc is not None else None
     return {
         "page_id": record.page.page_id,
+        "model": record.model,
         "source_uri": record.page.source_uri,
         "output_format": record.raw.output_format,
         "document_json": document_json,
+        "markdown": record.markdown,
         "raw_payload": record.raw.payload,
         "tokens": record.raw.tokens,
         "error": record.raw.error,

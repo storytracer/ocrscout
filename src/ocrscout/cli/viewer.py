@@ -1,8 +1,8 @@
 """`ocrscout viewer` — interactive Gradio inspector for a previous run.
 
 Same input as `ocrscout inspect` (a results directory containing
-``results.parquet``), but launches a long-lived Gradio app on a local port
-so a user can walk pages, toggle models, switch view modes, and share
+``data/train-*.parquet``), but launches a long-lived Gradio app on a local
+port so a user can walk pages, toggle models, switch view modes, and share
 URLs.
 
 Gradio is a heavy dependency, so it's gated behind the ``viewer`` optional
@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 @app.command("viewer")
 def viewer(
     output_dir: Path = typer.Argument(
-        ..., help="A previous run's --output-dir (must contain results.parquet)."
+        ..., help="A previous run's --output-dir (must contain data/train-*.parquet)."
     ),
     host: str = typer.Option(
         "127.0.0.1", "--host",
@@ -57,9 +57,10 @@ def viewer(
     """Launch the Gradio inspector against a previous run's output directory."""
     setup_logging(verbosity=verbose, quiet=quiet)
 
-    parquet_path = output_dir / "results.parquet"
-    if not parquet_path.is_file():
-        rprint(f"[red]No results.parquet at {parquet_path}[/red]")
+    from ocrscout.exports.layout import find_parquet_files
+
+    if not find_parquet_files(output_dir):
+        rprint(f"[red]No data/train-*.parquet under {output_dir}[/red]")
         raise typer.Exit(code=1)
 
     try:

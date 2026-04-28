@@ -1,14 +1,14 @@
 """ViewerStore: in-memory data layer for the Gradio inspector.
 
-Loads ``results.parquet`` once at startup, derives a per-page disagreement
-score, and resolves markdown / DoclingDocument items / source images on
-demand. Polars is used for the initial load (fast, easy filtering); plain
-Python dicts/lists carry the rows around afterwards.
+Loads ``data/train-*.parquet`` once at startup via ``datasets.load_dataset``,
+derives a per-page disagreement score, and resolves markdown / DoclingDocument
+items / source images on demand. Plain Python dicts/lists carry the rows
+around afterwards.
 """
 
 from __future__ import annotations
 
-import difflib
+import io
 import json
 import logging
 from dataclasses import dataclass, field
@@ -16,10 +16,9 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, ClassVar
 
-import polars as pl
 from PIL import Image
 
-from ocrscout.viewer.diff import tokenize
+from ocrscout.exports.layout import find_parquet_files, parquet_data_files
 
 log = logging.getLogger(__name__)
 
@@ -101,14 +100,15 @@ class ViewerStore:
 
     def __init__(self, output_dir: Path) -> None:
         self.output_dir = output_dir
-        self.parquet_path = output_dir / "results.parquet"
         self.text_dir = output_dir / "text"
-        if not self.parquet_path.is_file():
+        shards = find_parquet_files(output_dir)
+        if not shards:
             raise FileNotFoundError(
-                f"No results.parquet at {self.parquet_path}. Pass an output dir "
-                "produced by `ocrscout run`."
+                f"No data/train-*.parquet under {output_dir}. Pass an output "
+                "dir produced by `ocrscout run` (or a `snapshot_download`'d "
+                "ocrscout dataset repo)."
             )
-        self._rows: list[dict[str, Any]] = self._load_rows(self.parquet_path)
+        self._rows: list[dict[str, Any]] = self._load_rows(output_dir)
         self._by_page_model: dict[tuple[str, str], dict[str, Any]] = {
             (r["page_id"], r["model"]): r for r in self._rows
         }
@@ -116,7 +116,8 @@ class ViewerStore:
         self._pages: list[PageRow] = self._build_page_index()
         log.info(
             "viewer: loaded %d rows across %d pages × %d models from %s",
-            len(self._rows), len(self._pages), len(self.all_models), self.parquet_path,
+            len(self._rows), len(self._pages), len(self.all_models),
+            ", ".join(str(p.relative_to(output_dir)) for p in shards),
         )
 
     # ------------------------------------------------------------------ public
@@ -126,7 +127,7 @@ class ViewerStore:
 
         Default ordering is alphabetical by ``page_id``, which is predictable
         and stable across runs. Pass ``sort="parquet"`` to keep the order in
-        which rows appeared in ``results.parquet`` (whatever the source
+        which rows appeared in the parquet shards (whatever the source
         adapter emitted).
         """
         if sort == "parquet":
@@ -186,20 +187,35 @@ class ViewerStore:
         )
 
     def image_for(self, page_id: str) -> Image.Image | None:
-        """Return the PIL image at ``source_uri`` for ``page_id``, or None.
+        """Return the PIL image for ``page_id``, or None.
 
-        Cached via an LRU on the resolved path so the same image isn't reread
-        when toggling models. Returns ``None`` on missing/unreadable sources
-        — the viewer will render a placeholder.
+        Resolution order:
+
+        1. The ``image`` column (bytes embedded in the parquet by the publisher
+           when ``--bundle-images`` was set). Decoded once per call; the LRU
+           cache guards repeat calls.
+        2. ``source_uri`` — local path resolved relative to ``self.output_dir``
+           if not absolute, fsspec URL otherwise. Cached on the resolved
+           string.
+
+        Returns ``None`` for pages with neither.
         """
-        # Find any row for this page; they all share the same source_uri.
-        raw = next(
-            (r for r in self._rows if r["page_id"] == page_id and r.get("source_uri")),
-            None,
-        )
-        if raw is None or not raw.get("source_uri"):
+        raw = next((r for r in self._rows if r["page_id"] == page_id), None)
+        if raw is None:
             return None
-        return _load_image_cached(str(raw["source_uri"]))
+        img_bytes = raw.get("image_bytes")
+        if img_bytes:
+            return _decode_image_bytes(img_bytes)
+        src = raw.get("source_uri")
+        if not src:
+            return None
+        src = str(src)
+        if "://" not in src:
+            p = Path(src)
+            if not p.is_absolute():
+                p = self.output_dir / p
+            src = str(p)
+        return _load_image_cached(src)
 
     def annotated_for(
         self, page_id: str, model: str
@@ -231,24 +247,44 @@ class ViewerStore:
 
     # ------------------------------------------------------------------ internal
 
-    def _load_rows(self, parquet_path: Path) -> list[dict[str, Any]]:
-        df = pl.read_parquet(parquet_path)
+    def _load_rows(self, output_dir: Path) -> list[dict[str, Any]]:
+        from datasets import Image as HfImage
+        from datasets import load_dataset
+
+        ds = load_dataset(
+            "parquet",
+            data_files=parquet_data_files(output_dir),
+            split="train",
+        )
+        has_image = "image" in ds.column_names
+        if has_image:
+            # Keep image bytes raw so we don't materialise PIL.Images for every
+            # row at load time — image_for() decodes on demand.
+            ds = ds.cast_column("image", HfImage(decode=False))
+
         out: list[dict[str, Any]] = []
-        for raw in df.iter_rows(named=True):
+        for raw in ds:
             metrics_raw = raw.get("metrics_json") or ""
             try:
                 metrics = json.loads(metrics_raw) if metrics_raw else {}
             except json.JSONDecodeError:
                 metrics = {}
+            image_bytes: bytes | None = None
+            if has_image:
+                payload = raw.get("image")
+                if isinstance(payload, dict):
+                    image_bytes = payload.get("bytes")
             out.append(
                 {
                     "page_id": raw["page_id"],
+                    "model": raw.get("model") or metrics.get("model", "?"),
                     "source_uri": raw.get("source_uri"),
                     "output_format": raw.get("output_format"),
                     "document_json": raw.get("document_json"),
+                    "markdown": raw.get("markdown"),
                     "error": raw.get("error"),
-                    "model": metrics.get("model", "?"),
                     "metrics": metrics,
+                    "image_bytes": image_bytes,
                 }
             )
         return out
@@ -284,31 +320,29 @@ class ViewerStore:
     def _page_disagreement(self, rows: list[dict[str, Any]]) -> float:
         """Mean pairwise word-diff distance (1 - SequenceMatcher.ratio).
 
-        0.0 = all models agreed exactly; 1.0 = no shared tokens. Cheap to
-        compute even for 5+ models since each ratio is O(n+m) in tokens.
+        0.0 = all models agreed exactly; 1.0 = no shared tokens. Delegates to
+        :func:`ocrscout.publish._stats.compute_page_disagreement` after
+        materialising each row's markdown body — the publisher's dataset
+        card consumes the same helper so both surfaces compute identical
+        scores.
         """
-        token_streams = []
-        for r in rows:
-            md = self._markdown_for(r)
-            if md:
-                token_streams.append(tokenize(md))
-        if len(token_streams) < 2:
-            # Single-model pages have no disagreement to measure; sort them last
-            # by giving them a 0 score (they fall under the contested ones).
-            return 0.0
-        total = 0.0
-        n = 0
-        for i in range(len(token_streams)):
-            for j in range(i + 1, len(token_streams)):
-                ratio = difflib.SequenceMatcher(
-                    None, token_streams[i], token_streams[j], autojunk=False
-                ).quick_ratio()
-                total += 1.0 - ratio
-                n += 1
-        return total / n if n else 0.0
+        from ocrscout.publish._stats import compute_page_disagreement
+
+        materialized = [{"markdown": self._markdown_for(r)} for r in rows]
+        return compute_page_disagreement(materialized)
 
     def _markdown_for(self, row: dict[str, Any]) -> str:
-        """Prefer the on-disk markdown sidecar; fall back to re-rendering JSON."""
+        """Resolve the markdown body for a row.
+
+        Order: parquet ``markdown`` column → on-disk text sidecar → re-render
+        from ``document_json``. Modern parquets (post-schema-swap) populate
+        the ``markdown`` column at write time, so the sidecar/JSON paths are
+        only hit for older runs or for rows where Docling's
+        ``export_to_markdown`` failed at run time.
+        """
+        md = row.get("markdown")
+        if md:
+            return md
         stem = Path(row["page_id"]).stem.replace("/", "_").replace("\\", "_")
         sidecar = self.text_dir / f"{stem}.{row['model']}.md"
         if sidecar.is_file():
@@ -410,6 +444,18 @@ def _load_image_cached(path: str) -> Image.Image | None:
         return img
     except (OSError, FileNotFoundError) as e:
         log.warning("viewer: cannot open source image %s: %s", path, e)
+        return None
+
+
+def _decode_image_bytes(payload: bytes) -> Image.Image | None:
+    """Decode an inline image payload (the ``image.bytes`` from a Hub-bundled
+    parquet) into a PIL.Image, or ``None`` on failure."""
+    try:
+        with Image.open(io.BytesIO(payload)) as img:
+            img.load()
+            return img.copy()
+    except (OSError, ValueError) as e:
+        log.warning("viewer: cannot decode bundled image bytes: %s", e)
         return None
 
 

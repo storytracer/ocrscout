@@ -55,7 +55,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
         # still see what they pointed at.
         with gr.Blocks(title="ocrscout viewer") as demo:
             gr.Markdown(
-                f"### No rows in `{output_dir / 'results.parquet'}`.\n\n"
+                f"### No rows in `{output_dir / 'data'}/`.\n\n"
                 "Run `ocrscout run` first."
             )
         demo.ocrscout_css = css
