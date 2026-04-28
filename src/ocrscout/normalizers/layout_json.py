@@ -20,6 +20,7 @@ from docling_core.types.doc.labels import DocItemLabel
 
 from ocrscout.errors import NormalizerError
 from ocrscout.interfaces.normalizer import Normalizer
+from ocrscout.normalizers._tables import parse_html_table
 from ocrscout.profile import ModelProfile
 from ocrscout.types import PageImage, RawOutput
 
@@ -113,9 +114,9 @@ class LayoutJsonNormalizer(Normalizer):
             doc.add_picture(prov=picture_prov)
             return
         if kind == "table":
-            # v0: stash table cells/markdown as a TABLE-labeled text item;
-            # full TableData reconstruction is out of scope for the bootstrap.
-            doc.add_text(label=DocItemLabel.TABLE, text=text, prov=prov)
+            data = parse_html_table(text)
+            table_prov = _build_prov(bbox_raw, page_no=page_no, charspan=(0, 0))
+            doc.add_table(data=data, prov=table_prov)
             return
 
         label = _TEXT_LABELS.get(kind, DocItemLabel.TEXT)
