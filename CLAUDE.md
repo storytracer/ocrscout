@@ -43,6 +43,10 @@ A profile records:
 - **vLLM tuning**: `vllm_engine_args` (passed to `vllm.LLM(...)`), `sampling_args` (passed to `vllm.SamplingParams(...)`), `vllm_version`, `server_url` (for HTTP server mode).
 - **Free-form**: `backend_args`, `metadata`.
 
+### Profile defaults
+
+Some `vllm_engine_args` keys are constant across every shipped profile and live in `DEFAULT_VLLM_ENGINE_ARGS` in [src/ocrscout/profile.py](src/ocrscout/profile.py) instead of being repeated in each YAML — currently `trust_remote_code: true` and `cudagraph_capture_sizes: [1, 2, 4, 8, 16, 24, 32]`. Both runner and managed modes call `effective_vllm_engine_args(profile)` to merge defaults under the profile's overrides (profile wins). Likewise, the `vllm_version` field defaults to `">=0.15.1"` and `backend_args.batch_size` defaults to `16` (in `_DEFAULT_BATCH_SIZE` at [src/ocrscout/backends/vllm.py](src/ocrscout/backends/vllm.py)). Don't restate any of these in a new profile unless you need to override.
+
 ### vLLM backend modes
 
 Profiles with `source: vllm` can run in three modes:
@@ -94,7 +98,7 @@ uv run ocrscout run --source ./images/ --models dots-mocr \
 
 1. Run `uv run ocrscout introspect <name>` — fetches the upstream HF script (`uv-scripts/ocr/<name>.py`) and prints a draft YAML with TODO markers (model_id, vLLM engine args, sampling params, prompt template selection).
 2. Pipe the draft to `src/ocrscout/profiles/<name>.yaml` and open it alongside the upstream script (cached at `~/.cache/ocrscout/uv-scripts-ocr/<name>.py`).
-3. Ask Claude Code (or do it manually) to read the upstream source and resolve the TODOs: copy `PROMPT_TEMPLATES` verbatim, port the `LLM(...)` kwargs to `vllm_engine_args`, port `SamplingParams(...)` to `sampling_args`, decide `chat_template_content_format` based on how the script calls `llm.chat(...)`. Also pick an absolute `kv_cache_memory_bytes` (start from `concurrent_requests × max_model_len × ~30_000` bytes and round to a friendly number like `16G`).
+3. Ask Claude Code (or do it manually) to read the upstream source and resolve the TODOs: copy `PROMPT_TEMPLATES` verbatim, port the `LLM(...)` kwargs to `vllm_engine_args`, port `SamplingParams(...)` to `sampling_args`, decide `chat_template_content_format` based on how the script calls `llm.chat(...)`. Also pick an absolute `kv_cache_memory_bytes` (start from `concurrent_requests × max_model_len × ~30_000` bytes and round to a friendly number like `16G`). Skip `trust_remote_code`, `cudagraph_capture_sizes`, `vllm_version`, and `backend_args.batch_size` — those have defaults (see "Profile defaults" above) and should only be set to override.
 4. Validate with `uv run ocrscout run --source <fixture> --models <name>` on a small dataset.
 
 Introspection is purely static (`ast.parse`) — the upstream script is never executed during this workflow.
