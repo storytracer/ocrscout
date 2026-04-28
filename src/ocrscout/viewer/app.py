@@ -187,9 +187,24 @@ def build_app(output_dir: Path) -> gr.Blocks:
 
         # ----- Wiring -----
 
+        def _image_outputs(file_id: str, model: str | None):
+            """Compute the (annotated_value, legend_html) pair for a given
+            (file_id, layout_model). Single source of truth for image-column
+            updates — invoked inline from navigation handlers and from the
+            layout dropdown's change listener."""
+            if not model:
+                img = store.image_for(file_id)
+                value = (img, []) if img is not None else None
+                return value, _render_legend([], store)
+            img, anns = store.annotated_for(file_id, model)
+            if img is None:
+                return None, _render_legend([], store)
+            return (img, anns), _render_legend(anns, store)
+
         def _on_file_change(file_id: str) -> tuple:
             summary = _render_page_summary(store, file_id)
             layout_models = store.layout_models_for(file_id)
+            annotated_value, legend = _image_outputs(file_id, LAYOUT_NONE_VALUE)
             return (
                 file_id,
                 summary,
@@ -197,12 +212,20 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     choices=_layout_choices(layout_models),
                     value=LAYOUT_NONE_VALUE,
                 ),
+                annotated_value,
+                legend,
             )
 
         page_dd.change(
             _on_file_change,
             inputs=[page_dd],
-            outputs=[current_file, page_summary, layout_model_dd],
+            outputs=[
+                current_file,
+                page_summary,
+                layout_model_dd,
+                annotated,
+                legend_html,
+            ],
         )
 
         def _step(direction: int, file_id: str):
@@ -214,6 +237,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
             new_idx = max(0, min(len(ids) - 1, idx + direction))
             new_file = ids[new_idx]
             layout_models = store.layout_models_for(new_file)
+            annotated_value, legend = _image_outputs(new_file, LAYOUT_NONE_VALUE)
             return (
                 gr.update(value=new_file, choices=ids),
                 new_file,
@@ -222,36 +246,40 @@ def build_app(output_dir: Path) -> gr.Blocks:
                     choices=_layout_choices(layout_models),
                     value=LAYOUT_NONE_VALUE,
                 ),
+                annotated_value,
+                legend,
             )
 
         prev_btn.click(
             lambda p: _step(-1, p),
             inputs=[current_file],
-            outputs=[page_dd, current_file, page_summary, layout_model_dd],
+            outputs=[
+                page_dd,
+                current_file,
+                page_summary,
+                layout_model_dd,
+                annotated,
+                legend_html,
+            ],
         )
         next_btn.click(
             lambda p: _step(+1, p),
             inputs=[current_file],
-            outputs=[page_dd, current_file, page_summary, layout_model_dd],
+            outputs=[
+                page_dd,
+                current_file,
+                page_summary,
+                layout_model_dd,
+                annotated,
+                legend_html,
+            ],
         )
 
-        def _on_layout_change(file_id: str, model: str | None):
-            if not model:
-                img = store.image_for(file_id)
-                value = (img, []) if img is not None else None
-                return value, _render_legend([], store)
-            img, anns = store.annotated_for(file_id, model)
-            if img is None:
-                return None, _render_legend([], store)
-            return (img, anns), _render_legend(anns, store)
-
+        # Image-column updates land via the navigation handlers above; the
+        # layout dropdown still drives its own refresh when the user picks a
+        # different overlay model on the same page.
         layout_model_dd.change(
-            _on_layout_change,
-            inputs=[current_file, layout_model_dd],
-            outputs=[annotated, legend_html],
-        )
-        current_file.change(
-            _on_layout_change,
+            _image_outputs,
             inputs=[current_file, layout_model_dd],
             outputs=[annotated, legend_html],
         )
