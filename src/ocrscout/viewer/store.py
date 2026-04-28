@@ -142,6 +142,23 @@ class ViewerStore:
             m for (pid, m) in self._by_page_model if pid == page_id
         )
 
+    def layout_models_for(self, page_id: str) -> list[str]:
+        """Models that produced layout bboxes for this page (alphabetical).
+
+        Used by the viewer's Layout source dropdown so the user can only
+        pick a model whose output has something to overlay on the image.
+        Models that emit plain markdown (no provenance bboxes) are filtered
+        out — picking one of them would just show an empty overlay.
+        """
+        out: list[str] = []
+        for model in self.models_for(page_id):
+            row = self._by_page_model.get((page_id, model))
+            if row is None:
+                continue
+            if self._bboxes_for(row):
+                out.append(model)
+        return out
+
     def get(self, page_id: str, model: str) -> ModelRow | None:
         raw = self._by_page_model.get((page_id, model))
         if raw is None:

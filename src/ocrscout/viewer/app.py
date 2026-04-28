@@ -64,6 +64,8 @@ def build_app(output_dir: Path) -> gr.Blocks:
 
     initial_page = page_choices[0]
     initial_models = store.all_models[: min(2, len(store.all_models))]
+    initial_layout_models = store.layout_models_for(initial_page)
+    initial_layout_choice = initial_layout_models[0] if initial_layout_models else None
 
     with gr.Blocks(
         title="ocrscout viewer",
@@ -122,8 +124,8 @@ def build_app(output_dir: Path) -> gr.Blocks:
             with gr.Column(scale=2, elem_classes=["ocrscout-control-group"]):
                 gr.HTML('<div class="ocrscout-group-label">Layout source</div>')
                 layout_model_dd = gr.Dropdown(
-                    choices=initial_models or [""],
-                    value=(initial_models[0] if initial_models else None),
+                    choices=initial_layout_models or [""],
+                    value=initial_layout_choice,
                     label=None,
                     show_label=False,
                     container=False,
@@ -199,10 +201,10 @@ def build_app(output_dir: Path) -> gr.Blocks:
 
         def _on_page_change(page_id: str) -> tuple:
             summary = _render_page_summary(store, page_id)
-            models_for_page = store.models_for(page_id)
-            layout_choice = models_for_page[0] if models_for_page else None
+            layout_models = store.layout_models_for(page_id)
+            layout_choice = layout_models[0] if layout_models else None
             return page_id, summary, gr.update(
-                choices=models_for_page or [""], value=layout_choice
+                choices=layout_models or [""], value=layout_choice
             )
 
         page_dd.change(
@@ -219,14 +221,13 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 idx = 0
             new_idx = max(0, min(len(ids) - 1, idx + direction))
             new_page = ids[new_idx]
+            layout_models = store.layout_models_for(new_page)
+            layout_choice = layout_models[0] if layout_models else None
             return (
                 gr.update(value=new_page, choices=ids),
                 new_page,
                 _render_page_summary(store, new_page),
-                gr.update(
-                    choices=store.models_for(new_page) or [""],
-                    value=(store.models_for(new_page) or [""])[0] or None,
-                ),
+                gr.update(choices=layout_models or [""], value=layout_choice),
             )
 
         prev_btn.click(
@@ -341,7 +342,8 @@ def build_app(output_dir: Path) -> gr.Blocks:
             models = [m for m in models if m in store.all_models]
             if not models and store.all_models:
                 models = store.all_models[: min(2, len(store.all_models))]
-            layout_choice = models[0] if models else None
+            layout_models = store.layout_models_for(page_id)
+            layout_choice = layout_models[0] if layout_models else None
             img, anns = (
                 store.annotated_for(page_id, layout_choice)
                 if layout_choice
@@ -352,9 +354,7 @@ def build_app(output_dir: Path) -> gr.Blocks:
                 page_id,
                 models,
                 gr.update(value=mode),
-                gr.update(
-                    choices=store.models_for(page_id) or [""], value=layout_choice
-                ),
+                gr.update(choices=layout_models or [""], value=layout_choice),
                 _render_page_summary(store, page_id),
                 (img, anns) if img is not None else None,
                 _render_legend(anns, store),
@@ -543,7 +543,7 @@ def _draw_text_pane(
         # Use the first selected model.
         first = next(iter(rows.values()))
         _emit_stats_strip(first)
-        _emit_text_body(first, store)
+        _emit_text_body(first, store, use_structured=_has_structure(first))
         return
 
     if mode == "Diff":
@@ -583,27 +583,44 @@ def _draw_text_pane(
             f"_{n} models selected — showing first 5. Deselect some to see "
             "the rest._"
         )
+    # Color-coded sections only when *every* visible row has layout — mixing
+    # structured and plain panes side-by-side reads inconsistently. If even
+    # one model is plain-markdown, all panes drop back to plain markdown.
+    all_structured = all(_has_structure(r) for _, r in capped)
     with gr.Row(equal_height=False):
         for _m, row in capped:
             with gr.Column(scale=1, min_width=200):
                 _emit_stats_strip(row)
-                _emit_text_body(row, store)
+                _emit_text_body(row, store, use_structured=all_structured)
 
 
-def _emit_text_body(row: ModelRow, store: ViewerStore) -> None:
-    """Render the model's text content for the Single / Side-by-side modes.
+def _has_structure(row: ModelRow) -> bool:
+    """Does this row carry layout/section info worth color-coding?
 
-    If the row carries structured items with multiple distinct labels (e.g.
-    title + heading + text + caption + picture from a layout-aware model),
-    render an HTML body where each item is wrapped in a left-bordered block
-    colored to match the bbox legend. Otherwise fall back to the flat
-    markdown export — that's what plain-markdown models like glm-ocr emit
-    and they only have one synthetic label per item.
+    True when there's more than one item AND at least one label that isn't
+    the generic ``text`` / ``paragraph`` default — that's the signal that
+    the model is layout-aware (titles, captions, tables, etc.) rather than
+    a plain-markdown emitter that synthesises a single label per paragraph.
     """
-    distinct_labels = {it.label for it in row.items if it.label}
-    plain_labels = {"text", "paragraph"}
-    has_structure = len(distinct_labels - plain_labels) >= 1 and len(row.items) > 1
-    if not has_structure or not row.items:
+    if len(row.items) <= 1:
+        return False
+    distinct = {it.label for it in row.items if it.label}
+    return bool(distinct - {"text", "paragraph"})
+
+
+def _emit_text_body(
+    row: ModelRow, store: ViewerStore, *, use_structured: bool
+) -> None:
+    """Render the model's text content for Single / Side-by-side modes.
+
+    When ``use_structured`` is True (Single mode for a layout-aware model,
+    or Side-by-side where *all* selected models have layout), render an
+    HTML body where each item is a left-bordered block colored to match the
+    bbox legend. Otherwise fall back to the flat markdown export — also the
+    fallback when even one selected model lacks layout, since mixing
+    structured and plain panes side-by-side reads inconsistently.
+    """
+    if not use_structured or not row.items:
         gr.Markdown(
             row.markdown or "_(empty)_",
             elem_classes="ocrscout-markdown-pane",
