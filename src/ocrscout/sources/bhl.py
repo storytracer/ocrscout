@@ -24,6 +24,7 @@ import os
 import re
 import shutil
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +104,7 @@ class BhlSourceAdapter(SourceAdapter):
         year_range: tuple[int, int] | list[int] | None = None,
         pages_per_volume: int = 8,
         volumes: int | None = None,
+        concurrent_fetches: int = 16,
         cache_dir: str | Path | None = None,
         force_refresh: bool = False,
         storage_options: dict[str, Any] | None = None,
@@ -148,6 +150,9 @@ class BhlSourceAdapter(SourceAdapter):
             self.year_range = None
         self.pages_per_volume = int(pages_per_volume)
         self.volumes = int(volumes) if volumes is not None else None
+        if concurrent_fetches <= 0:
+            raise ScoutError("BhlSourceAdapter requires concurrent_fetches >= 1")
+        self.concurrent_fetches = int(concurrent_fetches)
         self.cache_dir = Path(cache_dir) if cache_dir else _default_cache_dir()
         self.force_refresh = bool(force_refresh)
         self.storage_options = (
@@ -164,10 +169,24 @@ class BhlSourceAdapter(SourceAdapter):
     def iter_pages(self) -> Iterator[PageImage]:
         self._ensure_query_run()
         assert self._sample_rows is not None
-        for row in self._sample_rows:
-            page = self._row_to_page(row)
-            if page is not None:
-                yield page
+        rows = self._sample_rows
+        if self.concurrent_fetches == 1 or len(rows) <= 1:
+            for row in rows:
+                page = self._row_to_page(row)
+                if page is not None:
+                    yield page
+            return
+        # Each _row_to_page is a network-bound S3 GET + JP2 decode; threading
+        # them is dramatically faster than the sequential loop. Pages are
+        # yielded in completion order, not input order — downstream OCR runs
+        # don't care about ordering, only about getting pages.
+        workers = min(self.concurrent_fetches, len(rows))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self._row_to_page, row) for row in rows]
+            for fut in as_completed(futures):
+                page = fut.result()
+                if page is not None:
+                    yield page
 
     def iter_volumes(self) -> Iterator[Volume]:
         self._ensure_query_run()
