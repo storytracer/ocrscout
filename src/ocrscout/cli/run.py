@@ -55,15 +55,15 @@ def run(
              "dirs, fsspec URLs, and HF Hub IDs via `--source`. Use `bhl` "
              "to sample the Biodiversity Heritage Library S3 bucket "
              "(305K volumes, 67M pages); `--source` is then ignored. "
-             "Per-adapter knobs (e.g. `languages`, `max_pages_per_volume`) "
-             "go through `--source-arg key=value`.",
+             "Per-adapter knobs (e.g. `languages`, `pages_per_volume`, "
+             "`volumes`) go through `--source-arg key=value`.",
     ),
     source_arg: list[str] = typer.Option(
         None, "--source-arg",
         help="Repeatable `key=value` kwargs forwarded to the source "
              "adapter constructor. Values are parsed as JSON when "
              "possible, plain string otherwise. Example: "
-             "`--source-arg 'languages=[\"eng\"]' --source-arg max_pages_per_volume=4`.",
+             "`--source-arg 'languages=[\"eng\"]' --source-arg pages_per_volume=4 --source-arg volumes=10`.",
     ),
     models: str = typer.Option(
         ..., "--models", "-m", help="Comma-separated profile names."

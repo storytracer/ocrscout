@@ -4,10 +4,12 @@ BHL's open-data S3 bucket (``s3://bhl-open-data/``) holds 305K volumes and
 67M pages — far too large to enumerate. Instead, we read its small TSV
 catalogs (``data/{item,page,title}.txt.gz``), join them with a
 pre-classified copyright lookup hosted on HuggingFace, apply
-rights/language/year filters, cap pages per volume, reservoir-sample the
-result, and only then pull the JPEG-2000 image bytes for the chosen pages.
-The DuckDB query streams the gzipped TSVs directly from disk, so RAM
-stays small even with the full ``page.txt.gz`` (~67M rows) in scope.
+rights/language/year filters, rank volumes (and pages within each)
+deterministically by ``hash(id || seed)``, then fill ``sample_n`` pages
+volume-by-volume up to ``pages_per_volume`` per volume. The JPEG-2000
+image bytes are pulled only for the chosen pages. The DuckDB query
+streams the gzipped TSVs directly from disk, so RAM stays small even
+with the full ``page.txt.gz`` (~67M rows) in scope.
 
 Image URLs follow ``s3://bhl-open-data/images/{BarCode}/{BarCode}_{NNNN}.jp2``;
 OCR URLs follow ``s3://bhl-open-data/ocr/item-{ItemID:06d}/item-{ItemID:06d}-{PageID:08d}-0000.txt``
@@ -99,7 +101,8 @@ class BhlSourceAdapter(SourceAdapter):
         rights: str = "public_domain",
         languages: list[str] | None = None,
         year_range: tuple[int, int] | list[int] | None = None,
-        max_pages_per_volume: int = 8,
+        pages_per_volume: int = 8,
+        volumes: int | None = None,
         cache_dir: str | Path | None = None,
         force_refresh: bool = False,
         storage_options: dict[str, Any] | None = None,
@@ -107,10 +110,24 @@ class BhlSourceAdapter(SourceAdapter):
         copyright_parquet_path: str = COPYRIGHT_PARQUET_PATH,
         **_ignored: Any,
     ) -> None:
+        if "max_pages_per_volume" in _ignored:
+            raise ScoutError(
+                "max_pages_per_volume was renamed to pages_per_volume "
+                "(it is now a target distribution, not just a cap)."
+            )
         if sample <= 0:
             raise ScoutError("BhlSourceAdapter requires sample >= 1")
-        if max_pages_per_volume <= 0:
-            raise ScoutError("BhlSourceAdapter requires max_pages_per_volume >= 1")
+        if pages_per_volume <= 0:
+            raise ScoutError("BhlSourceAdapter requires pages_per_volume >= 1")
+        if volumes is not None:
+            if volumes <= 0:
+                raise ScoutError("BhlSourceAdapter requires volumes >= 1")
+            if volumes * pages_per_volume < sample:
+                raise ScoutError(
+                    f"volumes={volumes} * pages_per_volume={pages_per_volume} "
+                    f"= {volumes * pages_per_volume} < sample={sample}; "
+                    "raise volumes or pages_per_volume, or lower sample."
+                )
         self.sample_n = int(sample)
         self.seed = int(seed)
         self.rights = str(rights)
@@ -129,7 +146,8 @@ class BhlSourceAdapter(SourceAdapter):
             self.year_range: tuple[int, int] | None = (int(yr[0]), int(yr[1]))
         else:
             self.year_range = None
-        self.max_pages_per_volume = int(max_pages_per_volume)
+        self.pages_per_volume = int(pages_per_volume)
+        self.volumes = int(volumes) if volumes is not None else None
         self.cache_dir = Path(cache_dir) if cache_dir else _default_cache_dir()
         self.force_refresh = bool(force_refresh)
         self.storage_options = (
@@ -174,17 +192,27 @@ class BhlSourceAdapter(SourceAdapter):
             rights=self.rights,
             languages=self.languages,
             year_range=self.year_range,
-            max_pages_per_volume=self.max_pages_per_volume,
+            pages_per_volume=self.pages_per_volume,
+            volumes_n=self.volumes,
             sample_n=self.sample_n,
             seed=self.seed,
         )
         self._sample_rows = rows
         self._volumes = _rows_to_volumes(rows)
+        if self.volumes is not None and len(rows) < self.sample_n:
+            log.warning(
+                "BHL sample: only %d page(s) available across the %d "
+                "requested volume(s); requested %d.",
+                len(rows), self.volumes, self.sample_n,
+            )
         log.info(
             "BHL sample: %d page(s) across %d volume(s) "
-            "(rights=%s, languages=%s, year_range=%s, max_per_volume=%d, seed=%d)",
+            "(rights=%s, languages=%s, year_range=%s, "
+            "pages_per_volume=%d, volumes=%s, seed=%d)",
             len(rows), len(self._volumes), self.rights, self.languages,
-            self.year_range, self.max_pages_per_volume, self.seed,
+            self.year_range, self.pages_per_volume,
+            self.volumes if self.volumes is not None else "auto",
+            self.seed,
         )
 
     def _ensure_catalog_file(self, basename: str) -> Path:
@@ -382,11 +410,20 @@ def _run_duckdb_sample(
     rights: str,
     languages: list[str] | None,
     year_range: tuple[int, int] | None,
-    max_pages_per_volume: int,
+    pages_per_volume: int,
+    volumes_n: int | None,
     sample_n: int,
     seed: int,
 ) -> list[dict[str, Any]]:
-    """Run the catalog join + per-volume cap + reservoir sample under DuckDB.
+    """Run the catalog join + volume-grouped fill under DuckDB.
+
+    Strategy: rank every eligible volume by ``hash(ItemID || seed)``, rank
+    pages within each volume the same way, then fill ``sample_n`` rows
+    ordered by ``(vrank, prank)`` after capping per-volume contributions
+    at ``pages_per_volume``. The first volume fills its quota, then the
+    next, and so on — so a ``sample_n=40`` with ``pages_per_volume=4``
+    naturally lands in ~10 volumes (more if some are thin). Pass
+    ``volumes_n`` to hard-cap the candidate volume pool first.
 
     All BHL TSV columns are kept as VARCHAR up front (BHL writes ``\\N``
     for null, which DuckDB's strict schema inference otherwise trips over).
@@ -426,6 +463,8 @@ def _run_duckdb_sample(
         params.extend([year_range[0], year_range[1]])
     where_sql = " AND ".join(where_clauses)
 
+    volumes_limit_sql = f"LIMIT {volumes_n}" if volumes_n is not None else ""
+
     sql = f"""
     WITH eligible AS (
         SELECT
@@ -446,7 +485,7 @@ def _run_duckdb_sample(
           ON c.CopyrightStatus = i.CopyrightStatus
         WHERE {where_sql}
     ),
-    ranked AS (
+    all_pages AS (
         SELECT
             p.PageID,
             p.ItemID,
@@ -460,25 +499,41 @@ def _run_duckdb_sample(
             e.TL2Author,
             e.Language,
             e.Year,
-            e.Rights,
-            ROW_NUMBER() OVER (
-                PARTITION BY p.ItemID
-                ORDER BY hash(p.PageID || CAST({seed} AS VARCHAR))
-            ) AS rn
+            e.Rights
         FROM {_read_tsv(page_path)} AS p
         JOIN eligible e USING (ItemID)
     ),
-    -- Materialize the per-volume cap into its own CTE so the reservoir
-    -- sample below only sees already-capped rows. Inlining the cap into
-    -- the same SELECT as USING SAMPLE causes DuckDB to apply the WHERE
-    -- after the sample (with the window column re-evaluated against the
-    -- sampled subset), and the result drains to zero.
+    volume_pool AS (
+        SELECT
+            ItemID,
+            hash(ItemID || CAST({seed} AS VARCHAR)) AS vrank
+        FROM all_pages
+        GROUP BY ItemID
+    ),
+    selected_volumes AS (
+        SELECT ItemID, vrank
+        FROM volume_pool
+        ORDER BY vrank
+        {volumes_limit_sql}
+    ),
+    ranked AS (
+        SELECT
+            ap.*,
+            sv.vrank,
+            ROW_NUMBER() OVER (
+                PARTITION BY ap.ItemID
+                ORDER BY hash(ap.PageID || CAST({seed} AS VARCHAR))
+            ) AS prank
+        FROM all_pages ap
+        JOIN selected_volumes sv USING (ItemID)
+    ),
     capped AS (
-        SELECT * FROM ranked WHERE rn <= {max_pages_per_volume}
+        SELECT * FROM ranked WHERE prank <= {pages_per_volume}
     )
     SELECT *
     FROM capped
-    USING SAMPLE reservoir({sample_n} ROWS) REPEATABLE({seed});
+    ORDER BY vrank, prank
+    LIMIT {sample_n};
     """
     log.debug("BHL DuckDB sample SQL params=%r", params)
     cursor = conn.execute(sql, params)
