@@ -61,7 +61,7 @@ class DoclingBackend(ModelBackend):
         prefix = f"[{invocation.profile.name}]"
         for i, page in enumerate(runtime_pages, 1):
             t0 = time.perf_counter()
-            log.debug("%s docling page %d/%d %s starting", prefix, i, total, page.page_id)
+            log.debug("%s docling page %d/%d %s starting", prefix, i, total, page.file_id)
             try:
                 with _resolved_image_path(page) as image_path:
                     result = converter.convert(str(image_path))
@@ -74,7 +74,7 @@ class DoclingBackend(ModelBackend):
                 items = len(getattr(doc, "texts", []) or [])
                 log.info(
                     "%s page %d/%d %s ok (%.1fs, %d text items)",
-                    prefix, i, total, page.page_id, elapsed, items,
+                    prefix, i, total, page.file_id, elapsed, items,
                 )
                 yield RawOutput(
                     page_id=page.page_id,
@@ -85,7 +85,7 @@ class DoclingBackend(ModelBackend):
                 elapsed = time.perf_counter() - t0
                 log.warning(
                     "%s page %d/%d %s FAIL (%.1fs): %s",
-                    prefix, i, total, page.page_id, elapsed, e,
+                    prefix, i, total, page.file_id, elapsed, e,
                 )
                 yield RawOutput(
                     page_id=page.page_id,

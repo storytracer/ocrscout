@@ -419,7 +419,7 @@ def _render_page_summary(store: ViewerStore, file_id: str) -> str:
                 title_bits.append(f"— {escape(authors)}")
         head = (
             f'<div class="vol-head">'
-            f'<span class="vol-id">Volume {escape(volume.volume_id)}</span>'
+            f'<span class="vol-id">Volume {escape(volume.barcode)}</span>'
             + (
                 ' · <span class="vol-title">' + " ".join(title_bits) + "</span>"
                 if title_bits else ""

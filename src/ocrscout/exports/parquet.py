@@ -130,7 +130,7 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
         "page_id": record.page.page_id,
         "model": record.model,
         "source_uri": record.page.source_uri,
-        "volume_id": record.page.volume_id,
+        "barcode": record.page.barcode,
         "sequence": record.page.sequence,
         "output_format": record.raw.output_format,
         "document_json": document_json,
@@ -149,7 +149,7 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
 
 def _volume_to_row(volume: Volume) -> dict[str, Any]:
     return {
-        "volume_id": volume.volume_id,
+        "barcode": volume.barcode,
         "title": volume.title,
         "creators_json": json.dumps(volume.creators) if volume.creators else None,
         "language": volume.language,

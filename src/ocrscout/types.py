@@ -31,7 +31,7 @@ class PageImage(BaseModel):
     volume sources, ``{parent_dir}/{filename.ext}`` for flat folder/URL/Hub
     sources. file_id is globally unique within a run.
 
-    ``volume_id`` joins to ``Volume.volume_id`` for sources that group pages
+    ``barcode`` joins to ``Volume.barcode`` for sources that group pages
     into bibliographic units (BHL items, IA items, HathiTrust volumes, IIIF
     manifests). It stays ``None`` for flat sources like ``hf_dataset``.
     """
@@ -45,7 +45,7 @@ class PageImage(BaseModel):
     height: int
     dpi: int | None = None
     source_uri: str | None = None
-    volume_id: str | None = None
+    barcode: str | None = None
     sequence: int | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
 
@@ -61,7 +61,7 @@ class Volume(BaseModel):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    volume_id: str
+    barcode: str
     title: str | None = None
     creators: list[str] = Field(default_factory=list)
     language: str | None = None

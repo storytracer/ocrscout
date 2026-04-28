@@ -436,7 +436,7 @@ def _run_one_model(
             continue
         if raw.error:
             failed += 1
-            log.warning("model %s page %s reported error: %s", model_name, raw.page_id, raw.error)
+            log.warning("model %s page %s reported error: %s", model_name, page.file_id, raw.error)
             continue
         try:
             t_norm0 = time.perf_counter()
@@ -445,7 +445,7 @@ def _run_one_model(
             normalize_seconds = time.perf_counter() - t_norm0
         except NormalizerError as e:
             failed += 1
-            log.warning("normalizer failed for %s/%s: %s", model_name, raw.page_id, e)
+            log.warning("normalizer failed for %s/%s: %s", model_name, page.file_id, e)
             continue
 
         item_count, text_length, markdown, text = _doc_stats(doc)
@@ -457,7 +457,7 @@ def _run_one_model(
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "reference adapter failed for %s/%s: %s",
-                    model_name, raw.page_id, e,
+                    model_name, page.file_id, e,
                 )
 
         page_comparisons: dict[str, ComparisonResult] = {}
@@ -481,7 +481,7 @@ def _run_one_model(
                 except Exception as e:  # noqa: BLE001
                     log.warning(
                         "comparison %s failed for %s/%s: %s",
-                        cmp.name, model_name, raw.page_id, e,
+                        cmp.name, model_name, page.file_id, e,
                     )
                     continue
                 if result is not None:

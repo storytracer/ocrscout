@@ -106,7 +106,7 @@ class PageRow:
 
     file_id: str
     page_id: str
-    volume_id: str | None
+    barcode: str | None
     sequence: int | None
     source_uri: str | None
     models: list[str]
@@ -276,7 +276,7 @@ class ViewerStore:
         raw = next((r for r in self._rows if r["file_id"] == file_id), None)
         if raw is None:
             return None
-        vid = raw.get("volume_id")
+        vid = raw.get("barcode")
         if not vid:
             return None
         return self._volumes.get(str(vid))
@@ -378,7 +378,7 @@ class ViewerStore:
                     "page_id": raw["page_id"],
                     "model": raw["model"],
                     "source_uri": raw.get("source_uri"),
-                    "volume_id": raw.get("volume_id"),
+                    "barcode": raw.get("barcode"),
                     "sequence": raw.get("sequence"),
                     "output_format": raw.get("output_format"),
                     "document_json": raw.get("document_json"),
@@ -419,7 +419,7 @@ class ViewerStore:
             return {}
         out: dict[str, Volume] = {}
         for raw in ds:
-            vid = raw.get("volume_id")
+            vid = raw.get("barcode")
             if not vid:
                 continue
             try:
@@ -431,7 +431,7 @@ class ViewerStore:
             except json.JSONDecodeError:
                 extra = {}
             out[str(vid)] = Volume(
-                volume_id=str(vid),
+                barcode=str(vid),
                 title=raw.get("title"),
                 creators=creators if isinstance(creators, list) else [],
                 language=raw.get("language"),
@@ -458,8 +458,8 @@ class ViewerStore:
             )
             disagreement = self._page_disagreement(rows)
             page_id = rows[0].get("page_id") or file_id
-            volume_id = next(
-                (r.get("volume_id") for r in rows if r.get("volume_id")), None
+            barcode = next(
+                (r.get("barcode") for r in rows if r.get("barcode")), None
             )
             sequence = next(
                 (r.get("sequence") for r in rows if r.get("sequence") is not None),
@@ -471,7 +471,7 @@ class ViewerStore:
                 PageRow(
                     file_id=file_id,
                     page_id=str(page_id),
-                    volume_id=str(volume_id) if volume_id else None,
+                    barcode=str(barcode) if barcode else None,
                     sequence=int(sequence) if sequence is not None else None,
                     source_uri=next(
                         (r["source_uri"] for r in rows if r.get("source_uri")), None

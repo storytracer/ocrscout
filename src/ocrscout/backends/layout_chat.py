@@ -195,7 +195,7 @@ class LayoutChatBackend(ModelBackend):
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "%s page %d/%d %s detector FAIL: %s",
-                log_prefix, page_idx, total_pages, page.page_id, e,
+                log_prefix, page_idx, total_pages, page.file_id, e,
             )
             return RawOutput(
                 page_id=page.page_id,
@@ -207,7 +207,7 @@ class LayoutChatBackend(ModelBackend):
         if not regions:
             log.info(
                 "%s page %d/%d %s no regions detected",
-                log_prefix, page_idx, total_pages, page.page_id,
+                log_prefix, page_idx, total_pages, page.file_id,
             )
             return RawOutput(
                 page_id=page.page_id,
@@ -248,13 +248,13 @@ class LayoutChatBackend(ModelBackend):
         if n_failed:
             log.warning(
                 "%s page %d/%d %s ok (%d/%d regions in %.1fs, %d failed)",
-                log_prefix, page_idx, total_pages, page.page_id,
+                log_prefix, page_idx, total_pages, page.file_id,
                 len(ordered) - n_failed, len(ordered), elapsed, n_failed,
             )
         else:
             log.info(
                 "%s page %d/%d %s ok (%d regions in %.1fs)",
-                log_prefix, page_idx, total_pages, page.page_id,
+                log_prefix, page_idx, total_pages, page.file_id,
                 len(ordered), elapsed,
             )
 

@@ -226,13 +226,13 @@ class BhlSourceAdapter(SourceAdapter):
         filename = f"{bar_code_s}_{sequence:04d}.jp2"
         return PageImage(
             page_id=str(page_id),
-            file_id=f"{item_id}/{filename}",
+            file_id=f"{bar_code_s}/{filename}",
             image=image,
             width=width,
             height=height,
             dpi=dpi,
             source_uri=url,
-            volume_id=str(item_id),
+            barcode=bar_code_s,
             sequence=sequence,
             extra={
                 "BarCode": bar_code_s,
@@ -475,7 +475,7 @@ def _rows_to_volumes(rows: list[dict[str, Any]]) -> list[Volume]:
         author = (row.get("TL2Author") or "").strip()
         volumes.append(
             Volume(
-                volume_id=item_id,
+                barcode=str(bar_code) if bar_code else item_id,
                 title=title or None,
                 creators=[author] if author else [],
                 language=row.get("Language") or None,

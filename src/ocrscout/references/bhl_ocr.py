@@ -59,19 +59,26 @@ class BhlOcrReferenceAdapter(ReferenceAdapter):
         )
 
     def get(self, page: PageImage) -> Reference | None:
-        if page.volume_id is None:
+        if page.barcode is None:
             log.debug(
-                "bhl_ocr: page %r has no volume_id (ItemID); skipping",
+                "bhl_ocr: page %r has no barcode; skipping",
+                page.page_id,
+            )
+            return None
+        item_id_raw = page.extra.get("ItemID")
+        if item_id_raw is None:
+            log.debug(
+                "bhl_ocr: page %r has no ItemID in extra; skipping",
                 page.page_id,
             )
             return None
         try:
-            item_id = int(page.volume_id)
+            item_id = int(item_id_raw)
             page_id = int(page.page_id)
         except (TypeError, ValueError):
             log.warning(
-                "bhl_ocr: page_id=%r / volume_id=%r are not integers; skipping",
-                page.page_id, page.volume_id,
+                "bhl_ocr: page_id=%r / ItemID=%r are not integers; skipping",
+                page.page_id, item_id_raw,
             )
             return None
 

@@ -299,12 +299,12 @@ class VllmBackend(ModelBackend):
                 if raw.error:
                     log.warning(
                         "%s page %d/%d %s FAIL: %s",
-                        prefix, completed, total, page.page_id, raw.error,
+                        prefix, completed, total, page.file_id, raw.error,
                     )
                 else:
                     log.info(
                         "%s page %d/%d %s ok",
-                        prefix, completed, total, page.page_id,
+                        prefix, completed, total, page.file_id,
                     )
 
         elapsed = time.perf_counter() - t0

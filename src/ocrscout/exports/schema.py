@@ -9,10 +9,10 @@ Single source of truth for the column shape, used by:
 All columns are nullable. ``image`` is omitted from the writer schema and is
 appended by the publisher when ``--bundle-images`` is set.
 
-``volume_id`` and ``sequence`` are populated by sources that group pages into
+``barcode`` and ``sequence`` are populated by sources that group pages into
 bibliographic units (BHL, IA, HathiTrust); flat sources like ``hf_dataset``
 leave them ``None``. The companion ``volumes-NNNNN.parquet`` sidecar (one row
-per volume) holds the bibliographic metadata, joinable on ``volume_id``.
+per volume) holds the bibliographic metadata, joinable on ``barcode``.
 
 ``markdown`` is the prediction rendered for human reading; ``text`` is the
 same DoclingDocument flattened to plain text so it's directly comparable to
@@ -38,7 +38,7 @@ from datasets import Features, Value
 RESULTS_FEATURES: Features = Features(
     {
         "file_id": Value("string"),
-        "volume_id": Value("string"),
+        "barcode": Value("string"),
         "sequence": Value("int64"),
         "page_id": Value("string"),
         "text": Value("string"),
@@ -72,7 +72,7 @@ RESULTS_COLUMNS: tuple[str, ...] = tuple(RESULTS_FEATURES.keys())
 
 VOLUMES_FEATURES: Features = Features(
     {
-        "volume_id": Value("string"),
+        "barcode": Value("string"),
         "title": Value("string"),
         "creators_json": Value("string"),
         "language": Value("string"),
