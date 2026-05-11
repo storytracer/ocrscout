@@ -1,6 +1,8 @@
 # ocrscout
 
-**Find the right OCR model for your documents — without spending a week setting them all up.**
+**Find the right OCR model for your documents**
+
+![ocrscout viewer comparing dots-mocr and glm-ocr-layout side-by-side](screenshot.jpg)
 
 ## Why this exists
 
