@@ -121,6 +121,7 @@ def classify_parquet(
     max_tokens: int = 500,
     temperature: float = 0.0,
     gpu_memory_utilization: float = 0.85,
+    max_model_len: int = 16000,
 ) -> None:
     """Classify each row's ``column`` with vLLM and write a new parquet.
 
@@ -135,6 +136,7 @@ def classify_parquet(
     try:
         import pyarrow as pa
         import pyarrow.parquet as pq
+        import torch
         from transformers import AutoTokenizer
         from vllm import LLM, SamplingParams
     except ImportError as e:
@@ -144,6 +146,19 @@ def classify_parquet(
             "`pip install ocrscout[vllm]` (you control the torch / CUDA "
             f"variant). Underlying import error: {e}"
         ) from e
+
+    # Driver preflight. vLLM's own error here ("Device string must not be
+    # empty") is opaque — diagnose first.
+    if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+        raise ScoutError(
+            "No CUDA device visible to torch. Run `nvidia-smi` — if it's "
+            "missing or errors, the Nvidia driver isn't installed/loaded on "
+            "this host. On fresh OVHCloud / generic Ubuntu cloud images "
+            "install with `sudo ubuntu-drivers install` (or your cloud "
+            "provider's GPU setup script) and reboot. If `nvidia-smi` works "
+            "but torch still sees 0 devices, check `CUDA_VISIBLE_DEVICES` "
+            "isn't set to an empty string."
+        )
 
     descriptions = _parse_label_descriptions(label_descriptions)
 
@@ -161,8 +176,9 @@ def classify_parquet(
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
 
     log.info(
-        "[bhl-classify] initializing vLLM with %s (gpu_memory_utilization=%.2f)",
-        model, gpu_memory_utilization,
+        "[bhl-classify] initializing vLLM with %s "
+        "(gpu_memory_utilization=%.2f, max_model_len=%d)",
+        model, gpu_memory_utilization, max_model_len,
     )
     try:
         llm = LLM(
@@ -170,11 +186,18 @@ def classify_parquet(
             trust_remote_code=True,
             dtype="auto",
             gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
         )
     except Exception as e:  # noqa: BLE001
         msg = str(e)
         hint = ""
-        if "Free memory" in msg or "GPU memory utilization" in msg:
+        if "KV cache" in msg or "max seq len" in msg:
+            hint = (
+                f" — KV cache budget too small for max_model_len={max_model_len}. "
+                "On smaller GPUs (≤16 GiB) lower max_model_len; the classifier "
+                "prompt + reasoning output needs ~12K tokens worst-case."
+            )
+        elif "Free memory" in msg or "GPU memory utilization" in msg:
             hint = (
                 " — VRAM headroom too tight. Free GPU memory by killing other "
                 "CUDA processes, or lower the classifier's "

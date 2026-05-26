@@ -136,6 +136,12 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
     # OS shares the GPU pool; bump up on dedicated GPUs to amortize KV
     # cache, lower if other CUDA processes are competing.
     CLASSIFIER_GPU_MEMORY_UTILIZATION: ClassVar[float] = 0.85
+    # vLLM `max_model_len` for the local-runner classifier. Right-sized to
+    # the workload (~1500-token prompt + 10k reasoning tokens), not the
+    # model's default 40960 — that needs 5.62 GiB of KV cache and won't fit
+    # on a 16 GiB GPU after weights + CUDA graphs. Bump only if the
+    # rights-text payloads grow past ~12k tokens.
+    CLASSIFIER_MAX_MODEL_LEN: ClassVar[int] = 16000
     # The classifier prompt. Encodes BHL-specific public-domain signals
     # plus the BHL MOU clause (a positive signal in any field cannot be
     # overridden by another field). Single semicolon-separated string per
@@ -954,6 +960,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             enable_reasoning=True,
             max_tokens=cls.CLASSIFIER_MAX_TOKENS,
             gpu_memory_utilization=cls.CLASSIFIER_GPU_MEMORY_UTILIZATION,
+            max_model_len=cls.CLASSIFIER_MAX_MODEL_LEN,
         )
 
     @classmethod
