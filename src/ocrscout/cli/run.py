@@ -18,11 +18,21 @@ import yaml
 from rich import print as rprint
 from rich.table import Table
 
+from pydantic import ValidationError
+
 from ocrscout import registry
 from ocrscout import state as state_mod
 from ocrscout.cli import app
 from ocrscout.cost import recorder as cost_recorder
-from ocrscout.errors import BackendError, NormalizerError, ProfileNotFound, RunnerError
+from ocrscout.errors import (
+    BackendError,
+    NormalizerError,
+    ProfileNotFound,
+    RegistryError,
+    RunnerError,
+    ScoutError,
+)
+from ocrscout.interfaces.source import SourceAdapter
 from ocrscout.exports.layout import parquet_dest
 from ocrscout.interfaces.comparison import (
     BaselineView,
@@ -267,10 +277,21 @@ def run_pipeline(
     except ProfileNotFound as e:
         raise typer.BadParameter(str(e)) from e
 
+    # Construct the source adapter BEFORE any runner work so that
+    # configuration errors (e.g. BHL without a prior `source bhl setup`)
+    # surface as a typer.BadParameter without first spinning up the
+    # LiteLLM proxy + vLLM serves. Pydantic validators on the adapter
+    # are cheap (sub-millisecond); the actual page iteration is
+    # deferred to `_execute`.
+    try:
+        source = _construct_source(cfg)
+    except (ScoutError, ValidationError, RegistryError) as e:
+        raise typer.BadParameter(str(e)) from e
+
     needs_proxy = any(p.runtime != "cpu" for p in profiles)
     if not needs_proxy:
         log.info("All profiles are runtime=cpu; running CPU-side backends in-process.")
-        _execute(cfg, parallel_models=parallel_models, resume=resume)
+        _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
         return
 
     runner = LocalRunner()
@@ -301,7 +322,7 @@ def run_pipeline(
         raise typer.Exit(code=1) from e
 
     try:
-        _execute(cfg, parallel_models=parallel_models, resume=resume)
+        _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
     finally:
         if not keep_up and not reused_existing:
             try:
@@ -310,9 +331,21 @@ def run_pipeline(
                 log.warning("Runner teardown reported error: %s", e)
 
 
+def _construct_source(cfg: PipelineConfig) -> SourceAdapter:
+    """Resolve and instantiate the source adapter from the pipeline config.
+
+    Pulled into its own helper so callers can fail fast — adapter
+    validators (e.g. BHL's check that ``info.yaml`` is configured) run
+    here, before any expensive runner setup.
+    """
+    source_cls = registry.get("sources", cfg.source.name)
+    return source_cls(**cfg.source.args)
+
+
 def _execute(
     cfg: PipelineConfig,
     *,
+    source: SourceAdapter,
     parallel_models: int = 1,
     resume: bool = False,
 ) -> None:
@@ -327,8 +360,6 @@ def _execute(
         gpu_cfg.type, gpu_cfg.provider, gpu_cfg.cost_per_hour,
     )
 
-    source_cls = registry.get("sources", cfg.source.name)
-    source = source_cls(**cfg.source.args)
     pages_iter = source.iter_pages()
     if cfg.sample is not None:
         pages = list(itertools.islice(pages_iter, cfg.sample))

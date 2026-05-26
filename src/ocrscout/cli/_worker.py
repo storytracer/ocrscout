@@ -67,11 +67,12 @@ def _worker(
     # Local import avoids a circular dependency at module import time:
     # cli.__init__ pulls every cli.* subcommand including this one, and
     # cli.run pulls LocalRunner which transitively pulls this worker.
-    from ocrscout.cli.run import _execute
+    from ocrscout.cli.run import _construct_source, _execute
 
     parallel_models = 1
     try:
-        _execute(cfg, parallel_models=parallel_models)
+        source = _construct_source(cfg)
+        _execute(cfg, source=source, parallel_models=parallel_models)
     except SystemExit:
         _write_job_state(job_dir, status="failed")
         raise
