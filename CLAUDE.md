@@ -36,7 +36,8 @@ Every OCR call flows through the LiteLLM proxy. This gives ocrscout a uniform co
 ocrscout is extended through Abstract Base Classes and Python entry points.
 
 1. Subclass the relevant ABC in [src/ocrscout/interfaces/](src/ocrscout/interfaces/):
-   - `SourceAdapter` — yields `PageImage` objects from somewhere (a directory, an HF dataset, IIIF, PDF). The shipped `hf_dataset` adapter at [src/ocrscout/sources/hf_dataset.py](src/ocrscout/sources/hf_dataset.py) covers local dirs, fsspec URLs (`s3://`, `gs://`, `https://`, `hf://`), and HF Hub repo IDs (`org/dataset`) through one code path — extend it (or write a new adapter) for IIIF, PDF rasterisation, etc. The [`bhl`](src/ocrscout/sources/bhl.py) adapter shows how to handle a catalog-driven corpus (305K volumes, 67M pages on S3). Sources may optionally implement `iter_volumes()` to yield typed `Volume` metadata that lands as a parallel `volumes-*.parquet` sidecar. Sources should also accept `start_idx` / `end_idx` constructor kwargs so SkyPilot/HF workers can take non-overlapping windows of a deterministic sample.
+   - `SourceAdapter` — yields `PageImage` objects from somewhere (a directory, an HF dataset, IIIF, PDF). Concrete sources are Pydantic v2 classes — `class FooSourceAdapter(SourceAdapter, BaseModel)` — with structural constants on the class as `ClassVar`s, validation via `Field(...)` and `@model_validator(mode="after")`, and source-specific admin verbs declared as inner classes (see "Source admin subsystem" below). The shipped `hf_dataset` adapter at [src/ocrscout/sources/hf_dataset.py](src/ocrscout/sources/hf_dataset.py) covers local dirs, fsspec URLs (`s3://`, `gs://`, `https://`, `hf://`), and HF Hub repo IDs (`org/dataset`) through one code path — extend it (or write a new adapter) for IIIF, PDF rasterisation, etc. The [`bhl`](src/ocrscout/sources/bhl.py) adapter shows how to handle a catalog-driven corpus (305K volumes, 67M pages on S3) with cached metadata, per-source `info.yaml`, and inline `Setup`/`Refresh` actions. Sources may optionally implement `iter_volumes()` to yield typed `Volume` metadata that lands as a parallel `volumes-*.parquet` sidecar. Sources should also accept `start_idx` / `end_idx` constructor kwargs so SkyPilot/HF workers can take non-overlapping windows of a deterministic sample.
+   - `SourceAction` — one admin verb for one source (e.g. `setup`, `refresh`, `stats`). Defined as an inner class on its `SourceAdapter`; lists itself on the adapter's `actions: ClassVar[list[type[SourceAction]]]`. CLI auto-generation walks `registry.list("sources")` and surfaces each as `ocrscout source <name> <verb>` via the Pydantic-flags-to-typer bridge at [src/ocrscout/sources/_flags_bridge.py](src/ocrscout/sources/_flags_bridge.py). See "Source admin subsystem" below.
    - `ReferenceAdapter` — returns a `Reference` (text and/or `DoclingDocument`, with typed `provenance`) for a `PageImage`. Note "reference", not "ground truth": most references in the wild are themselves OCR — see "Comparisons subsystem" below.
    - `ModelBackend` — prepares a `BackendInvocation` and runs it, yielding `RawOutput`. Built-ins: `litellm` (every OpenAI-compatible call routed through the LiteLLM proxy — covers both `runtime: vllm` and `runtime: hosted` profiles), `layout_chat` (per-region OCR over the same proxy), `docling`, `tesseract`. Backends that hit the proxy declare `requires_runner: ClassVar[bool] = True`.
    - `Runner` — orchestrates the compute stack (LiteLLM proxy + N vLLM backends) on whatever infrastructure the user picks. Built-ins: `local` (daemonised processes via [src/ocrscout/runners/local.py](src/ocrscout/runners/local.py)), `skypilot` (Kubernetes pool via [src/ocrscout/runners/skypilot.py](src/ocrscout/runners/skypilot.py)), `hf` (HuggingFace Jobs API via [src/ocrscout/runners/hf.py](src/ocrscout/runners/hf.py)). See "Runners" below.
@@ -56,7 +57,7 @@ ocrscout is extended through Abstract Base Classes and Python entry points.
      [project.entry-points."ocrscout.normalizers"]
      my_normalizer = "my_pkg.normalizers:MyNormalizer"
      ```
-     Entry-point groups: `ocrscout.sources`, `ocrscout.references`, `ocrscout.backends`, `ocrscout.runners`, `ocrscout.normalizers`, `ocrscout.exports`, `ocrscout.comparisons`, `ocrscout.comparison_renderers`, `ocrscout.benchmarks`, `ocrscout.reporters`, `ocrscout.layout_detectors`.
+     Entry-point groups: `ocrscout.sources`, `ocrscout.references`, `ocrscout.backends`, `ocrscout.runners`, `ocrscout.normalizers`, `ocrscout.exports`, `ocrscout.comparisons`, `ocrscout.comparison_renderers`, `ocrscout.benchmarks`, `ocrscout.reporters`, `ocrscout.layout_detectors`. Source-specific admin verbs are not a separate entry-point group — they piggy-back on the source by being listed on the adapter's `actions` ClassVar.
    - **In-process**: `from ocrscout import registry; registry.register("normalizers", "my_normalizer", MyNormalizer)`.
 
 Built-in components are registered in [src/ocrscout/registry.py](src/ocrscout/registry.py) and are protected from being shadowed by third-party entry points.
@@ -285,11 +286,44 @@ Reference vs prediction agreement is a first-class concept, with three coupled a
 
 **Entry-point groups**: `ocrscout.comparisons`, `ocrscout.comparison_renderers`. Built-ins are registered in [src/ocrscout/registry.py](src/ocrscout/registry.py); third-party packages add via these groups without touching ocrscout's source tree.
 
-## BHL source adapter quirks
+## Source admin subsystem
 
-The [`bhl`](src/ocrscout/sources/bhl.py) source adapter samples pages by joining BHL's TSV catalogs in DuckDB, then fetches JP2 images from `s3://bhl-open-data/images/{BarCode}/{SequenceOrder:04d}.jp2` and OCR sidecars from `s3://bhl-open-data/ocr/item-{ItemID:06d}/item-{ItemID:06d}-{PageID:08d}-{SequenceOrder:04d}.txt`. Per BHL's own README, a tiny historical minority of items used `_0000.jp2` instead of `_0001.jp2` for the first leaf — empirically not encountered in random sampling (0/100). The adapter trusts the modern convention universally; if a truly-legacy item slips through, the image fetch 404s and the page is cleanly skipped with a warning. Image and OCR sidecars share the same NNNN suffix per item by construction (the OCR pipeline names its output after the input image), so they cannot drift apart within an item — only relative to BHL's logical SequenceOrder, which would shift both by one in the legacy case. If/when a legacy item is empirically observed and matters, the cleanest fix is consulting IA-style scandata XML (BHL hosts it under `bhl-open-data/scandata/`) for authoritative per-leaf metadata.
+Sources have admin concerns that aren't part of the per-page iteration contract — cache provisioning, derived-artifact construction, freshness checks, classifier pipelines. These live as `SourceAction` subclasses **inline on the source adapter** (not in sibling modules) and surface as `ocrscout source <name> <verb>`. The mechanics:
 
-**Partitioning for SkyPilot / HF workers.** The adapter accepts `start_idx` / `end_idx` constructor kwargs that slice the deterministic sample after the DuckDB rank query but before fetching. With every worker receiving the same `(sample, seed, …)` plus a distinct `[start_idx, end_idx)` window, the union is the full deterministic sample with no overlaps. SkyPilot's job YAML computes these from `$SKYPILOT_JOB_RANK` / `$SKYPILOT_NUM_JOBS` in the worker run script (see [src/ocrscout/runners/skypilot.py](src/ocrscout/runners/skypilot.py)).
+- **Per-source `info.yaml`** at `~/.ocrscout/sources/<name>/info.yaml` — a typed Pydantic record (schema in [src/ocrscout/sources/_info.py](src/ocrscout/sources/_info.py)) of what's been provisioned: cache freshness (ETags + `last_refresh` timestamps), pointers to derived HF datasets, intermediate-parquet metadata. Top-level `extra="ignore"` so an older ocrscout reading a newer `info.yaml` survives unknown sections; per-section `extra="forbid"` catches typos.
+- **Per-source cache** at `~/.ocrscout/sources/<name>/{catalog,derived}/`. `catalog/` holds raw upstream data; `derived/` holds intermediate artifacts produced by refresh (e.g. BHL's `volumes.parquet` pre-join). Paths come from [src/ocrscout/sources/_paths.py](src/ocrscout/sources/_paths.py).
+- **`SourceAction` ABC** at [src/ocrscout/interfaces/source_action.py](src/ocrscout/interfaces/source_action.py). Each action declares a Pydantic `Flags` model; the CLI driver at [src/ocrscout/cli/source.py](src/ocrscout/cli/source.py) auto-generates a typer command from the model via [_flags_bridge.py](src/ocrscout/sources/_flags_bridge.py). Action lifecycle (driver-managed): load `info.yaml` → `action.fill_defaults(flags, info)` → `action.run(flags, ctx)` → atomic merge of the returned patch dict back into `info.yaml` (locked via `fcntl.flock` on a sibling `.lock` file).
+- **No hardcoded HF dataset names** anywhere in `sources/`. The user types the dataset id at `setup` or `refresh`; `info.yaml` stores the choice. The error path when nothing is configured names the relevant CLI commands but no specific dataset.
+- **Universal verbs** `info` and `clear` live in the CLI layer and apply to every source automatically.
+
+## BHL source adapter
+
+The [`bhl`](src/ocrscout/sources/bhl.py) adapter samples pages by joining BHL's TSV catalogs in DuckDB, then fetches JP2 images from `s3://bhl-open-data/images/{BarCode}/{SequenceOrder:04d}.jp2` and OCR sidecars from `s3://bhl-open-data/ocr/item-{ItemID:06d}/item-{ItemID:06d}-{PageID:08d}-{SequenceOrder:04d}.txt`. Image and OCR sidecars share the same NNNN suffix per item by construction. Per BHL's own README, a tiny historical minority of items used `_0000.jp2` instead of `_0001.jp2` for the first leaf — empirically not encountered in random sampling (0/100). The adapter trusts the modern convention universally; if a truly-legacy item slips through, the image fetch 404s and the page is cleanly skipped with a warning. If/when a legacy item is empirically observed and matters, the cleanest fix is consulting IA-style scandata XML (BHL hosts it under `bhl-open-data/scandata/`) for authoritative per-leaf metadata.
+
+### Lifecycle
+
+`BhlSourceAdapter` is a Pydantic v2 class with all structural constants as `ClassVar`s (`BUCKET`, `DATA_PREFIX`, `IMAGES_PREFIX`, `JP2_PATTERN`, `CATALOG_FILES`, `COPYRIGHT_PARQUET_PATH`, `COPYRIGHT_JOIN_COLUMNS`, plus the `CLASSIFIER_*` invocation contract). Iteration requires the cache to be provisioned by the inline admin verbs:
+
+| Verb | What it does |
+|---|---|
+| `ocrscout source bhl setup --read-from <dataset>` | Records the rights-classification dataset to read at sample time. Lightweight — no upstream sync. |
+| `ocrscout source bhl refresh --only catalog` | Re-fetches the three TSVs (`item.txt.gz`, `page.txt.gz`, `title.txt.gz`) with per-file ETag invalidation. Pure local. Rebuilds `derived/volumes.parquet`. |
+| `ocrscout source bhl refresh --runner local\|hf --source-repo <repo> --output-repo <repo>` | Full rights pipeline: extract unique 4-field combos from `item.txt.gz` → push to `--source-repo` → classify via the `uv-scripts/classification` UV script (local GPU or HF Jobs) → publish to `--output-repo` → rebuild `derived/volumes.parquet`. `source_repo`/`output_repo` are sticky in `info.yaml`. |
+| `ocrscout source bhl info` / `clear` | Universal: render state / wipe the source dir. |
+
+`iter_pages` errors out if `derived/volumes.parquet` is missing or older than `catalog.last_refresh` — no silent rebuilds; the user runs refresh explicitly.
+
+### Sampling query
+
+[BhlSourceAdapter._run_duckdb_sample_from_volumes](src/ocrscout/sources/bhl.py) reads the pre-joined `derived/volumes.parquet` (~300K rows, ~14MB compressed), applies user filters (rights, languages, year_range) against that small table, ranks each surviving volume by `hash(ItemID || seed)`, ranks pages within each volume the same way, then joins `catalog/page.txt.gz` only for surviving ItemIDs and fills `sample_n` rows volume-by-volume up to `pages_per_volume` per volume. This replaces the previous 4-way TSV+parquet join that ran on every iteration.
+
+### Classifier UV script
+
+The rights-classification pipeline shells out to the community-maintained UV inline script `https://huggingface.co/datasets/uv-scripts/classification/raw/main/classify-dataset.py` via [src/ocrscout/jobs.py](src/ocrscout/jobs.py)'s `run_uv_script(runner=local|hf)`. The classifier prompt, model (`Qwen/Qwen3-4B`), packages (`vllm<0.12.0`, `flashinfer-*`), labels, max-tokens, and HF Jobs flavor all live on `BhlSourceAdapter` as `CLASSIFIER_*` ClassVars — the invocation contract is the BHL adapter's, the script itself is external. `--runner hf` requires `HF_TOKEN` in the env; `--runner local` requires a CUDA GPU.
+
+### Partitioning for SkyPilot / HF workers
+
+The adapter accepts `start_idx` / `end_idx` constructor kwargs that slice the deterministic sample after the DuckDB rank query but before fetching. With every worker receiving the same `(sample, seed, …)` plus a distinct `[start_idx, end_idx)` window, the union is the full deterministic sample with no overlaps. SkyPilot's job YAML computes these from `$SKYPILOT_JOB_RANK` / `$SKYPILOT_NUM_JOBS` in the worker run script (see [src/ocrscout/runners/skypilot.py](src/ocrscout/runners/skypilot.py)).
 
 ## Tests are paused
 
@@ -304,7 +338,7 @@ The project is in rapid-prototyping mode. The previous test suite was deleted (r
 3. **Runner abstraction**: `Runner` ABC; `LocalRunner` with proper daemonisation; `SkyPilotRunner` for K8s pools; `HuggingFaceRunner` for HF Jobs.
 4. **Cost tracking**: in-process LiteLLM `success_callback` → per-page `litellm_cost` / `gpu_time_cost` / tokens / `elapsed_seconds` columns; `ocrscout costs` for DuckDB aggregation.
 5. **Incremental Parquet + checkpoint/resume**: `data/train-NNNNN.parquet` shards + `progress.json` checkpoint; `--resume` filters done pages.
-6. **Flat CLI**: `launch / submit / status / down / logs / run / benchmark / costs / apply` plus the existing `inspect / viewer / introspect / publish`.
+6. **Flat CLI**: `launch / submit / status / down / logs / run / benchmark / costs / apply` plus the existing `inspect / viewer / introspect / publish`. **Two-level for source admin**: `source <name> <verb>` (`setup`, `refresh`, `info`, `clear`, …) — see "Source admin subsystem".
 
 **Open:**
 
