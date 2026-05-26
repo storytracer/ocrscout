@@ -101,18 +101,19 @@ Active runner state lives in `~/.ocrscout/state.yaml` (atomic write via tmp + re
 ### CLI lifecycle
 
 ```bash
-# All-in-one ephemeral run (default --runner local). Auto-launches the
-# stack for any runtime: vllm profile in --models, runs the pipeline,
-# tears down. Pass --keep-up to leave the stack running after.
+# Default: ephemeral. Ctrl-C reliably kills the entire stack — no state
+# is left on disk. Pass --keep-up to use the persistent daemonised
+# path so the stack outlives this invocation for follow-up `submit`s.
 uv run ocrscout run --source ./images/ --models dots-mocr,glm-ocr-layout
 
 # Stateful lifecycle. The CLI is stateless across commands — closing
 # the terminal between them is fine; daemons survive.
 uv run ocrscout launch --models dots-mocr,glm-ocr-layout
-uv run ocrscout status                          # ready / busy / down
+uv run ocrscout status                          # ready / launching / busy / down
 uv run ocrscout submit --source s3://… --output ./out/ --pages 8000 --resume
 uv run ocrscout logs <job-id>                   # tails worker.log
-uv run ocrscout down                            # SIGTERM each PID; cleanup
+uv run ocrscout down                            # SIGTERM each recorded PID
+uv run ocrscout down --force                    # …plus port-scan for orphans
 
 # Switch runner with --runner. State file records which one is active.
 uv run ocrscout launch --runner skypilot --gpu L4 --workers 3 \
@@ -120,14 +121,32 @@ uv run ocrscout launch --runner skypilot --gpu L4 --workers 3 \
 uv run ocrscout submit --source s3://… --output s3://… --pages 8000 --num-jobs 10
 ```
 
-### LocalRunner lifecycle
+### LocalRunner lifecycle: persistent vs ephemeral
 
-[src/ocrscout/runners/local.py](src/ocrscout/runners/local.py) drives the local stack:
+[src/ocrscout/runners/local.py](src/ocrscout/runners/local.py) drives the local stack in one of two modes, selected by the `persistent: bool = True` kwarg on `LocalRunner.launch()`:
 
-- **Daemonisation** ([src/ocrscout/runners/_daemon.py](src/ocrscout/runners/_daemon.py)): classic UNIX double-fork — parent forks first child, first child `setsid`s + forks grandchild, grandchild `execvp`s the target command. The grandchild's parent is now init/launchd, so the OS auto-reaps on exit (no zombies, `pid_alive()` reports accurate state). Each daemon writes its PID atomically to `~/.ocrscout/pids/<name>.pid` and its stdout/stderr (line-buffered) to `~/.ocrscout/logs/<name>.log`. PR_SET_PDEATHSIG is **not** used — the whole point of daemonisation is that the daemon outlives the launching ocrscout process.
-- **Launch sequence**: KV-budget preflight (`_preflight_kv_budgets` in [src/ocrscout/runners/_preflight.py](src/ocrscout/runners/_preflight.py)) → spawn one `vllm serve` daemon per `runtime: vllm` profile on consecutive ports starting from `--base-port` (default 8000) → wait for each `/v1/models` to return 200 → write `~/.ocrscout/litellm.yaml` with the model_list (one entry per `runtime: vllm` profile pointing at its local serve, one per `runtime: hosted` profile pointing at the provider) → spawn the LiteLLM proxy daemon on `--proxy-port` (default 4000) → wait for `/health/liveliness` → write `state.yaml` atomically. Any failure mid-launch terminates everything that was spawned so far so we don't leak GPU memory or ports.
-- **Reuse**: `LocalRunner.launch(models=…)` is idempotent — if the current state.yaml matches the requested model set + ports, it returns the existing handle without spawning anything new. `ocrscout run` uses this so back-to-back invocations on the same models pay the launch cost once.
-- **Teardown** (`down()`): SIGTERM each PID's process group (10s grace), then SIGKILL fallback; remove state.yaml; leave logs.
+**Persistent** (`ocrscout launch`, `ocrscout run --keep-up`). Each child is spawned via classic UNIX double-fork in [src/ocrscout/runners/_daemon.py](src/ocrscout/runners/_daemon.py) (parent → first child `setsid`s + forks grandchild → grandchild `execvp`s the target). The grandchild is reparented to init/launchd so it survives terminal close; the OS auto-reaps on exit (no zombies; `pid_alive()` reports accurate state). PIDs land atomically in `~/.ocrscout/pids/<name>.pid`; stdout/stderr go to `~/.ocrscout/logs/<name>.log`. The lifecycle is recorded in `state.yaml` via a `phase` field:
+
+1. **Preflight done.** Write `state.yaml` with `phase: launching` + empty `processes` BEFORE any spawn. The crash breadcrumb — anything short of `phase: ready` on disk means the launcher didn't finish.
+2. **Per-daemon spawn + readiness + PID correction.** For each `vllm serve` and the LiteLLM proxy: daemonise → wait for `/v1/models` (or `/health/liveliness` for the proxy) → query the **actual** port-listener PID via [src/ocrscout/runners/_ports.py](src/ocrscout/runners/_ports.py)`:resolve_listener_pid` and rewrite the recorded PID + PID file. The correction step is load-bearing because `uv run --with vllm -- vllm serve` exits its transient resolver subprocess before the real Python server is up; the PID `execvp` recorded points at a dead transient by the time `/v1/models` answers. After correction, the `ManagedProcess` is appended to `state.processes` and the state file is atomically rewritten (incremental per-daemon).
+3. **Atomic flip to ready.** After every health check passes and every PID is corrected, `state.yaml` is rewritten with `phase: ready` — the only success indicator.
+
+PR_SET_PDEATHSIG is **not** used on the persistent path — by design the daemons outlive the launching ocrscout process. `ocrscout status` reading `phase: launching` with a `phase_updated_at` older than ~15 min (1.5× the default ready_timeout) flags a crashed launcher and recommends `ocrscout down --force`.
+
+**Ephemeral** (`ocrscout run` default, `ocrscout apply` as the SkyPilot/HF worker entry). Each child is spawned by [src/ocrscout/runners/_ephemeral.py](src/ocrscout/runners/_ephemeral.py)`:EphemeralStack` via `subprocess.Popen`. Four layers of defense in depth tie child fate to this process:
+
+1. **`PR_SET_PDEATHSIG=SIGTERM`** set in each child's preexec_fn via ctypes-bound `prctl`. The kernel SIGTERMs the child the instant its parent dies. Linux only — no-op on macOS.
+2. **`start_new_session=True`** on every Popen so the controlling terminal's Ctrl-C doesn't double-deliver. The orchestrator owns the signal and propagates explicit termination.
+3. **`atexit` registration** that calls `terminate_all()` (reverse-order SIGTERM → 10s grace → SIGKILL on each process group). Catches clean exits from non-signal paths.
+4. **SIGINT/SIGTERM/SIGHUP handlers** that call `terminate_all()` synchronously before re-raising. Handlers are installed lazily on first spawn and restored on teardown.
+
+The ephemeral path writes **nothing** under `~/.ocrscout/state.yaml` or `~/.ocrscout/pids/`. Log files still land in `~/.ocrscout/logs/` so `ocrscout logs` can tail them while the run is live. As a direct consequence, `ocrscout submit` after an ephemeral `run` cleanly errors with "no active stack" — submit is stateful and ephemeral runs opt out.
+
+This bifurcation closes a class of bugs where Ctrl-C during a `ocrscout run` left orphaned vLLM children holding GPU memory: with PDEATHSIG, the leaf vllm-serve dies regardless of which intermediate `uv run` wrapper Python recorded as the immediate child.
+
+**Reuse**: `LocalRunner.launch(models=…)` reads `state.yaml` first. If a persistent stack is already up and matches the requested models + proxy port (and `phase == "ready"`), it returns the existing handle without spawning anything — for both the persistent and ephemeral branches. `ocrscout run` skips its `finally` teardown via `reused_existing` so a `launch` followed by `run` doesn't leave the stack down. A mismatch errors out with a hint to call `ocrscout down`.
+
+**Teardown** (`down()`): the in-memory `EphemeralStack` is terminated first when present (ephemeral path). Otherwise the persistent path flips `phase: tearing_down`, then walks `state.processes` in reverse order (proxy first, then upstreams) SIGTERMing each PID's process group with 10s grace + SIGKILL fallback, clears PID files, and removes `state.yaml`. With `--force`, an additional belt-and-suspenders port scan (`_down_by_port_scan`) enumerates listeners on the LiteLLM (4000) and vLLM (8000-8031) port ranges via [_ports.py](src/ocrscout/runners/_ports.py)`:listeners_on_ports` and SIGTERMs each one. `--force` works whether or not `state.yaml` exists; use it after a Ctrl-C'd run, an OOM-killed orchestrator, or any suspected leak.
 
 ### Per-profile KV cache budgets
 

@@ -1,23 +1,37 @@
-"""LocalRunner: vLLM + LiteLLM as daemonised processes on this machine.
+"""LocalRunner: vLLM + LiteLLM as locally-managed processes.
 
-For development, testing, and single-GPU work (DGX Spark, workstation).
-Spawns one ``vllm serve`` per ``runtime: vllm`` profile and one LiteLLM
-proxy that fronts them all under ``localhost:<proxy_port>``. PIDs land in
-``~/.ocrscout/pids/`` and logs in ``~/.ocrscout/logs/`` so subsequent CLI
-invocations can ``status`` / ``logs`` / ``down`` without keeping the
-launching shell open.
+Two lifecycle modes, selected by the ``persistent`` kwarg on ``launch``:
 
-``runtime: hosted`` profiles are added to the LiteLLM model_list (so the
-proxy knows how to route their calls) but spawn nothing locally — they
-forward to the provider API via LiteLLM's built-in routing.
+**Persistent** (``persistent=True``, default — used by ``ocrscout launch``
+and ``ocrscout run --keep-up``). Each child is spawned via classic UNIX
+double-fork in :mod:`ocrscout.runners._daemon` and reparented to init,
+so the stack survives terminal close. PIDs land in ``~/.ocrscout/pids/``
+and logs in ``~/.ocrscout/logs/``. ``state.yaml`` tracks a ``phase``
+field (``launching`` → ``ready`` → ``tearing_down``) so a Ctrl-C
+mid-launch leaves a detectable breadcrumb. After each readiness probe
+passes, the runner queries the actual port listener PID via
+:func:`ocrscout.runners._ports.resolve_listener_pid` and rewrites the
+recorded PID — necessary because ``uv run --with vllm -- vllm serve``
+exits its transient resolver subprocess before the real server is up.
+
+**Ephemeral** (``persistent=False`` — used by default ``ocrscout run``
+and ``ocrscout apply``). Each child is spawned by
+:class:`ocrscout.runners._ephemeral.EphemeralStack` via
+``subprocess.Popen`` with ``PR_SET_PDEATHSIG=SIGTERM`` on Linux plus
+atexit + signal handlers as cross-platform fallback. The stack dies
+when this Python process dies. NO ``state.yaml`` is written; NO PID
+files. ``ocrscout submit`` after an ephemeral run errors cleanly with
+"no active stack" — submit is stateful, ephemeral opts out.
+
+``runtime: hosted`` profiles are added to the LiteLLM model_list (so
+the proxy knows how to route their calls) but spawn nothing locally —
+they forward to the provider API via LiteLLM's built-in routing.
 
 ``runtime: cpu`` profiles aren't touched here; their backends run
 in-process via the dispatcher and don't go through the proxy.
 
-``submit()`` is intentionally a no-op stub in Phase 1: page dispatch
-still flows through ``ocrscout run`` for now. Phase 1 step 6 wires
-``submit`` to a daemonised worker process and adds the new ``submit``
-CLI command.
+``submit()`` daemonises an ``ocrscout _worker`` process — it requires a
+persistent stack (raises ``RunnerError`` if state.yaml is missing).
 """
 
 from __future__ import annotations
@@ -43,6 +57,7 @@ from ocrscout.errors import RunnerError
 from ocrscout.exports.layout import find_parquet_files
 from ocrscout.interfaces.runner import Runner
 from ocrscout.profile import ModelProfile, effective_vllm_engine_args, resolve
+from ocrscout.runners import _ephemeral, _ports
 from ocrscout.runners._daemon import (
     daemonize_subprocess,
     pid_alive,
@@ -67,6 +82,7 @@ _DEFAULT_PROXY_PORT = 4000
 _DEFAULT_GPU_BUDGET = 0.85
 _DEFAULT_READY_TIMEOUT = 600.0
 _LITELLM_VERSION_SPEC = ">=1.50.0"
+_PORT_SCAN_RANGE = 32  # how many vLLM ports past base_port to scan in --force
 
 # vLLM args owned by the runner (port + GPU memory cap come from launch
 # context, not the profile); everything else flows from
@@ -75,10 +91,17 @@ _OWNED_ENGINE_KEYS = frozenset({"gpu_memory_utilization", "port"})
 
 
 class LocalRunner(Runner):
-    """Daemonised vLLM + LiteLLM stack on this machine."""
+    """Local vLLM + LiteLLM stack (persistent daemonised or ephemeral)."""
 
     name = "local"
     requires_local_gpu: ClassVar[bool] = True
+
+    def __init__(self) -> None:
+        super().__init__()
+        # Reference to an in-process EphemeralStack when ``launch`` was
+        # called with ``persistent=False`` on this instance. None for
+        # persistent launches and after a successful ``down``.
+        self._ephemeral_stack: _ephemeral.EphemeralStack | None = None
 
     def launch(
         self,
@@ -90,6 +113,7 @@ class LocalRunner(Runner):
         proxy_port: int = _DEFAULT_PROXY_PORT,
         gpu_budget: float = _DEFAULT_GPU_BUDGET,
         ready_timeout: float = _DEFAULT_READY_TIMEOUT,
+        persistent: bool = True,
         **_: Any,
     ) -> RunnerHandle:
         if not models:
@@ -109,12 +133,34 @@ class LocalRunner(Runner):
                 f"with a different config."
             )
 
+        if persistent:
+            return self._launch_persistent(
+                models=models, gpu_type=gpu_type, base_port=base_port,
+                proxy_port=proxy_port, gpu_budget=gpu_budget,
+                ready_timeout=ready_timeout,
+            )
+        return self._launch_ephemeral(
+            models=models, gpu_type=gpu_type, base_port=base_port,
+            proxy_port=proxy_port, gpu_budget=gpu_budget,
+            ready_timeout=ready_timeout,
+        )
+
+    # --- persistent path -----------------------------------------------------
+
+    def _launch_persistent(
+        self,
+        *,
+        models: list[str],
+        gpu_type: str | None,
+        base_port: int,
+        proxy_port: int,
+        gpu_budget: float,
+        ready_timeout: float,
+    ) -> RunnerHandle:
         profiles = [resolve(name) for name in models]
         vllm_profiles = [p for p in profiles if p.runtime == "vllm"]
         hosted_profiles = [p for p in profiles if p.runtime == "hosted"]
 
-        # Allocate ports up front so failed spawns don't leave port-shifting
-        # ambiguity on re-launch.
         vllm_ports = _allocate_ports(base_port, len(vllm_profiles))
         gpu_caps: dict[str, float] = {}
 
@@ -122,47 +168,19 @@ class LocalRunner(Runner):
             summary, gpu_caps = preflight_kv_budgets(vllm_profiles, gpu_budget)
             log.info(summary)
 
-        processes: list[ManagedProcess] = []
-        try:
-            for profile, port in zip(vllm_profiles, vllm_ports):
-                proc = _spawn_vllm_serve(
-                    profile=profile,
-                    port=port,
-                    gpu_memory_utilization=gpu_caps[profile.name],
-                )
-                processes.append(proc)
-
-            log.info(
-                "Spawned %d vllm-serve daemon(s); waiting up to %.0fs for ready",
-                len(processes), ready_timeout,
-            )
-            _wait_all_ready_serves(processes, ready_timeout)
-
-            litellm_proc = _spawn_litellm_proxy(
-                vllm_profiles=vllm_profiles,
-                vllm_ports=vllm_ports,
-                hosted_profiles=hosted_profiles,
-                proxy_port=proxy_port,
-            )
-            processes.append(litellm_proc)
-            log.info("Spawned litellm proxy; waiting for ready")
-            _wait_proxy_ready(proxy_port, ready_timeout)
-        except BaseException:
-            # If anything fails mid-launch, terminate whatever we spawned
-            # so we don't leak GPU memory or ports.
-            for proc in processes:
-                if proc.pid is not None:
-                    terminate(proc.pid)
-            raise
-
-        proxy_url = f"http://localhost:{proxy_port}/v1"
         gpu_cfg = _gpu_config_for_launch(gpu_type)
+        proxy_url = f"http://localhost:{proxy_port}/v1"
 
+        # Write the crash breadcrumb BEFORE any spawn. An empty
+        # ``processes`` list at this point is intentional — phase ==
+        # 'launching' means "do not trust these PIDs"; subsequent
+        # ``update_state_processes`` calls append corrected entries as
+        # daemons come up.
         state = RunnerStateFile(
             runner=self.name,
             models=models,
             proxy_url=proxy_url,
-            processes=processes,
+            processes=[],
             gpu=gpu_cfg,
             launched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             args={
@@ -171,9 +189,146 @@ class LocalRunner(Runner):
                 "gpu_budget": gpu_budget,
             },
         )
-        state_mod.write_state(state)
-        log.info("LocalRunner ready: proxy=%s  models=%s", proxy_url, ",".join(models))
+        state_mod.write_state_launching(state)
+
+        try:
+            for profile, port in zip(vllm_profiles, vllm_ports):
+                proc = _spawn_vllm_serve(
+                    profile=profile,
+                    port=port,
+                    gpu_memory_utilization=gpu_caps[profile.name],
+                )
+                log.info(
+                    "Spawned vllm serve for %s on port %d (initial pid=%d); "
+                    "awaiting readiness",
+                    profile.name, port, proc.pid or -1,
+                )
+                _wait_one(
+                    url=f"http://localhost:{port}/v1/models",
+                    pid=proc.pid,
+                    label=proc.name,
+                    log_path=Path(proc.log_path) if proc.log_path else None,
+                    deadline=time.monotonic() + ready_timeout,
+                )
+                _correct_recorded_pid(proc, port=port)
+                state.processes.append(proc)
+                state_mod.update_state_processes(state)
+
+            log.info("Spawned %d vllm-serve daemon(s); spawning litellm proxy",
+                     len(vllm_profiles))
+
+            _write_litellm_config(
+                vllm_profiles=vllm_profiles,
+                vllm_ports=vllm_ports,
+                hosted_profiles=hosted_profiles,
+            )
+            litellm_proc = _spawn_litellm_proxy(proxy_port=proxy_port)
+            log.info("Spawned litellm proxy (initial pid=%d); awaiting readiness",
+                     litellm_proc.pid or -1)
+            _wait_one(
+                url=f"http://localhost:{proxy_port}/health/liveliness",
+                pid=litellm_proc.pid,
+                label=litellm_proc.name,
+                log_path=Path(litellm_proc.log_path) if litellm_proc.log_path else None,
+                deadline=time.monotonic() + ready_timeout,
+            )
+            _correct_recorded_pid(litellm_proc, port=proxy_port)
+            state.processes.append(litellm_proc)
+            state_mod.update_state_processes(state)
+        except BaseException:
+            # Mid-launch failure: terminate whatever we spawned so we
+            # don't leak GPU memory or ports. The crash breadcrumb
+            # (phase='launching') is left on disk so the user can run
+            # `ocrscout down --force` if our cleanup itself was
+            # interrupted.
+            for proc in state.processes:
+                if proc.pid is not None:
+                    terminate(proc.pid)
+            raise
+
+        state_mod.mark_phase_ready(state)
+        log.info("LocalRunner ready: proxy=%s  models=%s",
+                 proxy_url, ",".join(models))
         return _handle_from_state(state)
+
+    # --- ephemeral path ------------------------------------------------------
+
+    def _launch_ephemeral(
+        self,
+        *,
+        models: list[str],
+        gpu_type: str | None,
+        base_port: int,
+        proxy_port: int,
+        gpu_budget: float,
+        ready_timeout: float,
+    ) -> RunnerHandle:
+        profiles = [resolve(name) for name in models]
+        vllm_profiles = [p for p in profiles if p.runtime == "vllm"]
+        hosted_profiles = [p for p in profiles if p.runtime == "hosted"]
+        vllm_ports = _allocate_ports(base_port, len(vllm_profiles))
+
+        gpu_caps: dict[str, float] = {}
+        if vllm_profiles:
+            summary, gpu_caps = preflight_kv_budgets(vllm_profiles, gpu_budget)
+            log.info(summary)
+
+        stack = _ephemeral.EphemeralStack()
+        self._ephemeral_stack = stack
+
+        try:
+            for profile, port in zip(vllm_profiles, vllm_ports):
+                cmd = _vllm_serve_cmd(
+                    profile=profile, port=port,
+                    gpu_memory_utilization=gpu_caps[profile.name],
+                )
+                log_path = state_mod.log_dir() / f"vllm-{_safe(profile.name)}.log"
+                stack.spawn(cmd, name=f"vllm-{_safe(profile.name)}",
+                            log_path=log_path, port=port)
+                log.info(
+                    "Ephemeral vllm serve for %s on port %d (pid=%d); "
+                    "awaiting readiness",
+                    profile.name, port, stack.processes[-1].popen.pid,
+                )
+                _wait_one(
+                    url=f"http://localhost:{port}/v1/models",
+                    pid=stack.processes[-1].popen.pid,
+                    label=stack.processes[-1].name,
+                    log_path=log_path,
+                    deadline=time.monotonic() + ready_timeout,
+                )
+
+            _write_litellm_config(
+                vllm_profiles=vllm_profiles,
+                vllm_ports=vllm_ports,
+                hosted_profiles=hosted_profiles,
+            )
+            litellm_cmd = _litellm_proxy_cmd(proxy_port=proxy_port)
+            litellm_log = state_mod.log_dir() / "litellm.log"
+            stack.spawn(litellm_cmd, name="litellm",
+                        log_path=litellm_log, port=proxy_port)
+            log.info(
+                "Ephemeral litellm proxy (pid=%d); awaiting readiness",
+                stack.processes[-1].popen.pid,
+            )
+            _wait_one(
+                url=f"http://localhost:{proxy_port}/health/liveliness",
+                pid=stack.processes[-1].popen.pid,
+                label="litellm",
+                log_path=litellm_log,
+                deadline=time.monotonic() + ready_timeout,
+            )
+        except BaseException:
+            stack.terminate_all()
+            self._ephemeral_stack = None
+            raise
+
+        proxy_url = f"http://localhost:{proxy_port}/v1"
+        log.info("LocalRunner ephemeral ready: proxy=%s  models=%s",
+                 proxy_url, ",".join(models))
+        return _handle_from_ephemeral_stack(stack, proxy_url, models)
+
+    # --- submit / status / logs / down --------------------------------------
 
     def submit(
         self,
@@ -204,8 +359,6 @@ class LocalRunner(Runner):
             encoding="utf-8",
         )
 
-        # Persist initial job metadata so `ocrscout status` reflects the
-        # submission even before the worker writes its first heartbeat.
         (job_dir / "state.yaml").write_text(
             yaml.safe_dump(
                 {
@@ -218,9 +371,6 @@ class LocalRunner(Runner):
             encoding="utf-8",
         )
 
-        # Daemonise ``ocrscout _worker --job <id>``. Use the same
-        # interpreter / module entry point ocrscout was invoked with so
-        # we don't pin a particular venv path.
         ocrscout_cmd = _ocrscout_invocation()
         cmd = [*ocrscout_cmd, "_worker", "--job", job_id]
         pid = daemonize_subprocess(
@@ -229,10 +379,6 @@ class LocalRunner(Runner):
             pid_path=job_dir / "worker.pid",
         )
 
-        # Update state.yaml's output_dir on the very first submit so
-        # subsequent ``status`` calls know where to count rows. Subsequent
-        # submits in the same launch reuse the same output_dir or set a
-        # new one; we record whatever this submit pointed at.
         state.output_dir = str(config.output_dir) if config.output_dir else state.output_dir
         state_mod.write_state(state)
 
@@ -265,15 +411,25 @@ class LocalRunner(Runner):
         if state.output_dir:
             pages_done, cumulative_cost = _count_pages_and_cost(Path(state.output_dir))
 
+        if state.phase == "ready":
+            health = "ready" if all_alive else "error"
+        elif state.phase == "launching":
+            health = "launching"
+        else:
+            health = "tearing_down"
+
         return RunnerStatus(
             runner=self.name,
-            state="ready" if all_alive else "error",
+            state=health,
             models=state.models,
             proxy_url=state.proxy_url,
             uptime_seconds=oldest_uptime,
             pages_done=pages_done,
             cumulative_cost=cumulative_cost,
             details={
+                "phase": state.phase,
+                "phase_updated_at": state.phase_updated_at,
+                "stale_launching": state_mod.is_stale_launching(state),
                 "processes": [
                     {
                         "name": p.name,
@@ -308,15 +464,31 @@ class LocalRunner(Runner):
             return
         _tail_files(targets, follow=follow)
 
-    def down(self) -> None:
+    def down(self, *, force: bool = False, **_: Any) -> None:
+        # In-process ephemeral stack? Terminate via the Popen tree.
+        if self._ephemeral_stack is not None:
+            self._ephemeral_stack.terminate_all()
+            self._ephemeral_stack = None
+            return
+
         state = state_mod.read_state()
         if state is None or state.runner != self.name:
-            log.info("LocalRunner: nothing to tear down")
+            if force:
+                self._down_by_port_scan(
+                    base_port=_DEFAULT_BASE_PORT, proxy_port=_DEFAULT_PROXY_PORT,
+                )
+            else:
+                log.info("LocalRunner: nothing to tear down")
             return
-        # Reverse order: proxy first, then upstreams. Matches the original
-        # context-manager teardown ordering so partial failures during the
-        # window when only some upstreams have shut down don't surface as
-        # "model X gone from proxy".
+
+        # Mark teardown in progress so a concurrent `status` poll doesn't
+        # try to reuse a half-killed stack.
+        state.phase = "tearing_down"
+        state_mod.update_state_processes(state)
+
+        # Reverse order matches the original context-manager teardown
+        # ordering: proxy first, then upstreams. Partial-failure windows
+        # don't surface "model X gone from proxy" errors.
         for proc in reversed(state.processes):
             if proc.pid is None:
                 continue
@@ -327,23 +499,50 @@ class LocalRunner(Runner):
                     pid_path.unlink()
                 except FileNotFoundError:
                     pass
+
+        if force:
+            self._down_by_port_scan(
+                base_port=_DEFAULT_BASE_PORT, proxy_port=_DEFAULT_PROXY_PORT,
+            )
+
         state_mod.clear_state()
         log.info("LocalRunner: torn down")
+
+    def _down_by_port_scan(self, *, base_port: int, proxy_port: int) -> None:
+        """Belt-and-suspenders: SIGTERM anything listening on the runner's
+        default port range, regardless of whether ``state.yaml`` recorded
+        it. Used by ``ocrscout down --force`` to recover from launches
+        whose state.yaml never reached ``phase: ready``.
+        """
+        scan_ports = [proxy_port] + list(
+            range(base_port, base_port + _PORT_SCAN_RANGE)
+        )
+        listeners = _ports.listeners_on_ports(scan_ports)
+        if not listeners:
+            log.info("Port scan: no orphan listeners on %s", scan_ports)
+            return
+        log.warning(
+            "Port scan: found orphan listeners %s — terminating",
+            listeners,
+        )
+        for port in listeners:
+            _ports.kill_listener_on_port(port)
 
 
 # --- spawn helpers ---------------------------------------------------------
 
 
-def _spawn_vllm_serve(
+def _vllm_serve_cmd(
     *,
     profile: ModelProfile,
     port: int,
     gpu_memory_utilization: float,
-) -> ManagedProcess:
-    name = _proc_name("vllm", profile.name)
-    pid_path = state_mod.pid_dir() / f"{name}.pid"
-    log_path = state_mod.log_dir() / f"{name}.log"
+) -> list[str]:
+    """Build the ``uv run … -- vllm serve …`` argv for ``profile``.
 
+    Shared by the persistent and ephemeral paths so both produce
+    identical processes.
+    """
     cmd: list[str] = [
         "uv", "run",
         "--with", f"vllm{profile.vllm_version}",
@@ -353,21 +552,32 @@ def _spawn_vllm_serve(
         "--gpu-memory-utilization", f"{gpu_memory_utilization:.4f}",
     ]
     cmd += _engine_args_to_cli(effective_vllm_engine_args(profile))
-
-    log.debug("daemonising %s on port %d -> %s", name, port, log_path)
-    pid = daemonize_subprocess(cmd, log_path=log_path, pid_path=pid_path)
-    return ManagedProcess(
-        name=name, pid=pid, port=port, log_path=str(log_path)
-    )
+    return cmd
 
 
-def _spawn_litellm_proxy(
+def _litellm_proxy_cmd(*, proxy_port: int) -> list[str]:
+    """Build the ``uv run … -- litellm --config … --port …`` argv.
+
+    Caller is responsible for having written the config file via
+    :func:`_write_litellm_config` first.
+    """
+    return [
+        "uv", "run",
+        "--with", f"litellm[proxy]{_LITELLM_VERSION_SPEC}",
+        "--", "litellm",
+        "--config", str(state_mod.litellm_config_path()),
+        "--port", str(proxy_port),
+        "--num_workers", "1",
+    ]
+
+
+def _write_litellm_config(
     *,
     vllm_profiles: Sequence[ModelProfile],
     vllm_ports: Sequence[int],
     hosted_profiles: Sequence[ModelProfile],
-    proxy_port: int,
-) -> ManagedProcess:
+) -> Path:
+    """Render the LiteLLM proxy config to disk. Shared by both paths."""
     config_path = state_mod.litellm_config_path()
     model_list: list[dict[str, Any]] = []
 
@@ -385,10 +595,9 @@ def _spawn_litellm_proxy(
 
     for profile in hosted_profiles:
         # Hosted entries trust the profile's ``model_id`` to be in
-        # LiteLLM's expected ``provider/<id>`` form (e.g. ``gemini/...``,
-        # ``anthropic/...``). The provider-native API key comes from the
-        # user's environment (``GEMINI_API_KEY`` etc.) and LiteLLM picks
-        # it up automatically.
+        # LiteLLM's expected ``provider/<id>`` form (e.g. ``gemini/...``).
+        # The provider-native API key comes from the user's environment
+        # (``GEMINI_API_KEY`` etc.) and LiteLLM picks it up automatically.
         params: dict[str, Any] = {"model": profile.model_id}
         params.update(profile.backend_args or {})
         entry: dict[str, Any] = {"model_name": profile.name, "litellm_params": params}
@@ -400,19 +609,34 @@ def _spawn_litellm_proxy(
     config = {"model_list": model_list}
     config_path.parent.mkdir(parents=True, exist_ok=True)
     config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+    return config_path
 
+
+def _spawn_vllm_serve(
+    *,
+    profile: ModelProfile,
+    port: int,
+    gpu_memory_utilization: float,
+) -> ManagedProcess:
+    """Persistent-path spawn: daemonise ``vllm serve`` via double-fork."""
+    name = _proc_name("vllm", profile.name)
+    pid_path = state_mod.pid_dir() / f"{name}.pid"
+    log_path = state_mod.log_dir() / f"{name}.log"
+    cmd = _vllm_serve_cmd(
+        profile=profile, port=port,
+        gpu_memory_utilization=gpu_memory_utilization,
+    )
+    log.debug("daemonising %s on port %d -> %s", name, port, log_path)
+    pid = daemonize_subprocess(cmd, log_path=log_path, pid_path=pid_path)
+    return ManagedProcess(name=name, pid=pid, port=port, log_path=str(log_path))
+
+
+def _spawn_litellm_proxy(*, proxy_port: int) -> ManagedProcess:
+    """Persistent-path spawn: daemonise the LiteLLM proxy via double-fork."""
     name = "litellm"
     pid_path = state_mod.pid_dir() / f"{name}.pid"
     log_path = state_mod.log_dir() / f"{name}.log"
-
-    cmd = [
-        "uv", "run",
-        "--with", f"litellm[proxy]{_LITELLM_VERSION_SPEC}",
-        "--", "litellm",
-        "--config", str(config_path),
-        "--port", str(proxy_port),
-        "--num_workers", "1",
-    ]
+    cmd = _litellm_proxy_cmd(proxy_port=proxy_port)
     log.debug("daemonising litellm proxy on port %d -> %s", proxy_port, log_path)
     pid = daemonize_subprocess(cmd, log_path=log_path, pid_path=pid_path)
     return ManagedProcess(
@@ -444,36 +668,45 @@ def _engine_args_to_cli(engine_args: dict) -> list[str]:
     return out
 
 
-# --- readiness probes ------------------------------------------------------
+# --- PID correction --------------------------------------------------------
 
 
-def _wait_all_ready_serves(processes: Sequence[ManagedProcess], timeout: float) -> None:
-    """Wait until every vllm-serve daemon's ``/v1/models`` returns 200."""
-    deadline = time.monotonic() + timeout
-    for proc in processes:
-        if proc.port is None or proc.pid is None:
-            continue
-        _wait_one(
-            url=f"http://localhost:{proc.port}/v1/models",
-            pid=proc.pid,
-            label=proc.name,
-            log_path=Path(proc.log_path) if proc.log_path else None,
-            deadline=deadline,
-        )
+def _correct_recorded_pid(proc: ManagedProcess, *, port: int) -> None:
+    """Rewrite ``proc.pid`` to the actual port listener if they differ.
 
+    ``daemonize_subprocess`` records the PID of whatever ``execvp`` ran
+    — which for ``uv run --with vllm -- vllm serve …`` is the ``uv run``
+    wrapper, a transient resolver process that exits as soon as deps
+    are synced. The real server is one of its descendants. After the
+    readiness probe passes, we ask the kernel which PID owns ``port``
+    and update both the in-memory ``ManagedProcess`` and the on-disk
+    PID file so ``ocrscout down`` and ``status`` look at the right
+    process.
 
-def _wait_proxy_ready(proxy_port: int, timeout: float) -> None:
-    """Probe the LiteLLM proxy's liveliness endpoint."""
-    pid_path = state_mod.pid_dir() / "litellm.pid"
-    pid = read_pid(pid_path)
-    log_path = state_mod.log_dir() / "litellm.log"
-    _wait_one(
-        url=f"http://localhost:{proxy_port}/health/liveliness",
-        pid=pid,
-        label="litellm",
-        log_path=log_path,
-        deadline=time.monotonic() + timeout,
+    No-op when the resolver returns None (e.g. ``ss`` and ``/proc/net/tcp``
+    both unavailable) — the recorded PID stays as-is and we rely on
+    process-group teardown to reach the leaf.
+    """
+    listener = _ports.resolve_listener_pid(port)
+    if listener is None or listener == proc.pid:
+        return
+    log.info(
+        "%s: correcting recorded pid %s → leaf listener %d (port %d)",
+        proc.name, proc.pid, listener, port,
     )
+    proc.pid = listener
+    if proc.name:
+        pid_path = state_mod.pid_dir() / f"{proc.name}.pid"
+        try:
+            pid_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = pid_path.with_suffix(pid_path.suffix + ".tmp")
+            tmp.write_text(str(listener), encoding="utf-8")
+            tmp.replace(pid_path)
+        except OSError as e:
+            log.warning("could not update pid file %s: %s", pid_path, e)
+
+
+# --- readiness probes ------------------------------------------------------
 
 
 def _wait_one(
@@ -489,7 +722,7 @@ def _wait_one(
         if pid is not None and not pid_alive(pid):
             tail = _tail(log_path, 50) if log_path else ""
             raise RunnerError(
-                f"{label}: daemon died before becoming ready\n"
+                f"{label}: process died before becoming ready\n"
                 f"--- last 50 lines of {log_path} ---\n{tail}"
             )
         try:
@@ -520,11 +753,7 @@ def _tail(path: Path | None, n: int) -> str:
 
 
 def _count_pages_and_cost(output_dir: Path) -> tuple[int, float]:
-    """Sum ``pages_done`` (row count) and ``cumulative_cost`` across parquet shards.
-
-    Falls back to a fast row-count scan when polars isn't importable
-    (e.g. minimal CPU-only test environment).
-    """
+    """Sum ``pages_done`` (row count) and ``cumulative_cost`` across parquet shards."""
     shards = find_parquet_files(output_dir)
     if not shards:
         return 0, 0.0
@@ -547,11 +776,7 @@ def _count_pages_and_cost(output_dir: Path) -> tuple[int, float]:
 
 
 def _tail_files(targets: list[tuple[str, Path]], *, follow: bool) -> None:
-    """Tail multiple log files with ``[name]`` prefixes.
-
-    Single-pass when ``follow=False`` (prints the tail of each file and
-    returns); otherwise uses ``tail -F`` semantics via a polling loop.
-    """
+    """Tail multiple log files with ``[name]`` prefixes."""
     if not follow:
         for name, path in targets:
             if path.is_file():
@@ -580,7 +805,6 @@ def _tail_files(targets: list[tuple[str, Path]], *, follow: bool) -> None:
                             any_new = True
                     positions[path] = cur
                 elif cur < last:
-                    # File rotated / truncated — reset.
                     positions[path] = cur
             sys.stdout.flush()
             if not any_new:
@@ -594,8 +818,11 @@ def _tail_files(targets: list[tuple[str, Path]], *, follow: bool) -> None:
 
 def _proc_name(role: str, profile_name: str) -> str:
     """Filename-safe daemon name. Used for PID and log file naming."""
-    safe = profile_name.replace("/", "_").replace(" ", "_")
-    return f"{role}-{safe}"
+    return f"{role}-{_safe(profile_name)}"
+
+
+def _safe(name: str) -> str:
+    return name.replace("/", "_").replace(" ", "_")
 
 
 def _allocate_ports(base: int, count: int) -> list[int]:
@@ -642,7 +869,12 @@ def _matches_existing(
     """Whether an active state file matches the launch we're about to do.
 
     Same models (order-insensitive) + same proxy port = reuse the stack.
+    Only matches when the existing stack is fully ready (``phase ==
+    'ready'``) — a stale ``launching`` shouldn't be reused, that's a
+    job for ``ocrscout down --force``.
     """
+    if existing.phase != "ready":
+        return False
     if set(existing.models) != set(models):
         return False
     if existing.proxy_url is None:
@@ -652,15 +884,7 @@ def _matches_existing(
 
 
 def _ocrscout_invocation() -> list[str]:
-    """Argv prefix for spawning a child ``ocrscout`` process.
-
-    Prefers an installed ``ocrscout`` console_script entry over
-    ``python -m`` because the entry point sets up the package path
-    correctly under all install layouts (uv-tool, pip, editable). Falls
-    back to ``sys.executable -m ocrscout`` when the entry script can't be
-    located on PATH (e.g. running from a checkout without ``pip install
-    -e``).
-    """
+    """Argv prefix for spawning a child ``ocrscout`` process."""
     ocrscout_path = shutil.which("ocrscout")
     if ocrscout_path:
         return [ocrscout_path]
@@ -682,4 +906,26 @@ def _handle_from_state(state: RunnerStateFile) -> RunnerHandle:
         proxy_url=state.proxy_url or "",
         endpoints=endpoints,
         extra={"models": state.models},
+    )
+
+
+def _handle_from_ephemeral_stack(
+    stack: _ephemeral.EphemeralStack,
+    proxy_url: str,
+    models: list[str],
+) -> RunnerHandle:
+    endpoints = [
+        RunnerEndpoint(
+            model=p.name.removeprefix("vllm-"),
+            url=f"http://localhost:{p.port}/v1" if p.port else "",
+            pid=p.popen.pid,
+        )
+        for p in stack.processes
+        if p.name.startswith("vllm-") and p.port is not None
+    ]
+    return RunnerHandle(
+        runner="local",
+        proxy_url=proxy_url,
+        endpoints=endpoints,
+        extra={"models": models, "ephemeral": True},
     )

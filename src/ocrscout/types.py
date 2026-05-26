@@ -249,7 +249,9 @@ class JobHandle(BaseModel):
     output_dir: str
 
 
-RunnerState = Literal["down", "launching", "ready", "busy", "error"]
+RunnerState = Literal[
+    "down", "launching", "ready", "busy", "tearing_down", "error",
+]
 
 
 class RunnerStatus(BaseModel):

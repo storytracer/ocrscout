@@ -23,8 +23,9 @@ from __future__ import annotations
 
 import os
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, ValidationError
@@ -85,6 +86,17 @@ class RunnerStateFile(BaseModel):
     """Original launch kwargs, kept so ``ocrscout run`` can decide whether
     to reuse an already-running stack or tear it down and re-launch with
     a different config."""
+    phase: Literal["launching", "ready", "tearing_down"] = "ready"
+    """Lifecycle stage for the persistent path. ``write_state_launching``
+    flips this to ``launching`` BEFORE any subprocess spawn so a Ctrl-C
+    mid-launch leaves a detectable breadcrumb on disk. The post-readiness
+    ``mark_phase_ready`` is the only success indicator — a state file
+    still at ``launching`` after the readiness deadline means the
+    launcher was killed and ``ocrscout down --force`` should be used.
+    Defaults to ``ready`` so pre-phase state.yaml files round-trip."""
+    phase_updated_at: str | None = None
+    """ISO8601 timestamp of the most recent phase transition. Used by
+    ``is_stale_launching`` to flag crashed launchers."""
 
 
 def state_dir() -> Path:
@@ -162,6 +174,70 @@ def read_state() -> RunnerStateFile | None:
 
 def write_state(state: RunnerStateFile) -> None:
     _atomic_write_yaml(state_file_path(), state.model_dump(mode="json"))
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def write_state_launching(state: RunnerStateFile) -> None:
+    """Atomic write with ``phase='launching'`` and a fresh timestamp.
+
+    Called BEFORE any subprocess spawn in the persistent launch path so
+    a Ctrl-C between this call and the final ``mark_phase_ready`` leaves
+    a detectable breadcrumb that ``ocrscout status`` / ``ocrscout down
+    --force`` can interpret.
+    """
+    state.phase = "launching"
+    state.phase_updated_at = _now_iso()
+    write_state(state)
+
+
+def update_state_processes(state: RunnerStateFile) -> None:
+    """Atomic re-write keeping ``phase`` as-is, refreshing
+    ``phase_updated_at``.
+
+    Used by the persistent path to record each ``ManagedProcess``
+    incrementally as daemons come up and their PIDs get corrected
+    (per design: incremental writes rather than only at the final flip).
+    """
+    state.phase_updated_at = _now_iso()
+    write_state(state)
+
+
+def mark_phase_ready(state: RunnerStateFile) -> None:
+    """Atomic flip to ``phase='ready'`` + refresh timestamp.
+
+    The only success indicator for the persistent launch path. Anything
+    short of this on disk means the launcher didn't finish.
+    """
+    state.phase = "ready"
+    state.phase_updated_at = _now_iso()
+    write_state(state)
+
+
+def is_stale_launching(
+    state: RunnerStateFile, *, max_age_seconds: float = 900.0
+) -> bool:
+    """Whether a state file in ``phase='launching'`` looks abandoned.
+
+    Heuristic: ``phase == 'launching'`` AND ``phase_updated_at`` is
+    older than ``max_age_seconds`` (default 15 min ≈ 1.5× the default
+    ready_timeout). Used by ``ocrscout status`` to surface "launcher
+    likely crashed; run ``ocrscout down --force``."
+    """
+    if state.phase != "launching":
+        return False
+    if not state.phase_updated_at:
+        return False
+    try:
+        ts = datetime.fromisoformat(state.phase_updated_at)
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - ts).total_seconds()
+    return age > max_age_seconds
 
 
 def clear_state() -> None:

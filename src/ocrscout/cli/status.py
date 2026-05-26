@@ -48,6 +48,23 @@ def status(
         f"[cyan]{snapshot.state}[/cyan]  "
         f"models=[cyan]{','.join(snapshot.models) or '—'}[/cyan]"
     )
+    details = snapshot.details or {}
+    phase = details.get("phase")
+    phase_updated_at = details.get("phase_updated_at")
+    if phase == "launching":
+        if details.get("stale_launching"):
+            rprint(
+                f"[bold yellow]warning:[/bold yellow] state.yaml shows phase="
+                f"'launching' from {phase_updated_at} — the launcher likely "
+                f"crashed.\n  Run [cyan]ocrscout down --force[/cyan] to scan "
+                f"ports and clean up."
+            )
+        else:
+            rprint(
+                f"  phase: [cyan]launching[/cyan] (since {phase_updated_at})"
+            )
+    elif phase == "tearing_down":
+        rprint(f"  phase: [yellow]tearing_down[/yellow] (since {phase_updated_at})")
     if snapshot.proxy_url:
         rprint(f"  proxy: [cyan]{snapshot.proxy_url}[/cyan]")
     rprint(f"  uptime: {_humanize_uptime(snapshot.uptime_seconds)}")

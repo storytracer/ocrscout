@@ -285,6 +285,13 @@ def run_pipeline(
             base_port=base_port,
             proxy_port=proxy_port,
             gpu_budget=gpu_budget,
+            # ``ocrscout run`` is one-shot: tie the stack's lifetime to
+            # this process via PR_SET_PDEATHSIG + atexit. ``--keep-up``
+            # opts back into the daemonised persistent path so the stack
+            # outlives the invocation for follow-up `submit`s. Reuse of
+            # an existing persistent stack short-circuits before the
+            # ephemeral path runs (see LocalRunner.launch).
+            persistent=keep_up,
         )
         os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
         if reused_existing:
