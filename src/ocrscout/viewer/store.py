@@ -300,7 +300,7 @@ class ViewerStore:
 
         Returns ``None`` for pages with neither.
         """
-        from ocrscout.sources.bhl import bhl_web_image_url
+        from ocrscout.sources.bhl import BhlSourceAdapter
 
         raw = next((r for r in self._rows if r["file_id"] == file_id), None)
         if raw is None:
@@ -312,7 +312,7 @@ class ViewerStore:
         if not src:
             return None
         src = str(src)
-        web_src = bhl_web_image_url(src)
+        web_src = BhlSourceAdapter.web_image_url(src)
         if web_src is not None:
             return web_src
         if "://" not in src:
