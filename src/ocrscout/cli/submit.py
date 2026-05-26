@@ -51,7 +51,7 @@ def submit(
              "active runner was launched with.",
     ),
     output_dir: Path = typer.Option(
-        Path("./ocrscout-results"), "--output-dir", "-o",
+        Path("./data/results"), "--output-dir", "-o",
         help="Where the worker writes data/*.parquet + progress.json.",
     ),
     pages: int | None = typer.Option(

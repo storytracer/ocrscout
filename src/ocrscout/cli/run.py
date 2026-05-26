@@ -102,7 +102,7 @@ def run(
         None, "--benchmark", help="Run a registered benchmark instead of --source."
     ),
     output_dir: Path = typer.Option(
-        Path("./ocrscout-results"), "--output-dir", "-o",
+        Path("./data/results"), "--output-dir", "-o",
         help="Where to write results and the generated pipeline.yaml.",
     ),
     export: str = typer.Option(

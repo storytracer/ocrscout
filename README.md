@@ -95,8 +95,8 @@ Here's what happens, in plain terms:
 2. It downloads each model on first use — they're cached locally afterwards — and starts them up on your GPU.
 3. It picks 20 pages from your image folder and sends every page through every model.
 4. Whatever the models emit (markdown, HTML tables, custom token streams), ocrscout converts into one common document format so you can compare them apples-to-apples.
-5. Everything goes into `./ocrscout-results/`:
-   - `data/train-*.parquet` — one row per (page, model) with timings, token counts, success/failure, the normalized document, and a pre-rendered `markdown` column. The directory is laid out exactly like a HuggingFace Hub dataset, so `datasets.load_dataset("./ocrscout-results", split="train")` works without further conversion.
+5. Everything goes into `./data/results/` (the default `--output-dir`; `./data/` is the conventional output root and is gitignored):
+   - `data/train-*.parquet` — one row per (page, model) with timings, token counts, success/failure, the normalized document, and a pre-rendered `markdown` column. The directory is laid out exactly like a HuggingFace Hub dataset, so `datasets.load_dataset("./data/results", split="train")` works without further conversion.
    - `pipeline.yaml` — the resolved configuration ocrscout actually ran (source, models, normalizer overrides, sample/seed), so the run is reproducible.
 6. A summary table is printed: how many pages each model handled, how often it failed, mean seconds per page, total output tokens.
 
@@ -121,10 +121,10 @@ ocrscout records each per-page comparison result in the parquet (rich JSON for r
 
 ```bash
 # Terminal summary + per-page dumps (good over SSH)
-uv run ocrscout inspect ./ocrscout-results/
+uv run ocrscout inspect ./data/results/
 
 # Browser viewer for visual comparison
-uv run ocrscout viewer ./ocrscout-results/
+uv run ocrscout viewer ./data/results/
 ```
 
 **Reproducible runs:** every `ocrscout run` writes a `pipeline.yaml` capturing exactly what was run. Re-run the same comparison later — or share the file with a teammate — with `ocrscout apply pipeline.yaml`.

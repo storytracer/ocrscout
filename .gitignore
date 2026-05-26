@@ -219,3 +219,7 @@ __marimo__/
 
 # Claude Code
 .claude
+
+# ocrscout run outputs (parquet shards, progress.json, pipeline.yaml, …).
+# Standard root for all --output-dir destinations.
+/data/

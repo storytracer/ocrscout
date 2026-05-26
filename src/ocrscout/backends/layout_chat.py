@@ -271,6 +271,7 @@ def _post_region(
     try:
         resp = litellm.completion(
             model=profile.name,
+            custom_llm_provider="openai",
             api_base=proxy_url,
             api_key=os.environ.get("LITELLM_API_KEY", "ocrscout-dummy"),
             messages=messages,
