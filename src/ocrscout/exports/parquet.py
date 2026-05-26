@@ -148,6 +148,37 @@ class ProgressTracker:
             raise
 
 
+def done_pairs_from_parquet(output_dir: Path) -> dict[str, set[str]]:
+    """Per-model done-set built by projecting ``page_id`` + ``model`` from
+    every ``data/train-*.parquet`` shard.
+
+    Replaces ``ProgressTracker`` as the resume cursor for ``ocrscout run``:
+    the parquet shards are the single source of truth for "which (page, model)
+    pairs have been written," so resume cannot drift from the actual output.
+    Column projection means only those two columns hit disk; for BHL-scale
+    runs (8K pages × N models) this completes in well under a second.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    done: dict[str, set[str]] = {}
+    for path in find_parquet_files(output_dir):
+        try:
+            table = pq.read_table(str(path), columns=["page_id", "model"])
+        except (OSError, pa.ArrowInvalid):
+            # A partially-written shard would have been atomically replaced
+            # by Dataset.to_parquet, but tolerate read errors as "not done"
+            # rather than crashing the resume.
+            continue
+        page_ids = table.column("page_id").to_pylist()
+        models = table.column("model").to_pylist()
+        for pid, model in zip(page_ids, models):
+            if pid is None or model is None:
+                continue
+            done.setdefault(str(model), set()).add(str(pid))
+    return done
+
+
 class ParquetExportAdapter(ExportAdapter):
     """Incrementally append rows to ``<output_dir>/data/train-NNNNN.parquet``.
 

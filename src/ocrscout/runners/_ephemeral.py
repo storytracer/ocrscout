@@ -60,6 +60,19 @@ log = logging.getLogger(__name__)
 _PR_SET_PDEATHSIG = 1
 
 
+def _is_ephemeral_handler(handler: Any) -> bool:
+    """True if ``handler`` is a bound ``_signal_handler`` on some ``EphemeralStack``.
+
+    Used by handler installation to avoid capturing a prior stack's handler
+    as our "fallback" — chaining through a torn-down stack adds no value
+    and obscures stack traces.
+    """
+    if not callable(handler):
+        return False
+    self_ref = getattr(handler, "__self__", None)
+    return isinstance(self_ref, EphemeralStack)
+
+
 def _set_pdeathsig() -> None:
     """preexec_fn: ``prctl(PR_SET_PDEATHSIG, SIGTERM)``.
 
@@ -233,6 +246,14 @@ class EphemeralStack:
                 prior = signal.getsignal(sig)
             except (ValueError, OSError):
                 continue
+            # Don't chain through another EphemeralStack's handler. When
+            # model-major chunking creates a fresh stack per chunk, the
+            # previous stack may still be in mid-teardown (or have not
+            # restored its handlers yet for some reason); capturing its
+            # bound method as `prior` would ricochet a signal through a
+            # closed stack instead of going to the OS default.
+            if _is_ephemeral_handler(prior):
+                prior = signal.SIG_DFL
             self._prior_handlers[sig] = prior
             try:
                 signal.signal(sig, self._signal_handler)

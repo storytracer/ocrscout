@@ -141,13 +141,21 @@ def run(
     ),
     parallel_models: int | None = typer.Option(
         None, "--parallel-models", "-P",
-        help="Number of models to run concurrently. Default: 1 (sequential), "
-             "which gives each model the full GPU and produces uncontended "
-             "per-model s/page numbers for benchmarking. Total wall-clock is "
-             "~equivalent to running them in parallel on a single GPU since "
-             "the GPU is the bottleneck either way. Raise this only if you "
-             "have separate GPUs per model or genuinely want concurrent "
-             "execution at the cost of comparable per-model timings.",
+        help="Size of the concurrent-model chunk for ephemeral `run`. "
+             "Default 1 = strict one-at-a-time: spawn one vLLM serve, run "
+             "all pages, tear down, spawn the next. Lowest VRAM (preflight "
+             "only checks `max(per-profile)`) at the cost of paying vLLM "
+             "cold-start once per model. N>1 keeps N serves resident as a "
+             "chunk; preflight rejects the chunk if its total exceeds the "
+             "GPU. Ignored under `--keep-up` (which forces single-launch "
+             "parallel spawn, today's behavior).",
+    ),
+    resume: bool = typer.Option(
+        False, "--resume",
+        help="Skip pages already present in <output-dir>/data/train-*.parquet "
+             "for each model. Resume is per-model: a page already done for "
+             "model A is still attempted for model B if B hadn't processed "
+             "it yet. Survives a crash anywhere mid-run.",
     ),
     verbose: int = typer.Option(
         0, "-v", "--verbose", count=True,
@@ -251,6 +259,7 @@ def run(
         proxy_port=proxy_port,
         gpu_budget=gpu_budget,
         keep_up=keep_up,
+        resume=resume,
     )
 
 
@@ -266,11 +275,21 @@ def run_pipeline(
 ) -> None:
     """Launch the required runner (if any), run the pipeline, tear down.
 
-    Shared by ``ocrscout run`` and ``ocrscout apply`` (and any future
-    command that takes a fully-resolved ``PipelineConfig``). Auto-launches
-    a ``LocalRunner`` when any profile has ``runtime != cpu`` and no
-    matching runner is already up. Profiles with ``runtime: cpu`` only
-    skip the launch entirely (Docling, Tesseract run in-process).
+    Shared by ``ocrscout run`` and ``ocrscout apply``. Auto-launches a
+    ``LocalRunner`` for any profile with ``runtime != cpu``.
+
+    Ephemeral runs default to **model-major** dispatch: one vLLM serve up at
+    a time (chunk size 1), all pages for that model, teardown, next chunk.
+    This way the preflight budget check enforces ``max(per-profile)`` rather
+    than ``sum(per-profile)``, so a benchmark matrix only needs to fit the
+    largest single model. ``--parallel-models N`` widens the chunk to N
+    concurrent serves; the preflight cap applies per chunk. ``--keep-up``
+    forces the original single-launch parallel-spawn path (all serves
+    resident together) so a follow-up ``submit`` pays no relaunch cost.
+
+    Profiles with ``runtime: cpu`` (Docling, Tesseract) run in-process in
+    a trailing pass with no proxy. ``runtime: hosted`` profiles share one
+    trailing proxy-only launch (no GPU work involved).
     """
     try:
         profiles = [resolve(name) for name in cfg.models]
@@ -280,16 +299,17 @@ def run_pipeline(
     # Construct the source adapter BEFORE any runner work so that
     # configuration errors (e.g. BHL without a prior `source bhl setup`)
     # surface as a typer.BadParameter without first spinning up the
-    # LiteLLM proxy + vLLM serves. Pydantic validators on the adapter
-    # are cheap (sub-millisecond); the actual page iteration is
-    # deferred to `_execute`.
+    # LiteLLM proxy + vLLM serves.
     try:
         source = _construct_source(cfg)
     except (ScoutError, ValidationError, RegistryError) as e:
         raise typer.BadParameter(str(e)) from e
 
-    needs_proxy = any(p.runtime != "cpu" for p in profiles)
-    if not needs_proxy:
+    vllm_profiles = [p for p in profiles if p.runtime == "vllm"]
+    hosted_profiles = [p for p in profiles if p.runtime == "hosted"]
+    cpu_profiles = [p for p in profiles if p.runtime == "cpu"]
+
+    if not vllm_profiles and not hosted_profiles:
         log.info("All profiles are runtime=cpu; running CPU-side backends in-process.")
         _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
         return
@@ -300,35 +320,143 @@ def run_pipeline(
         existing_state is not None and existing_state.runner == "local"
     )
 
-    try:
-        handle = runner.launch(
-            models=cfg.models,
-            base_port=base_port,
-            proxy_port=proxy_port,
-            gpu_budget=gpu_budget,
-            # ``ocrscout run`` is one-shot: tie the stack's lifetime to
-            # this process via PR_SET_PDEATHSIG + atexit. ``--keep-up``
-            # opts back into the daemonised persistent path so the stack
-            # outlives the invocation for follow-up `submit`s. Reuse of
-            # an existing persistent stack short-circuits before the
-            # ephemeral path runs (see LocalRunner.launch).
-            persistent=keep_up,
-        )
-        os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
-        if reused_existing:
-            log.info("Reusing already-running local stack")
-    except RunnerError as e:
-        log.error("Runner launch failed: %s", e)
-        raise typer.Exit(code=1) from e
+    # Single-launch path: today's all-serves-resident behavior. Used when
+    # the user explicitly asked for it (--keep-up), when a persistent stack
+    # is already up (we reuse it as-is — caller's responsibility for the
+    # models to match), or when there's nothing to chunk (≤1 vLLM model).
+    single_launch = keep_up or reused_existing or len(vllm_profiles) <= 1
 
-    try:
-        _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
-    finally:
-        if not keep_up and not reused_existing:
+    if single_launch:
+        try:
+            handle = runner.launch(
+                models=cfg.models,
+                base_port=base_port,
+                proxy_port=proxy_port,
+                gpu_budget=gpu_budget,
+                persistent=keep_up,
+            )
+            os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+            if reused_existing:
+                log.info("Reusing already-running local stack")
+        except RunnerError as e:
+            log.error("Runner launch failed: %s", e)
+            raise typer.Exit(code=1) from e
+
+        try:
+            _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
+        finally:
+            if not keep_up and not reused_existing:
+                try:
+                    runner.down()
+                except Exception as e:  # noqa: BLE001
+                    log.warning("Runner teardown reported error: %s", e)
+        return
+
+    # Model-major chunked path. Each chunk = one ephemeral launch with its
+    # own LiteLLM proxy + vLLM serve(s); teardown between chunks frees the
+    # GPU before the next model loads. The shared `source` and exporter
+    # state mean per-chunk output appends into the same parquet shards;
+    # resume reads (page, model) pairs from those shards directly.
+    chunk_size = max(1, parallel_models)
+    vllm_names = [p.name for p in vllm_profiles]
+    chunks = list(_iter_model_chunks(vllm_names, chunk_size))
+    log.info(
+        "Model-major dispatch: %d vLLM chunk(s) of up to %d model(s)%s%s",
+        len(chunks), chunk_size,
+        f" + {len(hosted_profiles)} hosted" if hosted_profiles else "",
+        f" + {len(cpu_profiles)} cpu" if cpu_profiles else "",
+    )
+
+    for chunk_idx, chunk_models in enumerate(chunks):
+        log.info(
+            "vLLM chunk %d/%d: %s",
+            chunk_idx + 1, len(chunks), ",".join(chunk_models),
+        )
+        try:
+            handle = runner.launch(
+                models=chunk_models,
+                base_port=base_port,
+                proxy_port=proxy_port,
+                gpu_budget=gpu_budget,
+                persistent=False,
+            )
+            os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+        except RunnerError as e:
+            log.error(
+                "Runner launch failed for chunk %s: %s", chunk_models, e,
+            )
+            raise typer.Exit(code=1) from e
+
+        try:
+            _execute(
+                _cfg_for_chunk(cfg, chunk_models),
+                source=source,
+                parallel_models=len(chunk_models),
+                resume=resume,
+            )
+        finally:
             try:
                 runner.down()
             except Exception as e:  # noqa: BLE001
                 log.warning("Runner teardown reported error: %s", e)
+
+    if hosted_profiles:
+        hosted_names = [p.name for p in hosted_profiles]
+        log.info("Hosted chunk: %s", ",".join(hosted_names))
+        try:
+            handle = runner.launch(
+                models=hosted_names,
+                base_port=base_port,
+                proxy_port=proxy_port,
+                gpu_budget=gpu_budget,
+                persistent=False,
+            )
+            os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+        except RunnerError as e:
+            log.error("Runner launch failed for hosted chunk: %s", e)
+            raise typer.Exit(code=1) from e
+        try:
+            _execute(
+                _cfg_for_chunk(cfg, hosted_names),
+                source=source,
+                parallel_models=min(parallel_models, len(hosted_names)),
+                resume=resume,
+            )
+        finally:
+            try:
+                runner.down()
+            except Exception as e:  # noqa: BLE001
+                log.warning("Runner teardown reported error: %s", e)
+
+    if cpu_profiles:
+        cpu_names = [p.name for p in cpu_profiles]
+        log.info("CPU chunk: %s", ",".join(cpu_names))
+        _execute(
+            _cfg_for_chunk(cfg, cpu_names),
+            source=source,
+            parallel_models=min(parallel_models, len(cpu_names)),
+            resume=resume,
+        )
+
+
+def _iter_model_chunks(names: list[str], chunk_size: int) -> list[list[str]]:
+    """Slide a window of ``chunk_size`` over ``names`` preserving order.
+
+    Returns a concrete list (not iterator) so callers can ``len()`` it
+    for progress logging.
+    """
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+    return [names[i : i + chunk_size] for i in range(0, len(names), chunk_size)]
+
+
+def _cfg_for_chunk(cfg: PipelineConfig, model_names: list[str]) -> PipelineConfig:
+    """Copy ``cfg`` with ``models`` restricted to ``model_names``.
+
+    Used by the chunked dispatch path so each chunk's ``_execute`` only
+    iterates over its own models against the shared source + exporter.
+    """
+    return cfg.model_copy(update={"models": list(model_names)})
 
 
 def _construct_source(cfg: PipelineConfig) -> SourceAdapter:
@@ -365,19 +493,20 @@ def _execute(
         pages = list(itertools.islice(pages_iter, cfg.sample))
     else:
         pages = list(pages_iter)
+    # Per-model resume done-set built once from the parquet shards already on
+    # disk (the single source of truth — see done_pairs_from_parquet). Each
+    # model gets its own done page_ids: a page completed for A but not B is
+    # still attempted for B. The filter is applied inside `_run` below so
+    # `_run_one_model` keeps a uniform `pages` argument.
+    done_pairs: dict[str, set[str]] = {}
     if resume:
-        # Drop page ids already completed in a prior run (recorded by the
-        # parquet adapter into <output_dir>/progress.json). Cheap dedup —
-        # the loaded set is bounded by the deterministic sample size.
-        from ocrscout.exports.parquet import ProgressTracker as _PT
-        progress = _PT(cfg.output_dir)
-        done = progress.completed_page_ids()
-        if done:
-            before = len(pages)
-            pages = [p for p in pages if p.page_id not in done]
+        from ocrscout.exports.parquet import done_pairs_from_parquet
+        done_pairs = done_pairs_from_parquet(cfg.output_dir)
+        total_done = sum(len(s) for s in done_pairs.values())
+        if total_done:
             log.info(
-                "Resume: skipping %d of %d pages already in progress.json",
-                before - len(pages), before,
+                "Resume: %d (page, model) pairs already in %s — filtering per model",
+                total_done, cfg.output_dir,
             )
     page_by_id = {p.page_id: p for p in pages}
     source_label = cfg.source.args.get("path") or cfg.source.name
@@ -426,9 +555,20 @@ def _execute(
     results: dict[str, _ModelRunResult] = {}
 
     def _run(name: str) -> tuple[str, _ModelRunResult]:
+        model_done = done_pairs.get(name, set())
+        if model_done:
+            model_pages = [p for p in pages if p.page_id not in model_done]
+            skipped = len(pages) - len(model_pages)
+            if skipped:
+                log.info("[%s] resume: skipping %d of %d pages", name, skipped, len(pages))
+        else:
+            model_pages = pages
+        if not model_pages:
+            log.info("[%s] resume: nothing to do", name)
+            return name, _ModelRunResult(ok=0, failed=0, run_seconds=0.0)
         result = _run_one_model(
             model_name=name,
-            pages=pages,
+            pages=model_pages,
             page_by_id=page_by_id,
             normalizer_overrides=cfg.normalizer_overrides,
             exporter=exporter,

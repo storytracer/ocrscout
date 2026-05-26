@@ -263,6 +263,15 @@ class LocalRunner(Runner):
         gpu_budget: float,
         ready_timeout: float,
     ) -> RunnerHandle:
+        if self._ephemeral_stack is not None and not self._ephemeral_stack._closed:
+            # Model-major chunking on the CLI side always calls down() before
+            # the next launch, so this is defense-in-depth: if a caller forgot,
+            # we refuse to leak GPU memory by stacking a second set of serves.
+            raise RunnerError(
+                "LocalRunner: previous ephemeral stack not torn down; "
+                "call .down() before launching another chunk."
+            )
+
         profiles = [resolve(name) for name in models]
         vllm_profiles = [p for p in profiles if p.runtime == "vllm"]
         hosted_profiles = [p for p in profiles if p.runtime == "hosted"]
