@@ -28,6 +28,7 @@ from rich import print as rprint
 from rich.table import Table
 
 from ocrscout.cli import app
+from ocrscout.errors import ScoutError
 from ocrscout.interfaces.source_action import SourceAction, SourceActionContext
 from ocrscout.log import setup_logging
 from ocrscout.registry import registry
@@ -181,7 +182,11 @@ def _make_action_invoker(
             derived_dir=dd,
             info=info,
         )
-        patch = action.run(flags, ctx)
+        try:
+            patch = action.run(flags, ctx)
+        except ScoutError as e:
+            log.error("%s", e)
+            raise typer.Exit(code=1) from e
         if patch:
             merge_info(source_name, patch)
 

@@ -317,7 +317,7 @@ Sources have admin concerns that aren't part of the per-page iteration contract 
 
 ## BHL source adapter
 
-The [`bhl`](src/ocrscout/sources/bhl.py) adapter samples pages by joining BHL's TSV catalogs in DuckDB, then fetches JP2 images from `s3://bhl-open-data/images/{BarCode}/{SequenceOrder:04d}.jp2` and OCR sidecars from `s3://bhl-open-data/ocr/item-{ItemID:06d}/item-{ItemID:06d}-{PageID:08d}-{SequenceOrder:04d}.txt`. Image and OCR sidecars share the same NNNN suffix per item by construction. Per BHL's own README, a tiny historical minority of items used `_0000.jp2` instead of `_0001.jp2` for the first leaf — empirically not encountered in random sampling (0/100). The adapter trusts the modern convention universally; if a truly-legacy item slips through, the image fetch 404s and the page is cleanly skipped with a warning. If/when a legacy item is empirically observed and matters, the cleanest fix is consulting IA-style scandata XML (BHL hosts it under `bhl-open-data/scandata/`) for authoritative per-leaf metadata.
+The [`bhl`](src/ocrscout/sources/bhl.py) adapter samples pages by joining BHL's catalog parquets in DuckDB, then fetches JP2 images from `s3://bhl-open-data/images/{BarCode}/{SequenceOrder:04d}.jp2` and OCR sidecars from `s3://bhl-open-data/ocr/item-{ItemID:06d}/item-{ItemID:06d}-{PageID:08d}-{SequenceOrder:04d}.txt`. Image and OCR sidecars share the same NNNN suffix per item by construction. Per BHL's own README, a tiny historical minority of items used `_0000.jp2` instead of `_0001.jp2` for the first leaf — empirically not encountered in random sampling (0/100). The adapter trusts the modern convention universally; if a truly-legacy item slips through, the image fetch 404s and the page is cleanly skipped with a warning. If/when a legacy item is empirically observed and matters, the cleanest fix is consulting IA-style scandata XML (BHL hosts it under `bhl-open-data/scandata/`) for authoritative per-leaf metadata.
 
 ### Lifecycle
 
@@ -326,19 +326,25 @@ The [`bhl`](src/ocrscout/sources/bhl.py) adapter samples pages by joining BHL's 
 | Verb | What it does |
 |---|---|
 | `ocrscout source bhl setup --read-from <dataset>` | Records the rights-classification dataset to read at sample time. Lightweight — no upstream sync. |
-| `ocrscout source bhl refresh --only catalog` | Re-fetches the three TSVs (`item.txt.gz`, `page.txt.gz`, `title.txt.gz`) with per-file ETag invalidation. Pure local. Rebuilds `derived/volumes.parquet`. |
-| `ocrscout source bhl refresh --runner local\|hf --source-repo <repo> --output-repo <repo>` | Full rights pipeline: extract unique 4-field combos from `item.txt.gz` → push to `--source-repo` → classify via the `uv-scripts/classification` UV script (local GPU or HF Jobs) → publish to `--output-repo` → rebuild `derived/volumes.parquet`. `source_repo`/`output_repo` are sticky in `info.yaml`. |
+| `ocrscout source bhl refresh --only catalog` | Re-fetches the three upstream TSVs (`item.txt.gz`, `page.txt.gz`, `title.txt.gz`) with per-file ETag invalidation and converts each one to `catalog/{item,page,title}.parquet` (ZSTD-compressed, `all_varchar`). The TSVs are dropped after conversion; ETag tracking moves to the parquet's sibling `.etag` file. Pure local. Triggers a `derived/volumes.parquet` rebuild iff a rights source is already configured. |
+| `ocrscout source bhl refresh --runner local` | Fully local rights pipeline. Extracts unique 4-field combos from `item.parquet`, runs the bundled [`_bhl_classify_local.py`](src/ocrscout/sources/_bhl_classify_local.py) PEP-723 UV script (parquet → parquet) on this machine, writes `derived/rights_classified.parquet`, and rebuilds `derived/volumes.parquet`. No HuggingFace Hub round-trip — `info.rights.local_parquet` records the path. |
+| `ocrscout source bhl refresh --runner hf --source-repo <repo> --output-repo <repo>` | HF-Jobs rights pipeline. Extract combos → push to `--source-repo` → classify via the upstream `uv-scripts/classification` UV script on HF Jobs → publish to `--output-repo` → rebuild `derived/volumes.parquet`. `source_repo`/`output_repo` are sticky in `info.yaml`. Needs `HF_TOKEN` in the env. |
 | `ocrscout source bhl info` / `clear` | Universal: render state / wipe the source dir. |
 
 `iter_pages` errors out if `derived/volumes.parquet` is missing or older than `catalog.last_refresh` — no silent rebuilds; the user runs refresh explicitly.
 
 ### Sampling query
 
-[BhlSourceAdapter._run_duckdb_sample_from_volumes](src/ocrscout/sources/bhl.py) reads the pre-joined `derived/volumes.parquet` (~300K rows, ~14MB compressed), applies user filters (rights, languages, year_range) against that small table, ranks each surviving volume by `hash(ItemID || seed)`, ranks pages within each volume the same way, then joins `catalog/page.txt.gz` only for surviving ItemIDs and fills `sample_n` rows volume-by-volume up to `pages_per_volume` per volume. This replaces the previous 4-way TSV+parquet join that ran on every iteration.
+[BhlSourceAdapter._run_duckdb_sample_from_volumes](src/ocrscout/sources/bhl.py) reads the pre-joined `derived/volumes.parquet` (~300K rows, ~14MB compressed), applies user filters (rights, languages, year_range) against that small table, ranks each surviving volume by `hash(ItemID || seed)`, ranks pages within each volume the same way, then joins `catalog/page.parquet` only for surviving ItemIDs and fills `sample_n` rows volume-by-volume up to `pages_per_volume` per volume. This replaces the previous 4-way TSV+parquet join that ran on every iteration.
 
-### Classifier UV script
+### Classifier dispatch
 
-The rights-classification pipeline shells out to the community-maintained UV inline script `https://huggingface.co/datasets/uv-scripts/classification/raw/main/classify-dataset.py` via [src/ocrscout/jobs.py](src/ocrscout/jobs.py)'s `run_uv_script(runner=local|hf)`. The classifier prompt, model (`Qwen/Qwen3-4B`), packages (`vllm<0.12.0`, `flashinfer-*`), labels, max-tokens, and HF Jobs flavor all live on `BhlSourceAdapter` as `CLASSIFIER_*` ClassVars — the invocation contract is the BHL adapter's, the script itself is external. `--runner hf` requires `HF_TOKEN` in the env; `--runner local` requires a CUDA GPU.
+The rights-classification pipeline takes one of two paths depending on `--runner`:
+
+* **`--runner local`** calls [`classify_parquet`](src/ocrscout/sources/_bhl_classify_local.py) **in-process** in the current Python interpreter. Parquet in (`derived/_rights_combos.parquet`), parquet out (`derived/rights_classified.parquet`) — no HuggingFace Hub involvement, no UV-managed throwaway env, no subprocess. The user installs `ocrscout[vllm]` into their main environment (`vllm` + `transformers` + `pyarrow`); `torch` is deliberately left out of the extra because DGX-class ARM64+CUDA hardware needs a wheel from Nvidia's index that pypi can't deliver. On import failure `classify_parquet` raises `ScoutError` with the install hint. Going in-process sidesteps the `vllm._C` → `libtorch_cuda.so` linkage break that bit us when `uv run` installed a stock vLLM wheel into a fresh env.
+* **`--runner hf`** shells out to the community-maintained `https://huggingface.co/datasets/uv-scripts/classification/raw/main/classify-dataset.py` via [src/ocrscout/jobs.py](src/ocrscout/jobs.py)'s `run_uv_script(runner="hf")`. Input/output are HF datasets (`--source-repo` / `--output-repo`); needs `HF_TOKEN` to push.
+
+The classifier model (`Qwen/Qwen3-4B`), labels, prompt, max-tokens, and HF Jobs flavor all live on `BhlSourceAdapter` as `CLASSIFIER_*` ClassVars — the invocation contract is the BHL adapter's, the local and HF paths are interchangeable downstream because both write the same `classification` / `parsing_success` / `reasoning` columns.
 
 ### Partitioning for SkyPilot / HF workers
 

@@ -131,6 +131,11 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
     CLASSIFIER_MAX_TOKENS: ClassVar[int] = 500
     CLASSIFIER_FLAVOR: ClassVar[str] = "l4x1"
     CLASSIFIER_TIMEOUT: ClassVar[str] = "1h"
+    # vLLM's `gpu_memory_utilization` for the local-runner classifier.
+    # 0.85 leaves headroom on unified-memory GH200-class boxes where the
+    # OS shares the GPU pool; bump up on dedicated GPUs to amortize KV
+    # cache, lower if other CUDA processes are competing.
+    CLASSIFIER_GPU_MEMORY_UTILIZATION: ClassVar[float] = 0.85
     # The classifier prompt. Encodes BHL-specific public-domain signals
     # plus the BHL MOU clause (a positive signal in any field cannot be
     # overridden by another field). Single semicolon-separated string per
@@ -235,18 +240,23 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             self._copyright_dataset = self.copyright_dataset
         else:
             info = load_info(self.name)
-            if info is not None and info.rights.read_from:
-                self._copyright_dataset = info.rights.read_from
+            if info is not None and (
+                info.rights.read_from or info.rights.local_parquet
+            ):
+                self._copyright_dataset = (
+                    info.rights.read_from or info.rights.local_parquet
+                )
             else:
                 raise ScoutError(
-                    f"{type(self).__name__} has no rights-classification dataset "
-                    f"configured. Run "
-                    f"`ocrscout source {self.name} setup --read-from <dataset>` "
-                    f"to point at an existing rights-classification dataset, or "
-                    f"`ocrscout source {self.name} refresh --runner local|hf "
-                    f"--source-repo <repo> --output-repo <repo>` "
-                    f"to maintain your own. "
-                    f"Constructor escape hatch: pass `copyright_dataset=<dataset>` explicitly."
+                    f"{type(self).__name__} has no rights classification "
+                    f"configured. Run `ocrscout source {self.name} refresh "
+                    f"--runner local` for a fully local pipeline, "
+                    f"`ocrscout source {self.name} refresh --runner hf "
+                    f"--source-repo <repo> --output-repo <repo>` for HF Jobs, "
+                    f"or `ocrscout source {self.name} setup --read-from "
+                    f"<dataset>` to point at an existing rights dataset. "
+                    f"Constructor escape hatch: pass "
+                    f"`copyright_dataset=<dataset>` explicitly."
                 )
         return self
 
@@ -314,11 +324,11 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
     def _ensure_query_run(self) -> None:
         """Resolve the sample by reading from the refresh-built pre-join.
 
-        Sampling against the raw 67M-row ``page.txt.gz`` is wasteful when
+        Sampling against the raw 67M-row ``page.parquet`` is wasteful when
         most BHL rows have nothing to do with our filters. Refresh
         produces ``~/.ocrscout/sources/bhl/derived/volumes.parquet``
         (item × title × rights, ~300K rows) once; this method scans it
-        for volume-level filters, then joins ``catalog/page.txt.gz`` only
+        for volume-level filters, then joins ``catalog/page.parquet`` only
         for surviving ItemIDs.
 
         Errors clearly when refresh hasn't run yet — the alternative
@@ -354,7 +364,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 f"`ocrscout source {self.name} refresh` to rebuild."
             )
 
-        page_path = self._cache_dir / "page.txt.gz"
+        page_path = self._catalog_parquet_path(self._cache_dir, "page.txt.gz")
         if not page_path.is_file():
             raise ScoutError(
                 f"BHL catalog {page_path} missing. Run "
@@ -542,7 +552,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         ``pages_per_volume``. The difference vs. the old query: the
         rights/year/title joins are already baked into
         ``volumes.parquet``, so this query reads one small parquet
-        (~300K rows) for volume filtering plus the raw ``page.txt.gz``
+        (~300K rows) for volume filtering plus the raw ``page.parquet``
         only to fetch page metadata for the surviving ItemIDs.
         """
         try:
@@ -555,10 +565,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
 
         conn = duckdb.connect(":memory:")
 
-        page_tsv = (
-            f"read_csv('{page_path}', delim='\\t', header=true, "
-            "all_varchar=true, nullstr='\\N', quote='', escape='')"
-        )
+        page_sql = f"read_parquet('{page_path}')"
 
         # Volume-side filter — operates on the pre-joined parquet.
         where_clauses = ["Rights = ?"]
@@ -601,7 +608,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 e.LicenseType,
                 e.RightsHolder,
                 e.ItemYear
-            FROM {page_tsv} AS p
+            FROM {page_sql} AS p
             JOIN eligible e USING (ItemID)
         ),
         volume_pool AS (
@@ -717,6 +724,12 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
 
     # --- refresh stage helpers ---
 
+    @staticmethod
+    def _catalog_parquet_path(catalog_dir: Path, tsv_basename: str) -> Path:
+        """``item.txt.gz`` → ``catalog_dir/item.parquet``."""
+        stem = tsv_basename.removesuffix(".txt.gz")
+        return catalog_dir / f"{stem}.parquet"
+
     @classmethod
     def _refresh_catalog(
         cls,
@@ -725,18 +738,30 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         *,
         force: bool,
     ) -> dict[str, Any]:
-        """Pull TSVs into ``catalog_dir`` with per-file ETag invalidation.
+        """Pull TSVs from S3 and store them as parquet in ``catalog_dir``.
 
-        Returns the patch for ``info.catalog`` so the action's caller
-        can merge it back into ``info.yaml``: ``last_refresh`` plus a
-        ``files`` dict of ``basename → etag``.
+        For each TSV: ETag-check against the cached parquet's sibling
+        ``.etag`` file; on miss, download to a temp file, DuckDB-convert
+        to ``<stem>.parquet`` (all_varchar columns, ZSTD-compressed), drop
+        the temp TSV. Downstream readers all consume the parquet.
+
+        Returns the patch for ``info.catalog``: ``last_refresh`` plus a
+        ``files`` dict mapping the upstream TSV basename to its ETag.
         """
+        try:
+            import duckdb
+        except ImportError as e:
+            raise ScoutError(
+                "duckdb is required for `refresh`; install via "
+                "`pip install ocrscout[bhl]`."
+            ) from e
+
         catalog_dir.mkdir(parents=True, exist_ok=True)
         files: dict[str, str] = {}
         for basename in cls.CATALOG_FILES:
-            local = catalog_dir / basename
             url = f"{cls.DATA_PREFIX}/{basename}"
-            etag_path = local.with_suffix(local.suffix + ".etag")
+            parquet = cls._catalog_parquet_path(catalog_dir, basename)
+            etag_path = parquet.with_suffix(parquet.suffix + ".etag")
             remote_etag = cls._s3_etag(url, storage_options)
             cached_etag = (
                 etag_path.read_text().strip()
@@ -745,14 +770,30 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             )
             if (
                 not force
-                and local.is_file()
+                and parquet.is_file()
                 and remote_etag
                 and cached_etag == remote_etag
             ):
                 log.info("[bhl] catalog %s up-to-date (etag=%s)", basename, remote_etag)
             else:
-                log.info("[bhl] downloading catalog %s -> %s", url, local)
-                cls._download_s3_file(url, local, storage_options)
+                tsv_tmp = catalog_dir / basename
+                log.info("[bhl] downloading catalog %s -> %s", url, tsv_tmp)
+                cls._download_s3_file(url, tsv_tmp, storage_options)
+                log.info("[bhl] converting %s -> %s", tsv_tmp.name, parquet.name)
+                conn = duckdb.connect(":memory:")
+                tmp_parquet = parquet.with_suffix(parquet.suffix + ".tmp")
+                conn.execute(
+                    f"""
+                    COPY (
+                      SELECT * FROM read_csv(
+                        '{tsv_tmp}', delim='\\t', header=true,
+                        all_varchar=true, nullstr='\\N', quote='', escape=''
+                      )
+                    ) TO '{tmp_parquet}' (FORMAT PARQUET, COMPRESSION ZSTD)
+                    """
+                )
+                tmp_parquet.replace(parquet)
+                tsv_tmp.unlink(missing_ok=True)
                 remote_etag = cls._s3_etag(url, storage_options)
                 if remote_etag:
                     etag_path.write_text(remote_etag)
@@ -764,7 +805,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         }
 
     @classmethod
-    def _extract_rights_combos(cls, item_path: Path, output_path: Path) -> int:
+    def _extract_rights_combos(cls, item_parquet: Path, output_path: Path) -> int:
         """Extract unique 4-field rights combos into a parquet.
 
         Mirrors the ``COPY`` query documented in the
@@ -798,10 +839,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                   RightsHolder: NULLIF(RightsHolder, '')
                 }}) AS VARCHAR) AS rights_json,
                 COUNT(*) AS Count
-              FROM read_csv(
-                '{item_path}', delim='\\t', header=true,
-                all_varchar=true, nullstr='\\N', quote='', escape=''
-              )
+              FROM read_parquet('{item_parquet}')
               GROUP BY CopyrightStatus, RightsStatement, LicenseType, RightsHolder
               ORDER BY Count DESC
             ) TO '{output_path}' (FORMAT PARQUET)
@@ -844,22 +882,28 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         )
 
     @classmethod
-    def _run_classify(
+    def _run_classify_hf(
         cls,
         *,
         source_repo: str,
         output_repo: str,
-        runner: Literal["local", "hf"],
         flavor: str,
     ) -> None:
-        """Drive the rights-classification UV script.
+        """HF-mode rights classification.
 
-        The script lives at :attr:`CLASSIFIER_SCRIPT_URL` and is invoked
-        with identical args under either runner — only the execution
-        wrapper differs. HF mode picks up ``HF_TOKEN`` from the local
-        env (the user must have it set; HF Jobs requires it to push to
-        the output dataset).
+        Submits the upstream ``uv-scripts/classification`` script to HF
+        Jobs; the script reads ``source_repo`` and pushes to
+        ``output_repo``. ``HF_TOKEN`` from the local env is forwarded as
+        a job secret so the remote can push.
         """
+        import os
+        token = os.environ.get("HF_TOKEN")
+        if not token:
+            raise ScoutError(
+                "refresh --runner hf requires HF_TOKEN in the "
+                "environment so the remote job can push to "
+                f"{output_repo!r}."
+            )
         args = [
             "--input-dataset", source_repo,
             "--column", cls.CLASSIFIER_INPUT_COLUMN,
@@ -870,25 +914,46 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             "--enable-reasoning",
             "--max-tokens", str(cls.CLASSIFIER_MAX_TOKENS),
         ]
-        secrets: dict[str, str] | None = None
-        if runner == "hf":
-            import os
-            token = os.environ.get("HF_TOKEN")
-            if not token:
-                raise ScoutError(
-                    "refresh --runner hf requires HF_TOKEN in the "
-                    "environment so the remote job can push to "
-                    f"{output_repo!r}."
-                )
-            secrets = {"HF_TOKEN": token}
         run_uv_script(
             script_url=cls.CLASSIFIER_SCRIPT_URL,
             args=args,
-            runner=runner,
+            runner="hf",
             with_packages=cls.CLASSIFIER_PACKAGES,
-            secrets=secrets,
+            secrets={"HF_TOKEN": token},
             flavor=flavor,
             timeout=cls.CLASSIFIER_TIMEOUT,
+        )
+
+    @classmethod
+    def _run_classify_local(
+        cls,
+        *,
+        input_parquet: Path,
+        output_parquet: Path,
+    ) -> None:
+        """Local-mode rights classification, in-process.
+
+        Calls :func:`ocrscout.sources._bhl_classify_local.classify_parquet`
+        in this Python process — no subprocess, no UV-managed env. The
+        active env must provide vllm + transformers + torch + pyarrow
+        (install via ``pip install ocrscout[vllm]``); on ARM64 / DGX-class
+        hardware the user picks a compatible torch wheel themselves.
+        Going in-process sidesteps the ``vllm._C`` → ``libtorch_cuda.so``
+        linkage break we hit when uv installed a stock vLLM wheel into
+        a throwaway env.
+        """
+        from ocrscout.sources._bhl_classify_local import classify_parquet
+
+        classify_parquet(
+            input_parquet=input_parquet,
+            output_parquet=output_parquet,
+            column=cls.CLASSIFIER_INPUT_COLUMN,
+            model=cls.CLASSIFIER_MODEL,
+            labels=[s.strip() for s in cls.CLASSIFIER_LABELS.split(",") if s.strip()],
+            label_descriptions=cls.CLASSIFIER_LABEL_DESCRIPTIONS,
+            enable_reasoning=True,
+            max_tokens=cls.CLASSIFIER_MAX_TOKENS,
+            gpu_memory_utilization=cls.CLASSIFIER_GPU_MEMORY_UTILIZATION,
         )
 
     @classmethod
@@ -896,7 +961,9 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         cls,
         catalog_dir: Path,
         out_path: Path,
-        rights_repo: str,
+        *,
+        rights_repo: str | None = None,
+        rights_local_parquet: Path | None = None,
     ) -> dict[str, Any]:
         """Pre-join item × title × rights at the volume level.
 
@@ -904,40 +971,54 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         sample query and ``_rows_to_volumes`` need downstream
         (BarCode, TitleID, Title, Language, Year/ItemYear, TL2Author,
         the four raw rights fields, and the classification verdict).
-        The next ``iter_pages`` JOINs ``page.txt.gz`` against this
+        The next ``iter_pages`` JOINs ``page.parquet`` against this
         small parquet instead of re-running the 4-way join.
+
+        Exactly one of ``rights_repo`` / ``rights_local_parquet`` must
+        be provided. ``rights_repo`` fetches via ``hf_hub_download`` (HF
+        runner); ``rights_local_parquet`` reads a path produced by the
+        local classifier.
         """
         try:
             import duckdb
-            from huggingface_hub import hf_hub_download
         except ImportError as e:
             raise ScoutError(
-                "duckdb + huggingface_hub are required for `refresh`; "
-                "install via `pip install ocrscout[bhl]`."
+                "duckdb is required for `refresh`; install via "
+                "`pip install ocrscout[bhl]`."
             ) from e
 
-        item_path = catalog_dir / "item.txt.gz"
-        title_path = catalog_dir / "title.txt.gz"
-        if not item_path.is_file() or not title_path.is_file():
+        if (rights_repo is None) == (rights_local_parquet is None):
             raise ScoutError(
-                f"catalog TSVs missing in {catalog_dir}; run "
+                "_build_volumes_parquet: exactly one of rights_repo / "
+                "rights_local_parquet must be set."
+            )
+
+        item_parquet = cls._catalog_parquet_path(catalog_dir, "item.txt.gz")
+        title_parquet = cls._catalog_parquet_path(catalog_dir, "title.txt.gz")
+        if not item_parquet.is_file() or not title_parquet.is_file():
+            raise ScoutError(
+                f"catalog parquets missing in {catalog_dir}; run "
                 "`refresh --only catalog` first."
             )
 
-        rights_parquet = hf_hub_download(
-            repo_id=rights_repo,
-            filename=cls.COPYRIGHT_PARQUET_PATH,
-            repo_type="dataset",
-        )
+        if rights_local_parquet is not None:
+            rights_path: str = str(rights_local_parquet)
+        else:
+            try:
+                from huggingface_hub import hf_hub_download
+            except ImportError as e:
+                raise ScoutError(
+                    "huggingface_hub is required to resolve a remote rights "
+                    "repo; install via `pip install ocrscout[bhl]`."
+                ) from e
+            rights_path = hf_hub_download(
+                repo_id=rights_repo,
+                filename=cls.COPYRIGHT_PARQUET_PATH,
+                repo_type="dataset",
+            )
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         conn = duckdb.connect(":memory:")
-
-        def _read_tsv(path: Path) -> str:
-            return (
-                f"read_csv('{path}', delim='\\t', header=true, "
-                "all_varchar=true, nullstr='\\N', quote='', escape='')"
-            )
 
         rights_join_sql = " AND ".join(
             f"NULLIF(c.{col}, '') IS NOT DISTINCT FROM NULLIF(i.{col}, '')"
@@ -962,9 +1043,9 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                     i.Year AS ItemYear,
                     TRY_CAST(REGEXP_EXTRACT(i.Year, '\\d{{4}}', 0) AS INTEGER) AS Year,
                     c.classification AS Rights
-                FROM {_read_tsv(item_path)} AS i
-                LEFT JOIN {_read_tsv(title_path)} AS t USING (TitleID)
-                JOIN read_parquet('{rights_parquet}') AS c
+                FROM read_parquet('{item_parquet}') AS i
+                LEFT JOIN read_parquet('{title_parquet}') AS t USING (TitleID)
+                JOIN read_parquet('{rights_path}') AS c
                   ON {rights_join_sql}
                 WHERE c.parsing_success = TRUE
             ) TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
@@ -1046,13 +1127,20 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
 
         Two stages, both optionally scoped via ``--only``:
 
-        * ``catalog``: ETag-checked re-fetch of the three TSVs into
-          ``~/.ocrscout/sources/bhl/catalog/``.
-        * ``rights``: extract unique 4-field rights combos from the
-          catalog, push to ``--source-repo``, classify via the
-          :attr:`CLASSIFIER_SCRIPT_URL` UV script (local GPU or HF
-          Jobs), publish to ``--output-repo``, point
-          ``rights.read_from`` at the result.
+        * ``catalog``: ETag-checked re-fetch of the three TSVs from S3,
+          converted to ``catalog/{item,page,title}.parquet`` (ZSTD,
+          all-varchar). The raw TSVs are dropped after conversion.
+        * ``rights``: extract unique 4-field rights combos from
+          ``item.parquet``, then classify them. Two paths:
+
+          - ``--runner local``: classify on this machine via the bundled
+            :mod:`_bhl_classify_local` PEP-723 UV script. Input and
+            output are local parquets under ``derived/`` — no HF Hub
+            involvement.
+          - ``--runner hf``: push combos to ``--source-repo``, submit
+            the upstream ``uv-scripts/classification`` script to HF
+            Jobs, publish the result to ``--output-repo``, point
+            ``rights.read_from`` at it.
 
         After either stage runs, the volume-level pre-join at
         ``derived/volumes.parquet`` is always rebuilt — it's the input
@@ -1083,16 +1171,16 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 None,
                 description=(
                     "HF dataset id for the *unclassified* rights combos "
-                    "(classifier input). Required when running the rights "
-                    "stage on first invocation; sticky thereafter."
+                    "(classifier input). `--runner hf` only — required on "
+                    "first invocation, sticky thereafter."
                 ),
             )
             output_repo: str | None = Field(
                 None,
                 description=(
                     "HF dataset id for the *classified* rights output "
-                    "(classifier output). Required when running the rights "
-                    "stage on first invocation; sticky thereafter."
+                    "(classifier output). `--runner hf` only — required on "
+                    "first invocation, sticky thereafter."
                 ),
             )
             flavor: str = Field(
@@ -1125,6 +1213,23 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             flags: "BhlSourceAdapter.Refresh.Flags",
             ctx: SourceActionContext,
         ) -> dict[str, dict] | None:
+            # `--runner hf` requires both HF dataset repos for the rights
+            # stage. Validate up front so we don't waste a catalog refresh
+            # on a setup that can't complete. `--runner local` needs no
+            # repos — output lands under `derived/`.
+            if (
+                flags.only in (None, "rights")
+                and flags.runner == "hf"
+                and (not flags.source_repo or not flags.output_repo)
+            ):
+                raise ScoutError(
+                    "refresh --runner hf's rights stage needs --source-repo "
+                    "and --output-repo. Use `--only catalog` to skip the "
+                    "rights stage, switch to `--runner local` for a fully "
+                    "local pipeline, or pass both flags (they're sticky "
+                    "after the first successful run)."
+                )
+
             patch: dict[str, dict[str, Any]] = {}
 
             # Stage 1: catalog refresh (always cheap, pure local).
@@ -1137,20 +1242,19 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 )
                 patch["catalog"] = catalog_patch
 
-            # Stage 2: rights pipeline (extract → push → classify → publish).
+            # Stage 2: rights pipeline (extract → classify → record).
+            local_rights_parquet: Path | None = None
             if flags.only in (None, "rights"):
-                log.info("[bhl] refresh: stage 2/2 — rights")
-                if not flags.source_repo or not flags.output_repo:
+                log.info(
+                    "[bhl] refresh: stage 2/2 — rights (runner=%s)",
+                    flags.runner,
+                )
+                item_parquet = BhlSourceAdapter._catalog_parquet_path(
+                    ctx.catalog_dir, "item.txt.gz"
+                )
+                if not item_parquet.is_file():
                     raise ScoutError(
-                        "refresh's rights stage needs --source-repo and "
-                        "--output-repo. Use `--only catalog` to skip it, "
-                        "or pass both flags (they're sticky after the "
-                        "first successful run)."
-                    )
-                item_path = ctx.catalog_dir / "item.txt.gz"
-                if not item_path.is_file():
-                    raise ScoutError(
-                        f"catalog not present at {item_path}; run "
+                        f"catalog not present at {item_parquet}; run "
                         "`refresh --only catalog` first."
                     )
 
@@ -1158,64 +1262,96 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 combos_path = ctx.derived_dir / "_rights_combos.parquet"
                 combos_path.parent.mkdir(parents=True, exist_ok=True)
                 combos_count = BhlSourceAdapter._extract_rights_combos(
-                    item_path, combos_path
+                    item_parquet, combos_path
                 )
                 log.info(
                     "[bhl] extracted %d unique rights combos -> %s",
                     combos_count, combos_path,
                 )
 
-                # 2b. Push to the classifier-input repo (idempotent: HF Hub
-                # handles overwrite on commit).
-                BhlSourceAdapter._push_combos_to_hub(
-                    combos_path, flags.source_repo
-                )
-                log.info("[bhl] pushed combos to %s", flags.source_repo)
-
-                # 2c. Run the classifier (local subprocess or HF Job).
-                BhlSourceAdapter._run_classify(
-                    source_repo=flags.source_repo,
-                    output_repo=flags.output_repo,
-                    runner=flags.runner,
-                    flavor=flags.flavor,
-                )
-                log.info("[bhl] classified -> %s", flags.output_repo)
-
-                # 2d. Confirm the output dataset is now reachable.
-                BhlSourceAdapter._verify_dataset_reachable(flags.output_repo)
-
-                patch["rights"] = {
-                    "source_repo": flags.source_repo,
-                    "output_repo": flags.output_repo,
-                    "read_from": flags.output_repo,
-                    "last_refresh": datetime.now().astimezone().isoformat(),
-                    "last_runner": flags.runner,
-                    "combos_classified": combos_count,
-                }
+                if flags.runner == "local":
+                    # 2b-local. Classify in-process and write a local parquet.
+                    local_rights_parquet = (
+                        ctx.derived_dir / "rights_classified.parquet"
+                    )
+                    BhlSourceAdapter._run_classify_local(
+                        input_parquet=combos_path,
+                        output_parquet=local_rights_parquet,
+                    )
+                    log.info(
+                        "[bhl] classified -> %s", local_rights_parquet,
+                    )
+                    patch["rights"] = {
+                        "local_parquet": str(local_rights_parquet),
+                        "source_repo": None,
+                        "output_repo": None,
+                        "read_from": None,
+                        "last_refresh": datetime.now().astimezone().isoformat(),
+                        "last_runner": "local",
+                        "combos_classified": combos_count,
+                    }
+                else:
+                    # 2b-hf. Push combos → submit HF Job → publish.
+                    BhlSourceAdapter._push_combos_to_hub(
+                        combos_path, flags.source_repo
+                    )
+                    log.info("[bhl] pushed combos to %s", flags.source_repo)
+                    BhlSourceAdapter._run_classify_hf(
+                        source_repo=flags.source_repo,
+                        output_repo=flags.output_repo,
+                        flavor=flags.flavor,
+                    )
+                    log.info("[bhl] classified -> %s", flags.output_repo)
+                    BhlSourceAdapter._verify_dataset_reachable(flags.output_repo)
+                    patch["rights"] = {
+                        "source_repo": flags.source_repo,
+                        "output_repo": flags.output_repo,
+                        "read_from": flags.output_repo,
+                        "local_parquet": None,
+                        "last_refresh": datetime.now().astimezone().isoformat(),
+                        "last_runner": "hf",
+                        "combos_classified": combos_count,
+                    }
 
             # Stage 3: rebuild the volume-level pre-join. Always runs when
-            # either upstream stage has touched the cache or HF dataset.
+            # either upstream stage has touched the cache or rights store.
             if patch:
-                # Determine the effective rights pointer:
-                # the just-classified output_repo > existing read_from.
-                rights_repo = (
-                    patch.get("rights", {}).get("read_from")
-                    or ctx.info.rights.read_from
+                # Effective rights pointer, preferring this run's output,
+                # falling back to whatever info.yaml already records.
+                rights_section = patch.get("rights", {})
+                effective_local = (
+                    rights_section.get("local_parquet")
+                    if "rights" in patch
+                    else ctx.info.rights.local_parquet
                 )
-                if not rights_repo:
+                effective_repo = (
+                    rights_section.get("read_from")
+                    if "rights" in patch
+                    else ctx.info.rights.read_from
+                )
+                if not effective_local and not effective_repo:
                     log.warning(
-                        "[bhl] no rights.read_from configured — skipping "
-                        "derived/volumes.parquet build. Run `setup --read-from "
-                        "<dataset>` or `refresh` with --source-repo/--output-repo "
-                        "first."
+                        "[bhl] no rights source configured — skipping "
+                        "derived/volumes.parquet build. Run `refresh --runner "
+                        "local` for a fully local pipeline, `refresh --runner "
+                        "hf --source-repo ... --output-repo ...` for HF Jobs, "
+                        "or `setup --read-from <dataset>` to consume an "
+                        "existing rights dataset."
                     )
                 else:
                     log.info("[bhl] refresh: rebuilding derived/volumes.parquet")
-                    derived_patch = BhlSourceAdapter._build_volumes_parquet(
-                        catalog_dir=ctx.catalog_dir,
-                        out_path=ctx.derived_dir / "volumes.parquet",
-                        rights_repo=rights_repo,
-                    )
+                    if effective_local:
+                        derived_patch = BhlSourceAdapter._build_volumes_parquet(
+                            catalog_dir=ctx.catalog_dir,
+                            out_path=ctx.derived_dir / "volumes.parquet",
+                            rights_local_parquet=Path(effective_local),
+                        )
+                    else:
+                        derived_patch = BhlSourceAdapter._build_volumes_parquet(
+                            catalog_dir=ctx.catalog_dir,
+                            out_path=ctx.derived_dir / "volumes.parquet",
+                            rights_repo=effective_repo,
+                        )
                     patch["derived"] = derived_patch
                     log.info(
                         "[bhl] derived/volumes.parquet built (%d rows)",

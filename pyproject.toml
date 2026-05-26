@@ -93,15 +93,27 @@ layout = [
     "torch>=2.0.0",
 ]
 # Biodiversity Heritage Library source + OCR reference adapter.
-# DuckDB streams the gzipped TSV catalogs (item.txt.gz / page.txt.gz /
-# title.txt.gz) for cheap catalog-driven sampling without enumerating
-# the 67M-page bucket; s3fs provides anonymous S3 access for both the
-# catalog files and the JP2/OCR sidecars; imagecodecs ships its own
-# OpenJPEG decoder so JP2 decoding doesn't depend on a system libopenjp2.
+# DuckDB drives the TSV→parquet catalog conversion (refresh) and the
+# parquet-backed sampling query (iter_pages) on the resulting
+# `catalog/{item,page,title}.parquet` files; s3fs provides anonymous S3
+# access for both the catalog files and the JP2/OCR sidecars;
+# imagecodecs ships its own OpenJPEG decoder so JP2 decoding doesn't
+# depend on a system libopenjp2.
 bhl = [
     "duckdb>=1.1.0",
     "s3fs>=2024.0.0",
     "imagecodecs>=2024.0.0",
+]
+# GPU stack for the in-process rights classifier (BHL refresh --runner
+# local) and any future local vLLM workloads. The torch version is
+# deliberately left to the user's existing environment — DGX-class
+# hardware (ARM64 + CUDA) needs a torch wheel from Nvidia's index that
+# isn't on pypi, so locking torch here would lock those users out. If
+# torch isn't present, `classify_parquet` raises with the install hint.
+vllm = [
+    "vllm>=0.11.0",
+    "transformers>=4.53.0",
+    "pyarrow>=14.0",
 ]
 # Optional metrics for the comparisons subsystem. The TextComparison core
 # always returns a SequenceMatcher word-level similarity score; jiwer adds

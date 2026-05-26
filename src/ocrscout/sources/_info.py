@@ -51,18 +51,28 @@ class CatalogSection(BaseModel):
 class RightsSection(BaseModel):
     """Rights / classification pipeline state.
 
-    ``source_repo`` is where the *unclassified* combos live (extract
-    output, classify input); ``output_repo`` is where the *classified*
-    rows live (classify output). ``read_from`` is what the adapter
-    actually reads at runtime — usually equal to ``output_repo`` after a
-    refresh, but ``setup`` can point it at a third-party published
-    dataset without running the heavy pipeline.
+    Two refresh modes share this section:
+
+    * ``--runner local`` runs the classifier on this machine and writes
+      its output to ``local_parquet`` (a path under ``derived/``). No HF
+      Hub round-trip; ``source_repo`` / ``output_repo`` / ``read_from``
+      stay ``None``.
+    * ``--runner hf`` runs the classifier as a HuggingFace Job that
+      reads ``source_repo`` and writes ``output_repo``; ``read_from`` is
+      what the adapter reads at runtime (usually equal to ``output_repo``,
+      but ``setup --read-from`` can point at a third-party dataset).
+
+    ``_build_volumes_parquet`` resolves the rights source as
+    ``local_parquet`` if present, else falls back to fetching
+    ``read_from`` from the Hub.
     """
 
     model_config = ConfigDict(extra="forbid")
     source_repo: str | None = None
     output_repo: str | None = None
     read_from: str | None = None
+    local_parquet: str | None = None
+    """Path to a locally-classified rights parquet (``--runner local``)."""
     last_refresh: datetime | None = None
     last_runner: str | None = None  # "local" | "hf"
     combos_classified: int | None = None

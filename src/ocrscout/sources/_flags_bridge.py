@@ -31,6 +31,8 @@ import typer
 from pydantic import BaseModel
 from pydantic_core import PydanticUndefined
 
+from ocrscout.log import setup_logging
+
 
 def _option_decl(field_name: str) -> str:
     """``source_repo`` → ``--source-repo``."""
@@ -120,10 +122,33 @@ def build_typer_callback(
         )
         field_order.append(name)
 
+    # Inject universal `-v` / `-q` options so every auto-generated action
+    # configures stdlib logging on entry. Without this, log.info() calls
+    # inside the action body go nowhere (no handler is attached).
+    params.append(
+        inspect.Parameter(
+            name="verbose",
+            kind=inspect.Parameter.KEYWORD_ONLY,
+            default=typer.Option(0, "-v", "--verbose", count=True),
+            annotation=int,
+        )
+    )
+    params.append(
+        inspect.Parameter(
+            name="quiet",
+            kind=inspect.Parameter.KEYWORD_ONLY,
+            default=typer.Option(False, "-q", "--quiet"),
+            annotation=bool,
+        )
+    )
+
     def _wrapper(**kwargs: Any) -> Any:
+        verbose = kwargs.pop("verbose", 0)
+        quiet = kwargs.pop("quiet", False)
+        setup_logging(verbosity=verbose, quiet=quiet)
         validated = flags_cls.model_validate(kwargs)
         return on_invoke(validated)
 
     _wrapper.__signature__ = inspect.Signature(parameters=params)  # type: ignore[attr-defined]
-    _wrapper.__annotations__ = {n: p.annotation for n, p in zip(field_order, params)}
+    _wrapper.__annotations__ = {p.name: p.annotation for p in params}
     return _wrapper
