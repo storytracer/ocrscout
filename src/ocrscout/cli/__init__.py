@@ -25,6 +25,7 @@ from ocrscout.cli import logs as _logs  # noqa: E402, F401
 from ocrscout.cli import publish as _publish  # noqa: E402, F401
 from ocrscout.cli import report as _report  # noqa: E402, F401
 from ocrscout.cli import run as _run  # noqa: E402, F401
+from ocrscout.cli import source as _source  # noqa: E402, F401
 from ocrscout.cli import status as _status  # noqa: E402, F401
 from ocrscout.cli import submit as _submit  # noqa: E402, F401
 from ocrscout.cli import viewer as _viewer  # noqa: E402, F401

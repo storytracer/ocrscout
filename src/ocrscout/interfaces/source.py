@@ -4,15 +4,32 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from ocrscout.types import PageImage, Volume
+
+if TYPE_CHECKING:
+    from ocrscout.interfaces.source_action import SourceAction
 
 
 class SourceAdapter(ABC):
     """Yields ``PageImage`` objects from a source (directory, dataset, IIIF, ...)."""
 
     name: ClassVar[str]
+
+    actions: ClassVar[list[type["SourceAction"]]] = []
+    """Source-specific admin verbs exposed under ``ocrscout source <name> <verb>``.
+
+    See :class:`ocrscout.interfaces.source_action.SourceAction`. The
+    universal ``info`` and ``clear`` verbs are added by the CLI driver
+    automatically — adapters only declare their domain-specific verbs
+    here.
+    """
+
+    cache_subdir: ClassVar[str | None] = None
+    """Subdirectory name under ``~/.ocrscout/sources/`` for this source's
+    cache + ``info.yaml``. Defaults to :attr:`name` when ``None``.
+    """
 
     @abstractmethod
     def iter_pages(self) -> Iterator[PageImage]:

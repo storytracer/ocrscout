@@ -3,7 +3,11 @@
 BHL's open-data S3 bucket (``s3://bhl-open-data/``) holds 305K volumes and
 67M pages — far too large to enumerate. Instead, we read its small TSV
 catalogs (``data/{item,page,title}.txt.gz``), join them with a
-pre-classified copyright lookup hosted on HuggingFace, apply
+pre-classified rights lookup hosted on HuggingFace
+(``storytracer/bhl_rights_json_classified``: unique combinations of the
+four rights-related ``item.txt.gz`` columns — ``CopyrightStatus``,
+``RightsStatement``, ``LicenseType``, ``RightsHolder`` — classified as
+``public_domain`` vs ``not_public_domain``), apply
 rights/language/year filters, rank volumes (and pages within each)
 deterministically by ``hash(id || seed)``, then fill ``sample_n`` pages
 volume-by-volume up to ``pages_per_volume`` per volume. The JPEG-2000
@@ -20,7 +24,6 @@ from __future__ import annotations
 
 import io
 import logging
-import os
 import re
 import shutil
 from collections.abc import Iterator
@@ -32,6 +35,9 @@ from PIL import Image
 
 from ocrscout.errors import ScoutError
 from ocrscout.interfaces.source import SourceAdapter
+from ocrscout.sources._info import load_info
+from ocrscout.sources._paths import source_dir
+from ocrscout.sources.bhl_actions import BhlSetupAction
 from ocrscout.types import PageImage, Volume
 
 log = logging.getLogger(__name__)
@@ -74,8 +80,26 @@ def bhl_web_image_url(source_uri: str, size: str = "full") -> str | None:
 
 
 CATALOG_FILES: tuple[str, ...] = ("item.txt.gz", "page.txt.gz", "title.txt.gz")
-COPYRIGHT_DATASET = "storytracer/bhl_copyright_statuses_classified"
+# Structural path within whatever HF dataset is configured as the rights
+# lookup. The dataset *name* is no longer a constant — it's resolved at
+# adapter-construction time from the kwarg, then from info.yaml, then an
+# error pointing the user at `ocrscout source bhl setup`.
 COPYRIGHT_PARQUET_PATH = "data/train-00000-of-00001.parquet"
+# Canonical public dataset, surfaced as a suggested value in the error
+# message but NEVER used as a silent default. We want users to make an
+# explicit choice about which classification dataset they trust before
+# their OCR run starts.
+CANONICAL_COPYRIGHT_DATASET = "storytracer/bhl_rights_json_classified"
+# Rights-related item.txt.gz columns evaluated jointly by the classifier.
+# Anything in any of these four fields can supply a positive public-domain
+# signal (BHL MOU: a signal in one field cannot be overridden by another),
+# so we JOIN on the whole tuple.
+COPYRIGHT_JOIN_COLUMNS: tuple[str, ...] = (
+    "CopyrightStatus",
+    "RightsStatement",
+    "LicenseType",
+    "RightsHolder",
+)
 
 
 class BhlSourceAdapter(SourceAdapter):
@@ -94,6 +118,8 @@ class BhlSourceAdapter(SourceAdapter):
 
     name = "bhl"
 
+    actions = [BhlSetupAction]
+
     def __init__(
         self,
         *,
@@ -108,7 +134,7 @@ class BhlSourceAdapter(SourceAdapter):
         cache_dir: str | Path | None = None,
         force_refresh: bool = False,
         storage_options: dict[str, Any] | None = None,
-        copyright_dataset: str = COPYRIGHT_DATASET,
+        copyright_dataset: str | None = None,
         copyright_parquet_path: str = COPYRIGHT_PARQUET_PATH,
         start_idx: int | None = None,
         end_idx: int | None = None,
@@ -155,12 +181,20 @@ class BhlSourceAdapter(SourceAdapter):
         if concurrent_fetches <= 0:
             raise ScoutError("BhlSourceAdapter requires concurrent_fetches >= 1")
         self.concurrent_fetches = int(concurrent_fetches)
-        self.cache_dir = Path(cache_dir) if cache_dir else _default_cache_dir()
+        self.cache_dir = (
+            Path(cache_dir) if cache_dir else source_dir(self.name) / "catalog"
+        )
         self.force_refresh = bool(force_refresh)
         self.storage_options = (
             dict(storage_options) if storage_options else {"anon": True}
         )
-        self.copyright_dataset = copyright_dataset
+        # Resolution order for the rights-classification dataset:
+        #   1. Explicit kwarg (one-off / pipeline-config override).
+        #   2. `info.yaml`'s `rights.read_from` (from a prior `setup` or
+        #      `refresh`).
+        #   3. Error — no silent default. Surface the canonical public
+        #      dataset as a suggested value so the fix is obvious.
+        self.copyright_dataset = copyright_dataset or _resolve_copyright_dataset()
         self.copyright_parquet_path = copyright_parquet_path
 
         # Optional [start_idx, end_idx) window over the deterministic sample.
@@ -351,9 +385,28 @@ class BhlSourceAdapter(SourceAdapter):
 # --- helpers ----------------------------------------------------------------
 
 
-def _default_cache_dir() -> Path:
-    base = os.environ.get("OCRSCOUT_CACHE_DIR") or os.path.expanduser("~/.cache/ocrscout")
-    return Path(base) / "bhl"
+def _resolve_copyright_dataset() -> str:
+    """Read ``info.yaml`` for a configured rights-lookup repo, or fail loudly.
+
+    Called only when the adapter's ``copyright_dataset=`` kwarg is absent.
+    The error message names the canonical public dataset as a suggested
+    value (the path most users will want) without making it a silent
+    fallback — the user has to type it explicitly via ``setup`` first.
+    """
+    info = load_info("bhl")
+    if info is not None and info.rights.read_from:
+        return info.rights.read_from
+    raise ScoutError(
+        "BhlSourceAdapter has no rights-classification dataset configured. "
+        f"Run `ocrscout source bhl setup --read-from {CANONICAL_COPYRIGHT_DATASET}` "
+        "to consume the canonical public dataset, or "
+        "`ocrscout source bhl refresh --runner local|hf "
+        "--source-repo <user>/bhl_rights_json "
+        "--output-repo <user>/bhl_rights_json_classified` "
+        "to maintain your own classified version. "
+        "You can also pass `copyright_dataset=<repo>` explicitly to the "
+        "adapter constructor for a one-off run."
+    )
 
 
 def _parse_int(value: Any) -> int | None:
@@ -504,6 +557,15 @@ def _run_duckdb_sample(
         params.extend([year_range[0], year_range[1]])
     where_sql = " AND ".join(where_clauses)
 
+    # The classified parquet was extracted from item.txt.gz, but stores
+    # missing fields as '' while our reader (nullstr='\\N') turns them into
+    # NULL — so NULLIF + IS NOT DISTINCT FROM normalises both sides before
+    # comparison and treats NULL=NULL as a match.
+    rights_join_sql = " AND ".join(
+        f"NULLIF(c.{col}, '') IS NOT DISTINCT FROM NULLIF(i.{col}, '')"
+        for col in COPYRIGHT_JOIN_COLUMNS
+    )
+
     volumes_limit_sql = f"LIMIT {volumes_n}" if volumes_n is not None else ""
 
     sql = f"""
@@ -513,6 +575,9 @@ def _run_duckdb_sample(
             i.BarCode,
             i.TitleID,
             i.CopyrightStatus,
+            i.RightsStatement,
+            i.LicenseType,
+            i.RightsHolder,
             t.LanguageCode AS Language,
             COALESCE(t.FullTitle, t.ShortTitle) AS Title,
             t.MARCBibID,
@@ -523,7 +588,7 @@ def _run_duckdb_sample(
         FROM {_read_tsv(item_path)} AS i
         LEFT JOIN {_read_tsv(title_path)} AS t USING (TitleID)
         JOIN read_parquet('{copyright_path}') AS c
-          ON c.CopyrightStatus = i.CopyrightStatus
+          ON {rights_join_sql}
         WHERE {where_sql}
     ),
     all_pages AS (
@@ -540,7 +605,12 @@ def _run_duckdb_sample(
             e.TL2Author,
             e.Language,
             e.Year,
-            e.Rights
+            e.Rights,
+            e.CopyrightStatus,
+            e.RightsStatement,
+            e.LicenseType,
+            e.RightsHolder,
+            e.ItemYear
         FROM {_read_tsv(page_path)} AS p
         JOIN eligible e USING (ItemID)
     ),
@@ -617,6 +687,9 @@ def _rows_to_volumes(rows: list[dict[str, Any]]) -> list[Volume]:
                     "BarCode": str(bar_code) if bar_code else None,
                     "TitleID": str(title_id) if title_id else None,
                     "CopyrightStatus": row.get("CopyrightStatus"),
+                    "RightsStatement": row.get("RightsStatement"),
+                    "LicenseType": row.get("LicenseType"),
+                    "RightsHolder": row.get("RightsHolder"),
                     "ItemYear": row.get("ItemYear"),
                 },
             )
