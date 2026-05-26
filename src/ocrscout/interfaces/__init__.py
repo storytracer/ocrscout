@@ -13,6 +13,7 @@ from ocrscout.interfaces.export import ExportAdapter
 from ocrscout.interfaces.normalizer import Normalizer
 from ocrscout.interfaces.reference import ReferenceAdapter
 from ocrscout.interfaces.reporter import Reporter
+from ocrscout.interfaces.runner import Runner
 from ocrscout.interfaces.source import SourceAdapter
 
 __all__ = [
@@ -27,5 +28,6 @@ __all__ = [
     "PredictionView",
     "ReferenceAdapter",
     "Reporter",
+    "Runner",
     "SourceAdapter",
 ]

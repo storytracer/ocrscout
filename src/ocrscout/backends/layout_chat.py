@@ -1,21 +1,23 @@
-"""LayoutChatBackend: layout-detector-driven, region-level OCR.
+"""LayoutChatBackend: layout-detector-driven, region-level OCR over LiteLLM.
 
 For each page:
 
 1. Run a registered ``LayoutDetector`` to find typed regions on the page.
 2. Sort regions in a stable reading order (top-then-left, with vertical
-   bucketing to tolerate small jitter on same-row items).
+   bucketing to tolerate small same-row jitter; or use the detector's own
+   ``reading_order`` field when populated).
 3. For each region: crop the source image, pick the prompt template based on
    the region's *detector-native* category (via
    ``profile.prompt_mode_per_category``, falling back to
-   ``preferred_prompt_mode``), and POST one chat-completion to the
-   OpenAI-compatible endpoint.
+   ``preferred_prompt_mode``), and call ``litellm.completion`` against the
+   LiteLLM proxy.
 4. Compose a ``layout_json`` payload — one block per region with the
    page-coordinate bbox (NOT the crop coordinates) and the OCR text — and
    yield it as a single ``RawOutput`` per page.
 
-Server-mode-only: subprocess vLLM is unsupported here because per-region
-subprocess re-spawn would dwarf any inference time.
+Requires an active Runner (LiteLLM proxy + at least one backing vLLM
+serve). Subprocess vLLM is unsupported here because the per-region launch
+cost would dwarf any inference time.
 """
 
 from __future__ import annotations
@@ -25,19 +27,13 @@ import json
 import logging
 import os
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Iterator, Sequence
 from typing import Any, ClassVar
 
-import requests
-
-from ocrscout.backends._openai_chat import (
-    ChatCompletionError,
-    build_base_payload,
-    build_chat_request_body,
-    list_models,
-    normalize_endpoint,
-    post_chat_completion,
-)
+from ocrscout import cost as cost_mod
+from ocrscout.backends.litellm import _build_messages, _split_sampling
 from ocrscout.errors import BackendError
 from ocrscout.interfaces.backend import ModelBackend
 from ocrscout.profile import ModelProfile
@@ -55,13 +51,10 @@ _READING_ORDER_ROW_PX = 50
 
 
 class LayoutChatBackend(ModelBackend):
-    """Layout-aware OCR backend over an OpenAI-compatible /chat/completions
-    endpoint."""
+    """Layout-aware OCR over the LiteLLM proxy."""
 
     name = "layout_chat"
-    # Tells managed-mode lifecycle that profiles using this backend need a
-    # vLLM serve subprocess spawned for them, just like ``source: vllm``.
-    requires_managed_vllm: ClassVar[bool] = True
+    requires_runner: ClassVar[bool] = True
 
     def prepare(
         self, profile: ModelProfile, pages: Sequence[PageImage]
@@ -75,105 +68,94 @@ class LayoutChatBackend(ModelBackend):
                 f"LayoutChatBackend: profile {profile.name!r} has no prompt_templates"
             )
 
-        server_url = os.environ.get("OCRSCOUT_VLLM_URL") or profile.server_url
-        if not server_url:
+        proxy_url = os.environ.get("OCRSCOUT_VLLM_URL") or profile.server_url
+        if not proxy_url:
             raise BackendError(
-                "LayoutChatBackend requires an OpenAI-compatible server. "
-                "Set --server-url, --managed, or profile.server_url. "
-                "Subprocess vLLM is not supported in layout mode."
+                "LayoutChatBackend requires a LiteLLM proxy URL. Launch a "
+                "runner (`ocrscout launch --models ...`) or set "
+                "OCRSCOUT_VLLM_URL."
             )
-        endpoint = normalize_endpoint(server_url)
+        proxy_url = proxy_url.rstrip("/")
 
-        # Probe /models before doing anything expensive: catches "wrong
-        # --server-url" and "model not loaded on this endpoint" up front,
-        # rather than after every region 404s silently inside _post_region.
-        session = requests.Session()
-        try:
-            served = list_models(session, endpoint, timeout=_MODELS_PROBE_TIMEOUT)
-        except ChatCompletionError as e:
-            session.close()
+        # Probe ``/models`` so a wrong URL fails up-front rather than after
+        # every region 404s silently inside _post_region. The proxy
+        # advertises the profile name (not the model_id) when its model_list
+        # was generated from the same profile, so check against either.
+        served = _list_proxy_models(proxy_url, timeout=_MODELS_PROBE_TIMEOUT)
+        if profile.name not in served and profile.model_id not in served:
             raise BackendError(
-                f"LayoutChatBackend: failed to query {endpoint}/models for "
-                f"profile {profile.name!r}: {e}"
-            ) from e
-        if profile.model_id not in served:
-            session.close()
-            raise BackendError(
-                f"LayoutChatBackend: profile {profile.name!r} expects model "
-                f"{profile.model_id!r} but {endpoint} serves {served!r}. "
-                f"Check --server-url (proxy URL when --managed runs multiple models)."
+                f"LayoutChatBackend: profile {profile.name!r} (model_id "
+                f"{profile.model_id!r}) is not served by the LiteLLM proxy at "
+                f"{proxy_url}; proxy serves {sorted(served)!r}."
             )
 
         detector_cls = registry.get("layout_detectors", profile.layout_detector)
         try:
             detector = detector_cls(**profile.layout_detector_args)
         except Exception as e:
-            session.close()
             raise BackendError(
                 f"LayoutChatBackend: failed to instantiate layout detector "
                 f"{profile.layout_detector!r}: {e}"
             ) from e
 
+        cost_mod.ensure_callback_registered()
+
         return BackendInvocation(
             kind="http",
-            endpoint=endpoint,
+            endpoint=proxy_url,
             profile=profile,
             pages=[p.page_id for p in pages],
             extra={
                 "pages_runtime": list(pages),
                 "detector": detector,
-                "session": session,
             },
         )
 
     def run(self, invocation: BackendInvocation) -> Iterator[RawOutput]:
-        endpoint = normalize_endpoint(invocation.endpoint or "")
-        if not endpoint:
-            raise BackendError("LayoutChatBackend.run: missing endpoint URL")
-
         profile = invocation.profile
+        proxy_url = invocation.endpoint or ""
+        if not proxy_url:
+            raise BackendError("LayoutChatBackend.run: missing proxy URL")
+
         pages: list[PageImage] = list(invocation.extra.get("pages_runtime", []))
         detector = invocation.extra["detector"]
-        session: requests.Session = invocation.extra["session"]
-
-        timeout = float(profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT))
+        timeout = float(
+            profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT)
+        )
         region_concurrency = max(
             1,
-            int(profile.backend_args.get("region_concurrency", _DEFAULT_REGION_CONCURRENCY)),
+            int(
+                profile.backend_args.get(
+                    "region_concurrency", _DEFAULT_REGION_CONCURRENCY
+                )
+            ),
         )
-
-        base_payload = build_base_payload(profile)
-        url = f"{endpoint}/chat/completions"
+        sampling = _split_sampling(profile.sampling_args or {})
         prefix = f"[{profile.name}]"
 
         log.info(
             "%s starting %d page(s) against %s (region concurrency=%d, detector=%s)",
-            prefix, len(pages), endpoint, region_concurrency, profile.layout_detector,
+            prefix, len(pages), proxy_url, region_concurrency, profile.layout_detector,
         )
-        log.debug("%s POST URL: %s", prefix, url)
 
-        try:
-            t_total = time.perf_counter()
-            for page_idx, page in enumerate(pages, start=1):
-                yield self._run_one_page(
-                    page=page,
-                    page_idx=page_idx,
-                    total_pages=len(pages),
-                    detector=detector,
-                    session=session,
-                    url=url,
-                    base_payload=base_payload,
-                    profile=profile,
-                    timeout=timeout,
-                    region_concurrency=region_concurrency,
-                    log_prefix=prefix,
-                )
-            log.info(
-                "%s layout-chat finished %d pages in %.1fs",
-                prefix, len(pages), time.perf_counter() - t_total,
+        t_total = time.perf_counter()
+        for page_idx, page in enumerate(pages, start=1):
+            yield self._run_one_page(
+                page=page,
+                page_idx=page_idx,
+                total_pages=len(pages),
+                detector=detector,
+                proxy_url=proxy_url,
+                profile=profile,
+                sampling=sampling,
+                timeout=timeout,
+                region_concurrency=region_concurrency,
+                log_prefix=prefix,
             )
-        finally:
-            session.close()
+        log.info(
+            "%s layout-chat finished %d pages in %.1fs",
+            prefix, len(pages), time.perf_counter() - t_total,
+        )
 
     def _run_one_page(
         self,
@@ -182,14 +164,15 @@ class LayoutChatBackend(ModelBackend):
         page_idx: int,
         total_pages: int,
         detector: Any,
-        session: requests.Session,
-        url: str,
-        base_payload: dict[str, Any],
+        proxy_url: str,
         profile: ModelProfile,
+        sampling: tuple[dict[str, Any], dict[str, Any]],
         timeout: float,
         region_concurrency: int,
         log_prefix: str,
     ) -> RawOutput:
+        cost_mod.recorder.open_page(page.page_id, profile.name)
+
         try:
             regions = detector.detect(page)
         except Exception as e:  # noqa: BLE001
@@ -225,9 +208,8 @@ class LayoutChatBackend(ModelBackend):
                     region=region,
                     page=page,
                     profile=profile,
-                    session=session,
-                    url=url,
-                    base_payload=base_payload,
+                    proxy_url=proxy_url,
+                    sampling=sampling,
                     timeout=timeout,
                 ): region
                 for region in ordered
@@ -270,26 +252,61 @@ def _post_region(
     region: LayoutRegion,
     page: PageImage,
     profile: ModelProfile,
-    session: requests.Session,
-    url: str,
-    base_payload: dict[str, Any],
+    proxy_url: str,
+    sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
 ) -> dict[str, Any]:
-    """POST one cropped region; return a layout-JSON block dict."""
+    """POST one cropped region through LiteLLM; return a layout-JSON block dict."""
     if page.image is None:
         return _failed_block(region, error="page has no in-memory image")
 
     crop = page.image.crop(region.bbox)
     prompt_template = _resolve_region_prompt(profile, region)
     prompt = _substitute_region_dims(prompt_template, crop)
+    messages = _build_messages(crop, prompt)
+    top_level, extra_body = sampling
 
-    body = build_chat_request_body(crop, prompt, base_payload)
+    import litellm
+
     try:
-        text, _tokens = post_chat_completion(session, url, body, timeout=timeout)
-    except ChatCompletionError as e:
-        return _failed_block(region, error=str(e))
+        resp = litellm.completion(
+            model=profile.name,
+            api_base=proxy_url,
+            api_key=os.environ.get("LITELLM_API_KEY", "ocrscout-dummy"),
+            messages=messages,
+            timeout=timeout,
+            metadata={
+                "page_id": page.page_id,
+                "region_id": region.id,
+                "model_name": profile.name,
+            },
+            extra_body=extra_body or None,
+            **top_level,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _failed_block(region, error=f"{type(e).__name__}: {e}")
 
+    text = _extract_text(resp)
     return _ok_block(region, text=text)
+
+
+def _extract_text(resp: Any) -> str:
+    try:
+        choices = getattr(resp, "choices", None) or (
+            resp.get("choices") if isinstance(resp, dict) else None
+        )
+        if not choices:
+            return ""
+        first = choices[0]
+        msg = getattr(first, "message", None) or (
+            first.get("message") if isinstance(first, dict) else None
+        )
+        content = getattr(msg, "content", None) if msg is not None else None
+        if content is None and isinstance(msg, dict):
+            content = msg.get("content")
+        return content or ""
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return ""
 
 
 def _ok_block(region: LayoutRegion, *, text: str) -> dict[str, Any]:
@@ -351,3 +368,27 @@ def _sort_reading_order(regions: list[LayoutRegion]) -> list[LayoutRegion]:
         return (int(round(top / _READING_ORDER_ROW_PX)) * _READING_ORDER_ROW_PX, left)
 
     return sorted(regions, key=heuristic_key)
+
+
+def _list_proxy_models(proxy_url: str, *, timeout: float) -> set[str]:
+    """GET ``{proxy_url}/models`` and return the served model_name set.
+
+    Uses stdlib ``urllib`` instead of ``requests`` because this is a tiny
+    one-shot probe; pulling ``requests`` in just to fail fast on URL
+    misconfig isn't worth the dep weight in a backend that otherwise
+    talks via ``litellm`` (which manages its own HTTP layer).
+    """
+    url = f"{proxy_url.rstrip('/')}/models"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            data = json.load(resp)
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError) as e:
+        raise BackendError(
+            f"LayoutChatBackend: cannot reach LiteLLM proxy at {url}: {e}"
+        ) from e
+    try:
+        return {entry["id"] for entry in data["data"]}
+    except (KeyError, TypeError) as e:
+        raise BackendError(
+            f"LayoutChatBackend: malformed /models response from {url}: {e}"
+        ) from e

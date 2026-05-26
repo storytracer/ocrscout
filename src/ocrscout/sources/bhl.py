@@ -110,6 +110,8 @@ class BhlSourceAdapter(SourceAdapter):
         storage_options: dict[str, Any] | None = None,
         copyright_dataset: str = COPYRIGHT_DATASET,
         copyright_parquet_path: str = COPYRIGHT_PARQUET_PATH,
+        start_idx: int | None = None,
+        end_idx: int | None = None,
         **_ignored: Any,
     ) -> None:
         if "max_pages_per_volume" in _ignored:
@@ -161,6 +163,22 @@ class BhlSourceAdapter(SourceAdapter):
         self.copyright_dataset = copyright_dataset
         self.copyright_parquet_path = copyright_parquet_path
 
+        # Optional [start_idx, end_idx) window over the deterministic sample.
+        # Used by SkyPilot/HF workers: each worker receives the same
+        # (sample_n, seed, …) plus a distinct window so the union is the
+        # full deterministic sample with no overlaps. ``None`` means
+        # "no clipping" (the full sample is yielded).
+        if start_idx is not None and start_idx < 0:
+            raise ScoutError(f"start_idx must be >= 0; got {start_idx}")
+        if end_idx is not None and end_idx < 0:
+            raise ScoutError(f"end_idx must be >= 0; got {end_idx}")
+        if start_idx is not None and end_idx is not None and end_idx < start_idx:
+            raise ScoutError(
+                f"end_idx ({end_idx}) must be >= start_idx ({start_idx})"
+            )
+        self.start_idx: int | None = int(start_idx) if start_idx is not None else None
+        self.end_idx: int | None = int(end_idx) if end_idx is not None else None
+
         self._sample_rows: list[dict[str, Any]] | None = None
         self._volumes: list[Volume] | None = None
 
@@ -170,6 +188,10 @@ class BhlSourceAdapter(SourceAdapter):
         self._ensure_query_run()
         assert self._sample_rows is not None
         rows = self._sample_rows
+        if self.start_idx is not None or self.end_idx is not None:
+            lo = self.start_idx if self.start_idx is not None else 0
+            hi = self.end_idx if self.end_idx is not None else len(rows)
+            rows = rows[lo:hi]
         if self.concurrent_fetches == 1 or len(rows) <= 1:
             for row in rows:
                 page = self._row_to_page(row)

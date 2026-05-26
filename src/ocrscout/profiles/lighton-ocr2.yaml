@@ -1,5 +1,6 @@
 name: lighton-ocr2
-source: vllm
+backend: litellm
+runtime: vllm
 model_id: lightonai/LightOnOCR-2-1B
 model_size: 1B
 upstream_script: uv-scripts/ocr/lighton-ocr2.py

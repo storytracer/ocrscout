@@ -1,8 +1,15 @@
-"""Standalone runner scripts spawned in subprocesses by ocrscout backends.
+"""Concrete ``Runner`` implementations and their supporting helpers.
 
-These modules are NOT imported by the ocrscout package itself — they execute
-inside ``uv run`` venvs that have heavy GPU dependencies (vllm, torch). Sitting
-in their own subpackage keeps them away from sibling shadowing: when Python
-adds ``sys.path[0]`` for the runner script, no nearby module name (``vllm.py``,
-``docling.py``) collides with the real third-party packages the runner imports.
+Each ``Runner`` (``LocalRunner``, future ``SkyPilotRunner``,
+``HuggingFaceRunner``) orchestrates a vLLM + LiteLLM stack on its target
+infrastructure. The supporting modules (``_daemon``, ``_preflight``)
+provide shared primitives.
+
+``vllm_runner.py`` (the legacy one-shot subprocess script) is scheduled
+for deletion in Phase 1 step 6 — it predates the LiteLLM-always
+architecture and no longer has a caller.
 """
+
+from ocrscout.runners.local import LocalRunner
+
+__all__ = ["LocalRunner"]

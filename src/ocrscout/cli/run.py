@@ -19,8 +19,10 @@ from rich import print as rprint
 from rich.table import Table
 
 from ocrscout import registry
+from ocrscout import state as state_mod
 from ocrscout.cli import app
-from ocrscout.errors import BackendError, ManagedServerError, NormalizerError, ProfileNotFound
+from ocrscout.cost import recorder as cost_recorder
+from ocrscout.errors import BackendError, NormalizerError, ProfileNotFound, RunnerError
 from ocrscout.exports.layout import parquet_dest
 from ocrscout.interfaces.comparison import (
     BaselineView,
@@ -31,9 +33,10 @@ from ocrscout.interfaces.comparison import (
 )
 from ocrscout.interfaces.reference import ReferenceAdapter
 from ocrscout.log import VERBOSE, setup_logging
-from ocrscout.managed import managed_servers
 from ocrscout.metrics import MetricsCollector
 from ocrscout.profile import resolve
+from ocrscout.runners.local import LocalRunner
+from ocrscout.state import GpuConfig
 from ocrscout.types import AdapterRef, ExportRecord, PipelineConfig
 
 log = logging.getLogger(__name__)
@@ -105,34 +108,26 @@ def run(
     export: str = typer.Option(
         "parquet", "--export", help="Export adapter name."
     ),
-    server_url: str | None = typer.Option(
-        None, "--server-url",
-        help="OpenAI-compatible vLLM server URL (e.g. http://localhost:8000/v1). "
-             "When set, vllm-source profiles use HTTP server mode instead of "
-             "spawning a `uv run --with vllm` subprocess. Equivalent to setting "
-             "OCRSCOUT_VLLM_URL. Mutually exclusive with --managed.",
-    ),
-    managed: bool = typer.Option(
-        False, "--managed",
-        help="Spin up one vllm-serve per vllm-source profile (and a LiteLLM "
-             "proxy when there are 2+) for the duration of this run, then tear "
-             "it down. For long-lived servers, use `ocrscout serve` instead.",
-    ),
     gpu_budget: float = typer.Option(
         0.85, "--gpu-budget",
-        help="Maximum total GPU memory the managed stack will collectively "
+        help="Maximum total GPU memory the local stack will collectively "
              "claim, as a fraction of total VRAM. Per-model KV cache is set "
              "by `vllm_engine_args.kv_cache_memory_bytes` in each profile; "
-             "this flag bounds the sum + per-model overhead. Only used with "
-             "--managed.",
+             "this flag bounds the sum + per-model overhead.",
     ),
     base_port: int = typer.Option(
         8000, "--base-port",
-        help="First port for managed vllm-serves. Only used with --managed.",
+        help="First TCP port for vLLM serves (LocalRunner only).",
     ),
     proxy_port: int = typer.Option(
         4000, "--proxy-port",
-        help="LiteLLM proxy port (only used when --managed and N>=2).",
+        help="LiteLLM proxy port (LocalRunner only).",
+    ),
+    keep_up: bool = typer.Option(
+        False, "--keep-up",
+        help="After the pipeline finishes, leave the runner stack up so "
+             "subsequent `ocrscout submit` calls don't pay another launch "
+             "cost. Default: tear it down (ephemeral run).",
     ),
     parallel_models: int | None = typer.Option(
         None, "--parallel-models", "-P",
@@ -164,18 +159,6 @@ def run(
             "source adapter. Pass --source-name to select a different "
             "adapter (e.g. `bhl`), or use --benchmark."
         )
-
-    if managed and server_url:
-        raise typer.BadParameter(
-            "--managed and --server-url are mutually exclusive: --managed "
-            "spawns its own server stack and sets the env var itself."
-        )
-
-    if server_url:
-        # Set the env var so backends pick it up (and so it propagates to
-        # any subprocess invoked downstream).
-        os.environ["OCRSCOUT_VLLM_URL"] = server_url
-        log.info("vLLM server: %s", server_url)
 
     source_args: dict[str, Any] = _parse_source_args(source_arg or [])
     if source_name == "hf_dataset":
@@ -251,42 +234,92 @@ def run(
     else:
         log.info("Running %d model(s) sequentially", len(cfg.models))
 
-    if managed:
-        try:
-            profiles = [resolve(name) for name in cfg.models]
-        except ProfileNotFound as e:
-            raise typer.BadParameter(str(e)) from e
-        try:
-            with managed_servers(
-                profiles,
-                gpu_budget=gpu_budget,
-                base_port=base_port,
-                proxy_port=proxy_port,
-            ) as handle:
-                if handle.proxy_url:
-                    os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
-                    log.info(
-                        "Managed endpoint: %s  (logs: %s)",
-                        handle.proxy_url, handle.log_dir,
-                    )
-                else:
-                    log.info(
-                        "--managed requested but no vllm profiles; running "
-                        "docling/in-process backends only."
-                    )
-                _execute(cfg, parallel_models=parallel_models)
-        except ManagedServerError as e:
-            log.error("Managed stack failed: %s", e)
-            raise typer.Exit(code=1) from e
-    else:
-        _execute(cfg, parallel_models=parallel_models)
+    run_pipeline(
+        cfg,
+        parallel_models=parallel_models,
+        base_port=base_port,
+        proxy_port=proxy_port,
+        gpu_budget=gpu_budget,
+        keep_up=keep_up,
+    )
+
+
+def run_pipeline(
+    cfg: PipelineConfig,
+    *,
+    parallel_models: int = 1,
+    base_port: int = 8000,
+    proxy_port: int = 4000,
+    gpu_budget: float = 0.85,
+    keep_up: bool = False,
+    resume: bool = False,
+) -> None:
+    """Launch the required runner (if any), run the pipeline, tear down.
+
+    Shared by ``ocrscout run`` and ``ocrscout apply`` (and any future
+    command that takes a fully-resolved ``PipelineConfig``). Auto-launches
+    a ``LocalRunner`` when any profile has ``runtime != cpu`` and no
+    matching runner is already up. Profiles with ``runtime: cpu`` only
+    skip the launch entirely (Docling, Tesseract run in-process).
+    """
+    try:
+        profiles = [resolve(name) for name in cfg.models]
+    except ProfileNotFound as e:
+        raise typer.BadParameter(str(e)) from e
+
+    needs_proxy = any(p.runtime != "cpu" for p in profiles)
+    if not needs_proxy:
+        log.info("All profiles are runtime=cpu; running CPU-side backends in-process.")
+        _execute(cfg, parallel_models=parallel_models, resume=resume)
+        return
+
+    runner = LocalRunner()
+    existing_state = state_mod.read_state()
+    reused_existing = (
+        existing_state is not None and existing_state.runner == "local"
+    )
+
+    try:
+        handle = runner.launch(
+            models=cfg.models,
+            base_port=base_port,
+            proxy_port=proxy_port,
+            gpu_budget=gpu_budget,
+        )
+        os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+        if reused_existing:
+            log.info("Reusing already-running local stack")
+    except RunnerError as e:
+        log.error("Runner launch failed: %s", e)
+        raise typer.Exit(code=1) from e
+
+    try:
+        _execute(cfg, parallel_models=parallel_models, resume=resume)
+    finally:
+        if not keep_up and not reused_existing:
+            try:
+                runner.down()
+            except Exception as e:  # noqa: BLE001
+                log.warning("Runner teardown reported error: %s", e)
 
 
 def _execute(
     cfg: PipelineConfig,
     *,
     parallel_models: int = 1,
+    resume: bool = False,
 ) -> None:
+    # Resolve the active GPU context once and stamp it onto every row of
+    # this run. Env-var overrides (set by SkyPilot/HF job YAMLs) take
+    # precedence over ``~/.ocrscout/config.yaml`` so remote workers
+    # carry their own pricing context into the output Parquet.
+    gpu_cfg = state_mod.read_config().gpu
+    log.log(
+        VERBOSE,
+        "GPU context: type=%s provider=%s cost_per_hour=%.4f",
+        gpu_cfg.type, gpu_cfg.provider, gpu_cfg.cost_per_hour,
+    )
+
     source_cls = registry.get("sources", cfg.source.name)
     source = source_cls(**cfg.source.args)
     pages_iter = source.iter_pages()
@@ -294,6 +327,20 @@ def _execute(
         pages = list(itertools.islice(pages_iter, cfg.sample))
     else:
         pages = list(pages_iter)
+    if resume:
+        # Drop page ids already completed in a prior run (recorded by the
+        # parquet adapter into <output_dir>/progress.json). Cheap dedup —
+        # the loaded set is bounded by the deterministic sample size.
+        from ocrscout.exports.parquet import ProgressTracker as _PT
+        progress = _PT(cfg.output_dir)
+        done = progress.completed_page_ids()
+        if done:
+            before = len(pages)
+            pages = [p for p in pages if p.page_id not in done]
+            log.info(
+                "Resume: skipping %d of %d pages already in progress.json",
+                before - len(pages), before,
+            )
     page_by_id = {p.page_id: p for p in pages}
     source_label = cfg.source.args.get("path") or cfg.source.name
     log.info("Loaded %d page(s) from %r", len(pages), source_label)
@@ -350,6 +397,7 @@ def _execute(
             reference_adapter=reference_adapter,
             comparisons=active_comparisons,
             metrics=metrics,
+            gpu=gpu_cfg,
         )
         return name, result
 
@@ -392,10 +440,11 @@ def _run_one_model(
     reference_adapter: ReferenceAdapter | None,
     comparisons: list[Comparison],
     metrics: MetricsCollector,
+    gpu: GpuConfig,
 ) -> _ModelRunResult:
     try:
         profile = resolve(model_name)
-        backend = registry.get("backends", profile.source)()
+        backend = registry.get("backends", profile.backend)()
         normalizer_name = normalizer_overrides.get(model_name, profile.normalizer)
         normalizer = registry.get("normalizers", normalizer_name)()
     except Exception as e:
@@ -403,8 +452,8 @@ def _run_one_model(
         return _ModelRunResult(ok=0, failed=len(pages), run_seconds=0.0)
 
     log.info(
-        "[%s] starting (backend=%s, normalizer=%s)",
-        model_name, profile.source, normalizer_name,
+        "[%s] starting (backend=%s, runtime=%s, normalizer=%s)",
+        model_name, profile.backend, profile.runtime, normalizer_name,
     )
 
     try:
@@ -488,6 +537,24 @@ def _run_one_model(
                     page_comparisons[cmp.name] = result
                     accumulated_comparisons.append(result)
 
+        # Close the cost recorder's page (if the backend opened one — only
+        # LiteLLM-routed backends do). Compute gpu_time_cost from elapsed
+        # and the active GpuConfig so the column is comparable across
+        # GPUs without re-deriving downstream.
+        cost_metrics = cost_recorder.close_page(page.page_id)
+        if cost_metrics is not None:
+            elapsed_s = cost_metrics.elapsed_seconds
+            gpu_time_cost = elapsed_s / 3600.0 * gpu.cost_per_hour
+            input_tokens = cost_metrics.input_tokens
+            output_tokens = cost_metrics.output_tokens
+            litellm_cost = cost_metrics.litellm_cost
+        else:
+            elapsed_s = None
+            gpu_time_cost = None
+            input_tokens = None
+            output_tokens = None
+            litellm_cost = None
+
         record = ExportRecord(
             page=page,
             model=model_name,
@@ -506,6 +573,14 @@ def _run_one_model(
                 "text_length": text_length,
             },
             comparisons=page_comparisons,
+            gpu_type=gpu.type,
+            provider=gpu.provider,
+            cost_per_hour=gpu.cost_per_hour,
+            elapsed_seconds=elapsed_s,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            litellm_cost=litellm_cost,
+            gpu_time_cost=gpu_time_cost,
         )
         exporter.write(record)
         ok += 1

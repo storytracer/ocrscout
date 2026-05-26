@@ -23,13 +23,17 @@ class BackendError(ScoutError):
     """Raised when a model backend fails to prepare or execute."""
 
 
-class ManagedServerError(ScoutError):
-    """Raised when ocrscout's managed multi-server orchestration fails.
+class RunnerError(ScoutError):
+    """Raised by a Runner when launch/submit/status/down fails.
 
-    Covers GPU-budget rejection, vllm-serve startup timeout/failure, and
-    LiteLLM proxy startup failure. Teardown of any partially-started subprocesses
-    happens before this is raised.
+    Includes GPU-budget rejection, daemon startup failure (LocalRunner),
+    remote pool errors (SkyPilotRunner), and HF Jobs API errors
+    (HuggingFaceRunner).
     """
+
+
+class StateError(ScoutError):
+    """Raised when ~/.ocrscout/state.yaml or config.yaml is malformed."""
 
 
 class NormalizerError(ScoutError):

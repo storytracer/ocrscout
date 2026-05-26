@@ -1,5 +1,6 @@
 name: dots-ocr
-source: vllm
+backend: litellm
+runtime: vllm
 model_id: rednote-hilab/dots.ocr
 model_size: 1.7B
 upstream_script: uv-scripts/ocr/dots-ocr.py

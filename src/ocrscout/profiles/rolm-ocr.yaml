@@ -1,5 +1,6 @@
 name: rolm-ocr
-source: vllm
+backend: litellm
+runtime: vllm
 model_id: reducto/RolmOCR
 model_size: 7B
 upstream_script: uv-scripts/ocr/rolm-ocr.py

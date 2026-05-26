@@ -1,5 +1,6 @@
 name: smoldocling
-source: docling
+backend: docling
+runtime: cpu
 model_id: ds4sd/SmolDocling-256M-preview
 output_format: docling_document
 normalizer: passthrough

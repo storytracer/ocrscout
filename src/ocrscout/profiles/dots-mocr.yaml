@@ -1,5 +1,6 @@
 name: dots-mocr
-source: vllm
+backend: litellm
+runtime: vllm
 model_id: rednote-hilab/dots.mocr
 model_size: 3B
 upstream_script: uv-scripts/ocr/dots-mocr.py
@@ -23,7 +24,7 @@ category_mapping:
 
 # Prompts copied verbatim from the upstream dots-mocr.py PROMPT_TEMPLATES
 # (see uv-scripts/ocr/dots-mocr.py:67). The "svg" mode supplies {width} and
-# {height} placeholders that VllmBackend fills in per page.
+# {height} placeholders that the backend fills in per page.
 preferred_prompt_mode: layout-all
 prompt_templates:
   ocr: |

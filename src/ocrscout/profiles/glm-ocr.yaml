@@ -1,5 +1,6 @@
 name: glm-ocr
-source: vllm
+backend: litellm
+runtime: vllm
 model_id: zai-org/GLM-OCR
 model_size: 0.9B
 upstream_script: uv-scripts/ocr/glm-ocr.py

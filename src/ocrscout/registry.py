@@ -27,6 +27,7 @@ EntryGroup = Literal[
     "benchmarks",
     "reporters",
     "layout_detectors",
+    "runners",
 ]
 
 _GROUPS: tuple[EntryGroup, ...] = (
@@ -40,6 +41,7 @@ _GROUPS: tuple[EntryGroup, ...] = (
     "benchmarks",
     "reporters",
     "layout_detectors",
+    "runners",
 )
 
 
@@ -56,8 +58,7 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
             "bhl_ocr": "ocrscout.references.bhl_ocr:BhlOcrReferenceAdapter",
         },
         "backends": {
-            "vllm": "ocrscout.backends.vllm:VllmBackend",
-            "openai_api": "ocrscout.backends.openai_api:OpenAIApiBackend",
+            "litellm": "ocrscout.backends.litellm:LiteLLMBackend",
             "tesseract": "ocrscout.backends.tesseract:TesseractBackend",
             "docling": "ocrscout.backends.docling:DoclingBackend",
             "layout_chat": "ocrscout.backends.layout_chat:LayoutChatBackend",
@@ -87,6 +88,14 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
         },
         "layout_detectors": {
             "pp-doclayout-v3": "ocrscout.layout_detectors.pp_doclayout_v3:PpDocLayoutV3Detector",
+        },
+        # Built-in Runners. Third-party runners (AI Factory, Slurm, …)
+        # attach via the ``ocrscout.runners`` entry-point group declared
+        # in pyproject.toml.
+        "runners": {
+            "local": "ocrscout.runners.local:LocalRunner",
+            "skypilot": "ocrscout.runners.skypilot:SkyPilotRunner",
+            "hf": "ocrscout.runners.hf:HuggingFaceRunner",
         },
     }
 

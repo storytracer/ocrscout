@@ -1,5 +1,6 @@
 name: glm-ocr-layout
-source: layout_chat
+backend: layout_chat
+runtime: vllm
 model_id: zai-org/GLM-OCR
 model_size: 0.9B
 upstream_script: uv-scripts/ocr/glm-ocr.py

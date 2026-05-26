@@ -16,10 +16,19 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_valida
 
 from ocrscout.errors import ProfileError, ProfileNotFound
 
-# ``source`` selects a backend by registry name. We keep the type as a plain
-# ``str`` so adding a backend doesn't require touching this schema — the
-# registry validates the name at run time when it resolves the backend class.
-ProfileSource = str
+# ``backend`` selects a ModelBackend class by registry name. We keep the type
+# as a plain ``str`` so adding a backend doesn't require touching this schema —
+# the registry validates the name at run time when it resolves the backend
+# class.
+BackendName = str
+# ``runtime`` decides what infrastructure the active Runner provisions. Three
+# values cover every shipped path: ``vllm`` (Runner spawns ``vllm serve`` and
+# fronts it through LiteLLM); ``hosted`` (Runner adds a provider entry to the
+# LiteLLM config but spawns nothing — Gemini, Anthropic, OpenAI, …); ``cpu``
+# (no LiteLLM involvement at all — Docling/Tesseract run in-process). Future
+# values can be added without touching consumers because every code path that
+# branches on this field re-checks against the constrained Literal here.
+Runtime = Literal["vllm", "hosted", "cpu"]
 OutputFormat = Literal["markdown", "doctags", "layout_json", "docling_document"]
 
 DEFAULT_VLLM_ENGINE_ARGS: dict[str, Any] = {
@@ -49,6 +58,9 @@ class ModelProfile(BaseModel):
 
     Identity
         ``name``, ``model_id``, ``model_size``, ``upstream_script``
+    Routing
+        ``backend`` (which ``ModelBackend`` class makes the call),
+        ``runtime`` (what infrastructure the active Runner provisions)
     Output
         ``output_format``, ``normalizer``, ``has_bboxes``, ``has_layout``,
         ``category_mapping``
@@ -67,7 +79,28 @@ class ModelProfile(BaseModel):
 
     # Identity
     name: str
-    source: ProfileSource
+    backend: BackendName
+    """Registry name of the ``ModelBackend`` class that drives this profile.
+
+    Common values: ``litellm`` (LiteLLM-proxied OpenAI-compatible calls —
+    vLLM-served OSS VLMs *and* hosted APIs both use this), ``layout_chat``
+    (layout-detector-driven region OCR over LiteLLM), ``docling`` (CPU-side
+    Docling library), ``tesseract`` (CPU CLI binary). The registry
+    validates the name at run time, so adding a new backend doesn't
+    require touching this schema.
+    """
+    runtime: Runtime
+    """What infrastructure the active Runner provisions for this model.
+
+    * ``vllm`` — Runner spawns ``vllm serve`` and exposes it through
+      LiteLLM. Requires ``vllm_engine_args.kv_cache_memory_bytes`` so the
+      KV-budget preflight has what it needs.
+    * ``hosted`` — Runner adds a provider entry to the LiteLLM config but
+      spawns no local server. API keys come from env. No vLLM fields
+      apply.
+    * ``cpu`` — No LiteLLM involvement. ``docling`` and ``tesseract``
+      run in-process and never see the proxy.
+    """
     model_id: str
     model_size: str | None = None
     upstream_script: str | None = None
@@ -145,22 +178,53 @@ class ModelProfile(BaseModel):
     """
 
     @model_validator(mode="after")
-    def _validate_layout_chat(self) -> ModelProfile:
-        if self.source == "layout_chat":
+    def _validate_routing(self) -> ModelProfile:
+        # backend == "layout_chat" → layout-aware OCR (per-region calls)
+        if self.backend == "layout_chat":
             if not self.layout_detector:
                 raise ValueError(
-                    "source='layout_chat' requires layout_detector to be set"
+                    "backend='layout_chat' requires layout_detector to be set"
                 )
             if self.output_format != "layout_json":
                 raise ValueError(
-                    "source='layout_chat' requires output_format='layout_json' "
+                    "backend='layout_chat' requires output_format='layout_json' "
                     f"(got {self.output_format!r})"
                 )
             if self.normalizer != "layout_json":
                 raise ValueError(
-                    "source='layout_chat' requires normalizer='layout_json' "
+                    "backend='layout_chat' requires normalizer='layout_json' "
                     f"(got {self.normalizer!r})"
                 )
+            if self.runtime != "vllm":
+                raise ValueError(
+                    "backend='layout_chat' requires runtime='vllm' "
+                    f"(got {self.runtime!r}); the OSS VLMs it wraps need a "
+                    "local vLLM serve."
+                )
+
+        # runtime: vllm → the Runner's KV-budget preflight needs the absolute
+        # cache size declared on the profile. Skipping this would mean the
+        # preflight has no way to validate combined GPU footprint at launch.
+        if self.runtime == "vllm":
+            kv = (self.vllm_engine_args or {}).get("kv_cache_memory_bytes")
+            if kv is None:
+                raise ValueError(
+                    f"runtime='vllm' requires vllm_engine_args.kv_cache_memory_bytes "
+                    f"on profile {self.name!r}. Add a value like "
+                    f"`kv_cache_memory_bytes: 16G` to the profile YAML."
+                )
+
+        # runtime: hosted → vLLM-specific fields are meaningless and a sign
+        # the profile was copy-pasted from a vllm-runtime template without
+        # being adapted.
+        if self.runtime == "hosted":
+            if self.vllm_engine_args:
+                raise ValueError(
+                    f"runtime='hosted' rejects vllm_engine_args on profile "
+                    f"{self.name!r}; hosted APIs don't accept vLLM engine "
+                    f"flags. Move provider-specific tuning into backend_args."
+                )
+
         return self
 
 

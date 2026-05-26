@@ -34,10 +34,16 @@ dependencies = [
     "pyyaml>=6.0",
     "typer>=0.12.0",
     "rich>=13.0.0",
-    # Used by VllmBackend and LayoutChatBackend for OpenAI-compatible
-    # chat-completions calls. Connection pooling matters under per-region
-    # fan-out in layout mode.
+    # Used by sources/references that talk to fsspec backends, IIIF, etc.
+    # Pulls into core because the BHL adapter (and any future adapter that
+    # touches HTTP) wants connection pooling without a separate dep gate.
     "requests>=2.31.0",
+    # litellm is the universal OpenAI-compatible client. Both LiteLLMBackend
+    # (one POST per page) and LayoutChatBackend (one POST per region) call
+    # ``litellm.completion``; the success_callback in ``ocrscout.cost``
+    # records per-page tokens/cost. The proxy binary (``litellm[proxy]``)
+    # is shipped under the ``vllm`` extra for daemon spawns.
+    "litellm>=1.50.0",
     # nvitop wraps libnvml.so via nvidia-ml-py; pure-Python install in seconds,
     # no GPU runtime deps. Used by managed-mode GPU budgeting/telemetry.
     # Gracefully returns no devices on CPU-only hosts.
@@ -104,8 +110,19 @@ bhl = [
 eval = [
     "jiwer>=3.0.0",
 ]
+# Remote orchestration via SkyPilot on Kubernetes. Lazy-imported by
+# SkyPilotRunner so installing this is only required on the
+# orchestrating machine, not on every K8s worker (workers install
+# ocrscout[vllm] in their pool/job setup script).
+skypilot = [
+    "skypilot-nightly[kubernetes]>=0.7.0",
+]
+# HuggingFace Jobs API runner. Same lazy-import pattern.
+hf = [
+    "huggingface-hub>=0.25.0",
+]
 all = [
-    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout,bhl,eval]",
+    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout,bhl,eval,skypilot,hf]",
 ]
 dev = [
     "ruff>=0.6.0",
@@ -121,6 +138,11 @@ ocrscout = "ocrscout.cli:main"
 [project.entry-points."ocrscout.layout_detectors"]
 # Built-in detectors are registered in src/ocrscout/registry.py;
 # third-party packages add entries under this header.
+
+[project.entry-points."ocrscout.runners"]
+# Built-in runners (local / skypilot / hf) are registered in
+# src/ocrscout/registry.py; third-party packages (Slurm, AI Factory, …)
+# add entries under this header.
 
 [project.urls]
 Homepage = "https://github.com/storytracer/ocrscout"

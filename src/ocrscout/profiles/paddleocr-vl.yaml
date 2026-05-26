@@ -1,5 +1,6 @@
 name: paddleocr-vl
-source: vllm
+backend: litellm
+runtime: vllm
 model_id: PaddlePaddle/PaddleOCR-VL-1.5
 model_size: 0.9B
 upstream_script: uv-scripts/ocr/paddleocr-vl.py

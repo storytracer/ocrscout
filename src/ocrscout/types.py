@@ -167,6 +167,21 @@ class ExportRecord(BaseModel):
     # in, and the parquet writer round-trips them as JSON.
     comparisons: dict[str, Any] = Field(default_factory=dict)
 
+    # --- cost / GPU context, stamped onto every row at write time ---------
+    # Populated by ``ocrscout.cost.recorder`` (from LiteLLM's
+    # success_callback) and the active ``GpuConfig`` (env vars on remote
+    # workers, ``~/.ocrscout/config.yaml`` locally). All optional so
+    # backends that don't touch LiteLLM (Docling, Tesseract) and runs that
+    # don't have a configured GPU still produce a valid row.
+    gpu_type: str | None = None
+    provider: str | None = None
+    cost_per_hour: float | None = None
+    elapsed_seconds: float | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    litellm_cost: float | None = None
+    gpu_time_cost: float | None = None
+
 
 class RunMetrics(BaseModel):
     """Final metrics envelope for a complete run."""
@@ -196,6 +211,65 @@ class AdapterRef(BaseModel):
 
     name: str
     args: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunnerEndpoint(BaseModel):
+    """One model endpoint exposed by a launched Runner.
+
+    For LocalRunner this is the vLLM ``/v1`` URL; for remote runners this
+    is whatever the worker advertised. Always reachable via the proxy URL
+    on ``RunnerHandle`` — these are diagnostic detail, not what callers
+    actually post to.
+    """
+
+    model: str
+    url: str
+    pid: int | None = None
+
+
+class RunnerHandle(BaseModel):
+    """Returned by ``Runner.launch()`` when the stack is healthy.
+
+    The ``proxy_url`` is the single OpenAI-compatible endpoint every
+    backend posts to. ``endpoints`` is diagnostic — the per-model vLLM
+    URLs behind the proxy.
+    """
+
+    runner: str
+    proxy_url: str
+    endpoints: list[RunnerEndpoint] = Field(default_factory=list)
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class JobHandle(BaseModel):
+    """Returned by ``Runner.submit()``. Fire-and-forget identifier."""
+
+    job_id: str
+    runner: str
+    output_dir: str
+
+
+RunnerState = Literal["down", "launching", "ready", "busy", "error"]
+
+
+class RunnerStatus(BaseModel):
+    """Returned by ``Runner.status()``. Snapshot of the runner's current state.
+
+    Cheap to compute (reads state file, checks PIDs / queries remote API).
+    Numbers come from the output Parquet glob: ``pages_done`` counts rows,
+    ``cumulative_cost`` sums the ``litellm_cost`` + ``gpu_time_cost``
+    columns.
+    """
+
+    runner: str
+    state: RunnerState
+    models: list[str] = Field(default_factory=list)
+    proxy_url: str | None = None
+    uptime_seconds: float | None = None
+    pages_done: int = 0
+    pages_failed: int = 0
+    cumulative_cost: float = 0.0
+    details: dict[str, Any] = Field(default_factory=dict)
 
 
 class PipelineConfig(BaseModel):
