@@ -161,6 +161,14 @@ def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
             "document_table_count_delta": raw.get("document_table_count_delta"),
             "document_picture_count_delta": raw.get("document_picture_count_delta"),
             "layout_iou_mean": raw.get("layout_iou_mean"),
+            # Hardware/cost context. Timing data lives in `metrics_json`
+            # (loaded above); the cost-callback's `elapsed_seconds` /
+            # `litellm_cost` / `gpu_time_cost` flat columns aren't read by
+            # the inspector — the dispatcher's `run_seconds_total` /
+            # `run_seconds_per_page` are the single source of truth.
+            "gpu_type": raw.get("gpu_type"),
+            "provider": raw.get("provider"),
+            "cost_per_hour": raw.get("cost_per_hour"),
         })
     return out
 
@@ -177,7 +185,126 @@ _FLAT_COLUMN_HEADERS: dict[str, str] = {
 }
 
 
+def _show_aggregate(rows: list[dict[str, Any]]) -> None:
+    """Print one row per model with run-level totals + batch throughput.
+
+    Every timing number comes from ``metrics_json`` (the dispatcher's
+    stamped per-model stats) — never from the cost callback's per-page
+    ``elapsed_seconds`` column. The dispatcher already produces the
+    canonical numbers (``run_seconds_total``, ``run_seconds_per_page``);
+    duplicating them via sum/median of per-page values just adds a
+    second source of truth that drifts when backends fan requests out
+    concurrently.
+
+    Designed for eyeballing two runs side by side (e.g. DGX vs cloud
+    GPU): one table per output dir, each cell directly comparable to the
+    same cell in the other table.
+    """
+    # Group rows by model (one parquet row per (page, model)).
+    by_model: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        by_model.setdefault(r["model"], []).append(r)
+
+    aggregates: list[dict[str, Any]] = []
+    for model in sorted(by_model):
+        model_rows = by_model[model]
+
+        # `run_seconds_total` is stamped uniformly per model by the
+        # dispatcher (see cli/run.py); pick the first row that has it.
+        run_seconds_total: float | None = None
+        for r in model_rows:
+            v = (r.get("metrics") or {}).get("run_seconds_total")
+            if v is not None:
+                run_seconds_total = float(v)
+                break
+
+        failed = sum(1 for r in model_rows if r.get("error"))
+        succeeded = len(model_rows) - failed
+        gpu_type = next(
+            (r.get("gpu_type") for r in model_rows
+             if r.get("gpu_type") and r.get("gpu_type") != "unknown"),
+            None,
+        )
+        provider = next(
+            (r.get("provider") for r in model_rows
+             if r.get("provider") and r.get("provider") != "local"),
+            None,
+        )
+        cost_per_hour = next(
+            (r.get("cost_per_hour") for r in model_rows
+             if r.get("cost_per_hour")),
+            None,
+        )
+        # `total` is the dispatcher's actual wall clock for this model;
+        # `avg` divides by visible rows so it matches what the dispatcher
+        # prints at end-of-run (total / pages_ok).
+        total = run_seconds_total
+        avg = (
+            run_seconds_total / len(model_rows)
+            if run_seconds_total is not None and model_rows else None
+        )
+        est_cost = (
+            total / 3600.0 * cost_per_hour
+            if total is not None and cost_per_hour is not None
+            else None
+        )
+        aggregates.append({
+            "model": model,
+            "succeeded": succeeded,
+            "failed": failed,
+            "total": total,
+            "avg": avg,
+            "gpu_type": gpu_type,
+            "provider": provider,
+            "cost_per_hour": cost_per_hour,
+            "est_cost": est_cost,
+        })
+
+    show_gpu = any(a["gpu_type"] or a["provider"] for a in aggregates)
+    show_cost = any(a["cost_per_hour"] is not None for a in aggregates)
+
+    table = Table(title="run aggregate — batch throughput per model")
+    table.add_column("model", style="bold")
+    table.add_column("pages", justify="right")
+    table.add_column("failed", justify="right")
+    table.add_column("total", justify="right")
+    table.add_column("avg/page", justify="right")
+    if show_gpu:
+        table.add_column("gpu", style="dim")
+    if show_cost:
+        table.add_column("$/hr", justify="right", style="dim")
+        table.add_column("est $", justify="right", style="dim")
+
+    for a in aggregates:
+        cells = [
+            a["model"],
+            _fmt_int(a["succeeded"]),
+            f"[red]{a['failed']}[/red]" if a["failed"] else "0",
+            _fmt_seconds_human(a["total"]),
+            _fmt_seconds_human(a["avg"]),
+        ]
+        if show_gpu:
+            gpu_label = (
+                f"{a['gpu_type'] or '?'} ({a['provider'] or '?'})"
+                if (a["gpu_type"] or a["provider"]) else "—"
+            )
+            cells.append(gpu_label)
+        if show_cost:
+            cells.append(
+                f"{a['cost_per_hour']:.2f}"
+                if a["cost_per_hour"] is not None else "—"
+            )
+            cells.append(
+                f"{a['est_cost']:.4f}"
+                if a["est_cost"] is not None else "—"
+            )
+        table.add_row(*cells)
+
+    Console().print(table)
+
+
 def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
+    _show_aggregate(rows)
     rows_sorted = sorted(rows, key=lambda r: (r["file_id"], r["model"]))
 
     # Only show comparison columns that have at least one non-null value.
@@ -201,7 +328,10 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
         m = r["metrics"]
         items = _fmt_int(m.get("item_count"))
         chars = _fmt_int(m.get("text_length"))
-        s_per_page = _fmt_seconds(m.get("run_seconds_per_page"))
+        # Throughput-based per-page time stamped by the dispatcher
+        # (same value across all rows of a model — single source of truth
+        # with the run aggregate above).
+        s_per_page = _fmt_seconds_human(m.get("run_seconds_per_page"))
         snippet = _snippet_from_doc(r["document_json"], snippet_length)
 
         file_label = r["file_id"] if r["file_id"] != last_file else ""
@@ -245,9 +375,10 @@ def _show_page(rows: list[dict[str, Any]], *, page_id: str) -> None:
             f"({r['output_format']}) ===[/bold cyan]"
         )
         m = r["metrics"]
+        s_per_page = _fmt_seconds_human(m.get("run_seconds_per_page"))
         rprint(
             f"[dim]items={m.get('item_count')}  chars={m.get('text_length')}  "
-            f"s/page={_fmt_seconds(m.get('run_seconds_per_page'))}[/dim]"
+            f"s/page={s_per_page}[/dim]"
         )
         markdown = r.get("markdown") or ""
         if markdown:
@@ -521,6 +652,26 @@ def _fmt_seconds(value: Any) -> str:
     if not isinstance(value, (int, float)):
         return "—"
     return f"{value:.2f}"
+
+
+def _fmt_seconds_human(value: Any) -> str:
+    """Compact human-friendly duration: ``42.10s`` / ``5m 42s`` / ``1h 14m``.
+
+    Used by the run-aggregate table where totals can span seconds → hours.
+    Per-page tables keep using :func:`_fmt_seconds` (always 2-decimal s)
+    because the per-page magnitudes there are predictable and direct
+    comparison matters.
+    """
+    if not isinstance(value, (int, float)):
+        return "—"
+    if value < 60:
+        return f"{value:.2f}s"
+    if value < 3600:
+        m, s = divmod(int(round(value)), 60)
+        return f"{m}m {s:02d}s"
+    h, rem = divmod(int(round(value)), 3600)
+    m = rem // 60
+    return f"{h}h {m:02d}m"
 
 
 def _fmt_metric(column: str, value: Any) -> str:

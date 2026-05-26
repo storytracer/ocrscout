@@ -48,6 +48,15 @@ class PageCostMetrics(BaseModel):
     output_tokens: int = 0
     litellm_cost: float = 0.0
     elapsed_seconds: float = 0.0
+    """Page wall-clock seconds = ``max(end_time) - min(start_time)`` across
+    every request fired for this page. Computed at :meth:`close_page` time
+    so concurrent fan-out (e.g. layout_chat's region requests) doesn't
+    inflate the value as if all regions had run sequentially."""
+    # Internal min/max trackers populated by `record_request`; consumed by
+    # `close_page` to compute `elapsed_seconds`. Kept on the model so the
+    # accumulator stays thread-safe under the recorder's lock.
+    _wall_start: float | None = None
+    _wall_end: float | None = None
 
 
 class CostRecorder:
@@ -79,7 +88,8 @@ class CostRecorder:
         cost: float,
         tokens_in: int,
         tokens_out: int,
-        elapsed_s: float,
+        start_s: float,
+        end_s: float,
     ) -> None:
         with self._lock:
             page = self._pages.get(page_id)
@@ -91,11 +101,22 @@ class CostRecorder:
             page.input_tokens += tokens_in
             page.output_tokens += tokens_out
             page.litellm_cost += cost
-            page.elapsed_seconds += elapsed_s
+            # Wall-clock min/max: see PageCostMetrics docstring. `elapsed_s`
+            # would over-count for layout backends that fan regions out in
+            # parallel threads (sum of region durations >> page wall time).
+            if page._wall_start is None or start_s < page._wall_start:
+                page._wall_start = start_s
+            if page._wall_end is None or end_s > page._wall_end:
+                page._wall_end = end_s
 
     def close_page(self, page_id: str) -> PageCostMetrics | None:
         with self._lock:
-            return self._pages.pop(page_id, None)
+            page = self._pages.pop(page_id, None)
+            if page is None:
+                return None
+            if page._wall_start is not None and page._wall_end is not None:
+                page.elapsed_seconds = max(0.0, page._wall_end - page._wall_start)
+            return page
 
     def peek(self, page_id: str) -> PageCostMetrics | None:
         with self._lock:
@@ -172,14 +193,21 @@ def _ocrscout_cost_callback(
         usage = _extract_usage(response)
         tokens_in = int(usage.get("prompt_tokens", 0) or 0)
         tokens_out = int(usage.get("completion_tokens", 0) or 0)
-        elapsed_s = _elapsed_seconds(start_time, end_time)
+        start_s = _to_epoch_seconds(start_time)
+        end_s = _to_epoch_seconds(end_time)
+        if start_s is None or end_s is None:
+            # Without usable timestamps the recorder can't compute wall
+            # clock; skip recording rather than poisoning the page with
+            # zeros.
+            return
 
         recorder.record_request(
             page_id=str(page_id),
             cost=cost,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
-            elapsed_s=elapsed_s,
+            start_s=start_s,
+            end_s=end_s,
         )
     except Exception as e:  # noqa: BLE001
         # A callback that raises pollutes every subsequent completion call
@@ -215,3 +243,19 @@ def _elapsed_seconds(start: Any, end: Any) -> float:
         return max(0.0, float(end) - float(start))
     except (TypeError, ValueError):
         return 0.0
+
+
+def _to_epoch_seconds(value: Any) -> float | None:
+    """Coerce a LiteLLM timestamp (datetime / float / None) to epoch seconds.
+
+    Returns ``None`` when conversion isn't possible — the recorder treats
+    that as "skip this request" rather than recording a meaningless zero.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.timestamp()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
