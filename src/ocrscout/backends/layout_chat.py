@@ -1,19 +1,24 @@
 """LayoutChatBackend: layout-detector-driven, region-level OCR over LiteLLM.
 
-For each page:
+A single producer thread iterates pages and runs the layout detector
+serially (one detector instance, GPU-resident); for each detected region
+it submits a POST task to a shared ``ThreadPoolExecutor``. A
+``BoundedSemaphore`` caps in-flight region POSTs across pages — the same
+``region_concurrency`` knob now bounds the cross-page in-flight queue,
+not a per-page batch. As each region completes, the worker stores its
+block in a per-page assembler under a global lock; when a page's last
+region completes, its ``page_id`` is enqueued onto a completion queue
+that the generator drains and yields. Pages yield in completion order,
+not input order — the caller (``cli/run.py:_run_one_model``) materializes
+via ``list()`` and re-keys by ``page_id``, so this is invisible.
 
-1. Run a registered ``LayoutDetector`` to find typed regions on the page.
-2. Sort regions in a stable reading order (top-then-left, with vertical
-   bucketing to tolerate small same-row jitter; or use the detector's own
-   ``reading_order`` field when populated).
-3. For each region: crop the source image, pick the prompt template based on
-   the region's *detector-native* category (via
-   ``profile.prompt_mode_per_category``, falling back to
-   ``preferred_prompt_mode``), and call ``litellm.completion`` against the
-   LiteLLM proxy.
-4. Compose a ``layout_json`` payload — one block per region with the
-   page-coordinate bbox (NOT the crop coordinates) and the OCR text — and
-   yield it as a single ``RawOutput`` per page.
+Two stalls this design eliminates vs. strict per-page sequencing:
+
+- Detector dead time between pages: vLLM keeps draining region POSTs
+  from previously-detected pages while the next page's layout runs.
+- Slow-region tail: a page's slowest region no longer holds back its
+  own page-yield + every subsequent page's start; it's just one of N
+  in-flight items competing for cycles.
 
 Requires an active Runner (LiteLLM proxy + at least one backing vLLM
 serve). Subprocess vLLM is unsupported here because the per-region launch
@@ -26,10 +31,13 @@ import concurrent.futures
 import json
 import logging
 import os
+import queue
+import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from ocrscout import cost as cost_mod
@@ -47,7 +55,7 @@ from ocrscout.types import BackendInvocation, LayoutRegion, PageImage, RawOutput
 log = logging.getLogger(__name__)
 
 _DEFAULT_REGION_CONCURRENCY = 8
-"""Fallback per-page region concurrency. Normally filled in by the
+"""Fallback cross-page region concurrency. Normally filled in by the
 autoscaler via ``backend_args.region_concurrency`` (or the runner's
 state file for submit-time workers); only applies when both lookups
 return nothing."""
@@ -56,6 +64,26 @@ _MODELS_PROBE_TIMEOUT = 15.0
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
 # small same-row jitter without conflating rows on tightly-packed pages.
 _READING_ORDER_ROW_PX = 50
+
+_SENTINEL: Any = object()
+"""Marker pushed onto ``done_queue`` by the producer's ``finally`` so the
+yielder unblocks even when the producer crashed before completing every
+page."""
+
+
+@dataclass
+class _PageState:
+    """Per-page assembly state shared between the producer (initial write)
+    and worker threads (post-completion mutation under ``state_lock``)."""
+
+    page: PageImage
+    page_idx: int
+    ordered: list[LayoutRegion]
+    total_regions: int
+    remaining: int
+    t_start: float
+    results: dict[int, dict[str, Any]] = field(default_factory=dict)
+    detector_error: str | None = None
 
 
 def _resolve_region_concurrency(profile: ModelProfile) -> int:
@@ -148,119 +176,261 @@ class LayoutChatBackend(ModelBackend):
         region_concurrency = max(1, _resolve_region_concurrency(profile))
         sampling = _split_sampling(profile.sampling_args or {})
         prefix = f"[{profile.name}]"
+        total_pages = len(pages)
 
         log.info(
-            "%s starting %d page(s) against %s (region concurrency=%d, detector=%s)",
-            prefix, len(pages), proxy_url, region_concurrency, profile.layout_detector,
+            "%s starting %d page(s) against %s "
+            "(region concurrency=%d cross-page, detector=%s)",
+            prefix, total_pages, proxy_url, region_concurrency, profile.layout_detector,
         )
+
+        if total_pages == 0:
+            return
 
         t_total = time.perf_counter()
-        for page_idx, page in enumerate(pages, start=1):
-            yield self._run_one_page(
-                page=page,
-                page_idx=page_idx,
-                total_pages=len(pages),
-                detector=detector,
-                proxy_url=proxy_url,
-                profile=profile,
-                sampling=sampling,
-                timeout=timeout,
-                region_concurrency=region_concurrency,
-                log_prefix=prefix,
+
+        inflight_sem = threading.BoundedSemaphore(region_concurrency)
+        state_lock = threading.Lock()
+        page_states: dict[str, _PageState] = {}
+        done_queue: queue.Queue[Any] = queue.Queue()
+        producer_exc: list[BaseException] = []
+
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=region_concurrency,
+            thread_name_prefix="layout_chat_region",
+        ) as executor:
+
+            def _producer_loop() -> None:
+                try:
+                    for page_idx, page in enumerate(pages, start=1):
+                        _produce_one_page(
+                            page=page,
+                            page_idx=page_idx,
+                            total_pages=total_pages,
+                            detector=detector,
+                            proxy_url=proxy_url,
+                            profile=profile,
+                            sampling=sampling,
+                            timeout=timeout,
+                            log_prefix=prefix,
+                            page_states=page_states,
+                            state_lock=state_lock,
+                            inflight_sem=inflight_sem,
+                            done_queue=done_queue,
+                            executor=executor,
+                        )
+                except BaseException as e:  # noqa: BLE001
+                    producer_exc.append(e)
+                finally:
+                    done_queue.put(_SENTINEL)
+
+            producer = threading.Thread(
+                target=_producer_loop,
+                name="layout_chat_producer",
+                daemon=True,
             )
+            producer.start()
+
+            yielded = 0
+            try:
+                while yielded < total_pages:
+                    item = done_queue.get()
+                    if item is _SENTINEL:
+                        break
+                    state = page_states.pop(item)
+                    yield _assemble_raw(state, profile, prefix, total_pages)
+                    yielded += 1
+            finally:
+                producer.join()
+
+        if producer_exc:
+            raise producer_exc[0]
+
         log.info(
             "%s layout-chat finished %d pages in %.1fs",
-            prefix, len(pages), time.perf_counter() - t_total,
+            prefix, total_pages, time.perf_counter() - t_total,
         )
 
-    def _run_one_page(
-        self,
-        *,
-        page: PageImage,
-        page_idx: int,
-        total_pages: int,
-        detector: Any,
-        proxy_url: str,
-        profile: ModelProfile,
-        sampling: tuple[dict[str, Any], dict[str, Any]],
-        timeout: float,
-        region_concurrency: int,
-        log_prefix: str,
-    ) -> RawOutput:
-        cost_mod.recorder.open_page(page.page_id, profile.name)
 
+def _produce_one_page(
+    *,
+    page: PageImage,
+    page_idx: int,
+    total_pages: int,
+    detector: Any,
+    proxy_url: str,
+    profile: ModelProfile,
+    sampling: tuple[dict[str, Any], dict[str, Any]],
+    timeout: float,
+    log_prefix: str,
+    page_states: dict[str, _PageState],
+    state_lock: threading.Lock,
+    inflight_sem: threading.BoundedSemaphore,
+    done_queue: queue.Queue[Any],
+    executor: concurrent.futures.ThreadPoolExecutor,
+) -> None:
+    """Producer-side body for one page: detect layout, register page state,
+    then submit one task per region under the in-flight semaphore."""
+    cost_mod.recorder.open_page(page.page_id, profile.name)
+    t_start = time.perf_counter()
+
+    try:
+        regions = detector.detect(page)
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "%s page %d/%d %s detector FAIL: %s",
+            log_prefix, page_idx, total_pages, page.file_id, e,
+        )
+        page_states[page.page_id] = _PageState(
+            page=page,
+            page_idx=page_idx,
+            ordered=[],
+            total_regions=0,
+            remaining=0,
+            t_start=t_start,
+            detector_error=f"{type(e).__name__}: {e}",
+        )
+        done_queue.put(page.page_id)
+        return
+
+    if not regions:
+        page_states[page.page_id] = _PageState(
+            page=page,
+            page_idx=page_idx,
+            ordered=[],
+            total_regions=0,
+            remaining=0,
+            t_start=t_start,
+        )
+        done_queue.put(page.page_id)
+        return
+
+    ordered = _sort_reading_order(regions)
+    # Publish state BEFORE any submit so worker callbacks always find it.
+    page_states[page.page_id] = _PageState(
+        page=page,
+        page_idx=page_idx,
+        ordered=ordered,
+        total_regions=len(ordered),
+        remaining=len(ordered),
+        t_start=t_start,
+    )
+
+    for region in ordered:
+        inflight_sem.acquire()
+        executor.submit(
+            _make_region_worker(
+                page_id=page.page_id,
+                region=region,
+                page=page,
+                profile=profile,
+                proxy_url=proxy_url,
+                sampling=sampling,
+                timeout=timeout,
+                page_states=page_states,
+                state_lock=state_lock,
+                inflight_sem=inflight_sem,
+                done_queue=done_queue,
+            )
+        )
+
+
+def _make_region_worker(
+    *,
+    page_id: str,
+    region: LayoutRegion,
+    page: PageImage,
+    profile: ModelProfile,
+    proxy_url: str,
+    sampling: tuple[dict[str, Any], dict[str, Any]],
+    timeout: float,
+    page_states: dict[str, _PageState],
+    state_lock: threading.Lock,
+    inflight_sem: threading.BoundedSemaphore,
+    done_queue: queue.Queue[Any],
+) -> Callable[[], None]:
+    """Build the closure submitted to the executor for one region.
+
+    The closure runs ``_post_region``, releases the in-flight semaphore in
+    ``finally`` (so even an unhandled error frees the slot), then mutates
+    the page's state under ``state_lock``; when the page's last region
+    completes, it enqueues the page_id onto ``done_queue``."""
+
+    def _work() -> None:
         try:
-            regions = detector.detect(page)
-        except Exception as e:  # noqa: BLE001
-            log.warning(
-                "%s page %d/%d %s detector FAIL: %s",
-                log_prefix, page_idx, total_pages, page.file_id, e,
+            block = _post_region(
+                region=region,
+                page=page,
+                profile=profile,
+                proxy_url=proxy_url,
+                sampling=sampling,
+                timeout=timeout,
             )
-            return RawOutput(
-                page_id=page.page_id,
-                output_format=profile.output_format,
-                payload="",
-                error=f"layout detector failed: {type(e).__name__}: {e}",
-            )
+        except Exception as e:  # noqa: BLE001  defense-in-depth; _post_region catches its own
+            block = _failed_block(region, error=f"{type(e).__name__}: {e}")
+        finally:
+            inflight_sem.release()
+        with state_lock:
+            state = page_states[page_id]
+            state.results[region.id] = block
+            state.remaining -= 1
+            is_done = state.remaining == 0
+        if is_done:
+            done_queue.put(page_id)
 
-        if not regions:
-            log.info(
-                "%s page %d/%d %s no regions detected",
-                log_prefix, page_idx, total_pages, page.file_id,
-            )
-            return RawOutput(
-                page_id=page.page_id,
-                output_format=profile.output_format,
-                payload=json.dumps([]),
-            )
+    return _work
 
-        ordered = _sort_reading_order(regions)
-        t0 = time.perf_counter()
-        results: dict[int, dict[str, Any]] = {}
-        with concurrent.futures.ThreadPoolExecutor(max_workers=region_concurrency) as ex:
-            futures = {
-                ex.submit(
-                    _post_region,
-                    region=region,
-                    page=page,
-                    profile=profile,
-                    proxy_url=proxy_url,
-                    sampling=sampling,
-                    timeout=timeout,
-                ): region
-                for region in ordered
-            }
-            for fut in concurrent.futures.as_completed(futures):
-                region = futures[fut]
-                try:
-                    block = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    block = _failed_block(region, error=f"{type(e).__name__}: {e}")
-                results[region.id] = block
 
-        # Re-emit blocks in the sorted reading-order so downstream consumers
-        # walk the document body in a sensible sequence.
-        blocks = [results[r.id] for r in ordered]
-        n_failed = sum(1 for b in blocks if b.get("error"))
-        elapsed = time.perf_counter() - t0
-        if n_failed:
-            log.warning(
-                "%s page %d/%d %s ok (%d/%d regions in %.1fs, %d failed)",
-                log_prefix, page_idx, total_pages, page.file_id,
-                len(ordered) - n_failed, len(ordered), elapsed, n_failed,
-            )
-        else:
-            log.info(
-                "%s page %d/%d %s ok (%d regions in %.1fs)",
-                log_prefix, page_idx, total_pages, page.file_id,
-                len(ordered), elapsed,
-            )
+def _assemble_raw(
+    state: _PageState,
+    profile: ModelProfile,
+    log_prefix: str,
+    total_pages: int,
+) -> RawOutput:
+    """Build the per-page ``RawOutput`` from accumulated worker results."""
+    page = state.page
+    page_idx = state.page_idx
 
+    if state.detector_error is not None:
         return RawOutput(
             page_id=page.page_id,
             output_format=profile.output_format,
-            payload=json.dumps(blocks),
+            payload="",
+            error=f"layout detector failed: {state.detector_error}",
         )
+
+    if state.total_regions == 0:
+        log.info(
+            "%s page %d/%d %s no regions detected",
+            log_prefix, page_idx, total_pages, page.file_id,
+        )
+        return RawOutput(
+            page_id=page.page_id,
+            output_format=profile.output_format,
+            payload=json.dumps([]),
+        )
+
+    blocks = [state.results[r.id] for r in state.ordered]
+    n_failed = sum(1 for b in blocks if b.get("error"))
+    elapsed = time.perf_counter() - state.t_start
+    if n_failed:
+        log.warning(
+            "%s page %d/%d %s ok (%d/%d regions in %.1fs, %d failed)",
+            log_prefix, page_idx, total_pages, page.file_id,
+            state.total_regions - n_failed, state.total_regions, elapsed, n_failed,
+        )
+    else:
+        log.info(
+            "%s page %d/%d %s ok (%d regions in %.1fs)",
+            log_prefix, page_idx, total_pages, page.file_id,
+            state.total_regions, elapsed,
+        )
+
+    return RawOutput(
+        page_id=page.page_id,
+        output_format=profile.output_format,
+        payload=json.dumps(blocks),
+    )
 
 
 def _post_region(
