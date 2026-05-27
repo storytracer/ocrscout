@@ -237,6 +237,25 @@ The proxy must serve the requested profile name(s) in its `model_list`. Useful w
 
 For the GPU-memory bookkeeping rules, per-profile sizing knobs, daemon lifecycle, and Runner internals, see [CLAUDE.md](CLAUDE.md).
 
+## Performance
+
+ocrscout's autoscaler tunes three knobs at launch time so you don't have to:
+
+- **vLLM KV-cache budget** — sized from detected GPU free VRAM, capped by `--gpu-budget` (default 85 %).
+- **Region concurrency** for `backend: layout_chat` profiles — derived from the GPU's memory bandwidth via [dbgpu](https://github.com/orf/dbgpu) (`bandwidth_GB_s / 15`, ~2800 SKUs covered).
+- **CPU detector pool size** for the PP-DocLayoutV3 layout detector — derived from `sched_getaffinity` (`(cores − 2) // 2` detector workers × matching PyTorch intra-op threads), so the layout stage doesn't serialise the run on bandwidth-rich GPUs.
+
+The result is layout-aware OCR throughput that scales meaningfully across GPU classes without any per-host tuning:
+
+| GPU | Region concurrency (auto) | Detector pool (auto) | s/page on `glm-ocr-layout` |
+|---|---:|---:|---:|
+| H100 PCIe 80 GB | 136 | 11 workers | **0.50** |
+| A10 PCIe | 40 | 14 workers | **1.43** |
+| L4 | 20 | 3 workers | **2.18** |
+| GB10 (DGX Spark) | 18 | 9 workers | **2.02** |
+
+Measured on a 240-page BHL sample (mixed Victorian books, journals, postcards, field notebooks; deterministic seed). No flags passed beyond `--source-name bhl --sample 240`; every knob came from the autoscaler. Override anything per-run via `--batch-concurrency N` (region pool) or `--detector-workers N` (CPU pool); see [CLAUDE.md](CLAUDE.md) for the full sizing rules and architectural detail.
+
 ## Cost tracking
 
 Every backend call goes through LiteLLM, which fires a success callback that accumulates per-page tokens, elapsed seconds, and dollar cost into the row written for each `(page, model)`. The Parquet output carries flat columns for direct SQL access:
