@@ -4138,6 +4138,7 @@ all = [
     { name = "litellm", extra = ["proxy"] },
     { name = "lxml" },
     { name = "ocrmypdf" },
+    { name = "opencv-python-headless" },
     { name = "pikepdf" },
     { name = "s3fs" },
     { name = "skypilot-nightly", extra = ["kubernetes"] },
@@ -4170,6 +4171,7 @@ iiif = [
     { name = "httpx" },
 ]
 layout = [
+    { name = "opencv-python-headless" },
     { name = "torch" },
     { name = "transformers" },
 ]
@@ -4218,6 +4220,7 @@ requires-dist = [
     { name = "nvitop", specifier = ">=1.3.0" },
     { name = "ocrmypdf", marker = "extra == 'pdf'", specifier = ">=16.0.0" },
     { name = "ocrscout", extras = ["pdf", "alto", "iiif", "cloud", "serve", "viewer", "layout", "bhl", "eval", "skypilot", "hf"], marker = "extra == 'all'" },
+    { name = "opencv-python-headless", marker = "extra == 'layout'", specifier = ">=4.8.0" },
     { name = "pikepdf", marker = "extra == 'pdf'", specifier = ">=9.0.0" },
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pyarrow", marker = "extra == 'vllm'", specifier = ">=14.0" },
