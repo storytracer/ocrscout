@@ -101,7 +101,7 @@ def _draft_yaml(info: HfScriptInfo) -> str:
         "model_size": "TODO  # e.g. 3B",
         "upstream_script": f"uv-scripts/ocr/{info.path.name}",
         "output_format": output_format,
-        "normalizer": output_format if output_format != "docling_document" else "passthrough",
+        "normalizer": output_format,
         "has_bboxes": output_format in {"layout_json", "doctags"},
         "has_layout": output_format in {"layout_json", "doctags"},
     }

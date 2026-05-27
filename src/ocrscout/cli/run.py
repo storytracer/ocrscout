@@ -291,8 +291,8 @@ def run_pipeline(
     forces the original single-launch parallel-spawn path (all serves
     resident together) so a follow-up ``submit`` pays no relaunch cost.
 
-    Profiles with ``runtime: cpu`` (Docling, Tesseract) run in-process in
-    a trailing pass with no proxy. ``runtime: hosted`` profiles share one
+    Profiles with ``runtime: cpu`` (e.g. Tesseract) run in-process in a
+    trailing pass with no proxy. ``runtime: hosted`` profiles share one
     trailing proxy-only launch (no GPU work involved).
     """
     try:

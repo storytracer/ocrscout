@@ -72,7 +72,7 @@ RESULTS_FEATURES: Features = Features(
         # (``elapsed_seconds / 3600 × cost_per_hour``) and kept as its own
         # column so ``ocrscout costs`` can sum either token cost or infra
         # cost without re-deriving. All nullable: backends that don't go
-        # through LiteLLM (Docling, Tesseract) leave them null.
+        # through LiteLLM (e.g. Tesseract) leave them null.
         "gpu_type": Value("string"),
         "provider": Value("string"),
         "cost_per_hour": Value("float64"),

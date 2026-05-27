@@ -25,11 +25,11 @@ BackendName = str
 # values cover every shipped path: ``vllm`` (Runner spawns ``vllm serve`` and
 # fronts it through LiteLLM); ``hosted`` (Runner adds a provider entry to the
 # LiteLLM config but spawns nothing — Gemini, Anthropic, OpenAI, …); ``cpu``
-# (no LiteLLM involvement at all — Docling/Tesseract run in-process). Future
+# (no LiteLLM involvement at all — Tesseract runs in-process). Future
 # values can be added without touching consumers because every code path that
 # branches on this field re-checks against the constrained Literal here.
 Runtime = Literal["vllm", "hosted", "cpu"]
-OutputFormat = Literal["markdown", "doctags", "layout_json", "docling_document"]
+OutputFormat = Literal["markdown", "doctags", "layout_json"]
 
 DEFAULT_VLLM_ENGINE_ARGS: dict[str, Any] = {
     # Trim CUDA graph capture sizes — vLLM's default is [1..512], but with
@@ -84,10 +84,9 @@ class ModelProfile(BaseModel):
 
     Common values: ``litellm`` (LiteLLM-proxied OpenAI-compatible calls —
     vLLM-served OSS VLMs *and* hosted APIs both use this), ``layout_chat``
-    (layout-detector-driven region OCR over LiteLLM), ``docling`` (CPU-side
-    Docling library), ``tesseract`` (CPU CLI binary). The registry
-    validates the name at run time, so adding a new backend doesn't
-    require touching this schema.
+    (layout-detector-driven region OCR over LiteLLM), ``tesseract`` (CPU
+    CLI binary). The registry validates the name at run time, so adding a
+    new backend doesn't require touching this schema.
     """
     runtime: Runtime
     """What infrastructure the active Runner provisions for this model.
@@ -98,8 +97,8 @@ class ModelProfile(BaseModel):
     * ``hosted`` — Runner adds a provider entry to the LiteLLM config but
       spawns no local server. API keys come from env. No vLLM fields
       apply.
-    * ``cpu`` — No LiteLLM involvement. ``docling`` and ``tesseract``
-      run in-process and never see the proxy.
+    * ``cpu`` — No LiteLLM involvement. ``tesseract`` runs in-process and
+      never sees the proxy.
     """
     model_id: str
     model_size: str | None = None

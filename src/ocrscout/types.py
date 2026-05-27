@@ -123,7 +123,7 @@ class RawOutput(BaseModel):
     """Raw output from a model backend, before normalization."""
 
     page_id: str
-    output_format: Literal["markdown", "doctags", "layout_json", "docling_document"]
+    output_format: Literal["markdown", "doctags", "layout_json"]
     payload: str
     tokens: int | None = None
     error: str | None = None
@@ -171,7 +171,7 @@ class ExportRecord(BaseModel):
     # Populated by ``ocrscout.cost.recorder`` (from LiteLLM's
     # success_callback) and the active ``GpuConfig`` (env vars on remote
     # workers, ``~/.ocrscout/config.yaml`` locally). All optional so
-    # backends that don't touch LiteLLM (Docling, Tesseract) and runs that
+    # backends that don't touch LiteLLM (e.g. Tesseract) and runs that
     # don't have a configured GPU still produce a valid row.
     gpu_type: str | None = None
     provider: str | None = None

@@ -61,7 +61,6 @@ cloud = [
     "s3fs>=2024.0.0",
     "gcsfs>=2024.0.0",
 ]
-docling = ["docling"]
 serve = ["litellm[proxy]>=1.50.0"]
 viewer = [
     # gradio 6+ moved css/head from the Blocks constructor onto Blocks.launch,
@@ -134,7 +133,7 @@ hf = [
     "huggingface-hub>=0.25.0",
 ]
 all = [
-    "ocrscout[pdf,alto,iiif,cloud,docling,serve,viewer,layout,bhl,eval,skypilot,hf]",
+    "ocrscout[pdf,alto,iiif,cloud,serve,viewer,layout,bhl,eval,skypilot,hf]",
 ]
 dev = [
     "ruff>=0.6.0",
@@ -182,19 +181,6 @@ ignore = ["E501", "B008"]  # typer.Option in defaults is the canonical typer idi
 python_version = "3.11"
 strict_optional = true
 warn_unused_ignores = true
-
-[tool.uv]
-# Exclude rapidocr: docling pulls it in as the default OCR engine for
-# its StandardPdfPipeline, but ocrscout only ever uses docling's
-# VlmPipeline (routed through our vLLM backends), so it's dead weight.
-# It also drags in the full opencv-python, whose cv2/typing/ directory
-# shadows the stdlib typing module inside vLLM's multiprocessing.spawn
-# workers and crashes EngineCore on startup. The `sys_platform ==
-# 'never'` marker is uv's idiom for "this requirement is never
-# satisfiable" — uv drops it from the resolution.
-override-dependencies = [
-    "rapidocr ; sys_platform == 'never'",
-]
 
 [dependency-groups]
 dev = [
