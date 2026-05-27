@@ -198,7 +198,13 @@ class LayoutChatBackend(ModelBackend):
 
         inflight_sem = threading.BoundedSemaphore(region_concurrency)
         state_lock = threading.Lock()
-        page_states: dict[str, _PageState] = {}
+        # done_queue carries the _PageState directly (not a lookup key) so
+        # workers can hold a closure reference to their own state. Keying
+        # by page_id would corrupt state if the input ever contained two
+        # pages with the same page_id (observed in BHL): a later page's
+        # state would overwrite an earlier page's slot mid-flight, and
+        # the earlier page's still-pending workers would write to the new
+        # state's results list, masquerading as the new page's regions.
         done_queue: queue.Queue[Any] = queue.Queue()
         producer_exc: list[BaseException] = []
 
@@ -220,7 +226,6 @@ class LayoutChatBackend(ModelBackend):
                             sampling=sampling,
                             timeout=timeout,
                             log_prefix=prefix,
-                            page_states=page_states,
                             state_lock=state_lock,
                             inflight_sem=inflight_sem,
                             done_queue=done_queue,
@@ -244,8 +249,7 @@ class LayoutChatBackend(ModelBackend):
                     item = done_queue.get()
                     if item is _SENTINEL:
                         break
-                    state = page_states.pop(item)
-                    yield _assemble_raw(state, profile, prefix, total_pages)
+                    yield _assemble_raw(item, profile, prefix, total_pages)
                     yielded += 1
             finally:
                 producer.join()
@@ -270,14 +274,17 @@ def _produce_one_page(
     sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
     log_prefix: str,
-    page_states: dict[str, _PageState],
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
     done_queue: queue.Queue[Any],
     executor: concurrent.futures.ThreadPoolExecutor,
 ) -> None:
-    """Producer-side body for one page: detect layout, register page state,
-    then submit one task per region under the in-flight semaphore."""
+    """Producer-side body for one page: detect layout, build a fresh
+    ``_PageState``, capture it directly in each region worker's closure,
+    then submit one task per region under the in-flight semaphore. The
+    state is never keyed in any shared dict — workers hold a direct
+    reference, so input pages with duplicate ``page_id``s can't cross-
+    contaminate each other's results."""
     cost_mod.recorder.open_page(page.page_id, profile.name)
     t_start = time.perf_counter()
 
@@ -288,33 +295,34 @@ def _produce_one_page(
             "%s page %d/%d %s detector FAIL: %s",
             log_prefix, page_idx, total_pages, page.file_id, e,
         )
-        page_states[page.page_id] = _PageState(
-            page=page,
-            page_idx=page_idx,
-            ordered=[],
-            total_regions=0,
-            remaining=0,
-            t_start=t_start,
-            detector_error=f"{type(e).__name__}: {e}",
+        done_queue.put(
+            _PageState(
+                page=page,
+                page_idx=page_idx,
+                ordered=[],
+                total_regions=0,
+                remaining=0,
+                t_start=t_start,
+                detector_error=f"{type(e).__name__}: {e}",
+            )
         )
-        done_queue.put(page.page_id)
         return
 
     if not regions:
-        page_states[page.page_id] = _PageState(
-            page=page,
-            page_idx=page_idx,
-            ordered=[],
-            total_regions=0,
-            remaining=0,
-            t_start=t_start,
+        done_queue.put(
+            _PageState(
+                page=page,
+                page_idx=page_idx,
+                ordered=[],
+                total_regions=0,
+                remaining=0,
+                t_start=t_start,
+            )
         )
-        done_queue.put(page.page_id)
         return
 
     ordered = _sort_reading_order(regions)
-    # Publish state BEFORE any submit so worker callbacks always find it.
-    page_states[page.page_id] = _PageState(
+    state = _PageState(
         page=page,
         page_idx=page_idx,
         ordered=ordered,
@@ -328,7 +336,7 @@ def _produce_one_page(
         inflight_sem.acquire()
         executor.submit(
             _make_region_worker(
-                page_id=page.page_id,
+                state=state,
                 position=position,
                 region=region,
                 page=page,
@@ -336,7 +344,6 @@ def _produce_one_page(
                 proxy_url=proxy_url,
                 sampling=sampling,
                 timeout=timeout,
-                page_states=page_states,
                 state_lock=state_lock,
                 inflight_sem=inflight_sem,
                 done_queue=done_queue,
@@ -346,7 +353,7 @@ def _produce_one_page(
 
 def _make_region_worker(
     *,
-    page_id: str,
+    state: _PageState,
     position: int,
     region: LayoutRegion,
     page: PageImage,
@@ -354,7 +361,6 @@ def _make_region_worker(
     proxy_url: str,
     sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
-    page_states: dict[str, _PageState],
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
     done_queue: queue.Queue[Any],
@@ -363,8 +369,8 @@ def _make_region_worker(
 
     The closure runs ``_post_region``, releases the in-flight semaphore in
     ``finally`` (so even an unhandled error frees the slot), then mutates
-    the page's state under ``state_lock``; when the page's last region
-    completes, it enqueues the page_id onto ``done_queue``."""
+    the captured ``state`` under ``state_lock``; when the page's last
+    region completes, it enqueues the state onto ``done_queue``."""
 
     def _work() -> None:
         try:
@@ -381,12 +387,11 @@ def _make_region_worker(
         finally:
             inflight_sem.release()
         with state_lock:
-            state = page_states[page_id]
             state.results[position] = block
             state.remaining -= 1
             is_done = state.remaining == 0
         if is_done:
-            done_queue.put(page_id)
+            done_queue.put(state)
 
     return _work
 
