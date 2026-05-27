@@ -81,7 +81,7 @@ OCRSCOUT_DETECTOR_TORCH_THREADS_ENV = "OCRSCOUT_DETECTOR_TORCH_THREADS"
 """Runtime override for ``torch.set_num_threads(V)`` — PyTorch's intra-op
 parallelism per detector forward. Default is the leftover CPU budget split
 evenly across detector workers (floor 1)."""
-_DEFAULT_REQUEST_TIMEOUT = 300.0
+_DEFAULT_REQUEST_TIMEOUT = 600.0
 _MODELS_PROBE_TIMEOUT = 15.0
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
 # small same-row jitter without conflating rows on tightly-packed pages.

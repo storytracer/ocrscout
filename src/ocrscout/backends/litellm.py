@@ -43,7 +43,7 @@ from ocrscout.types import BackendInvocation, PageImage, RawOutput
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_REQUEST_TIMEOUT = 300.0
+_DEFAULT_REQUEST_TIMEOUT = 600.0
 _DEFAULT_CONCURRENT_REQUESTS = 8
 """Fallback per-page client-side concurrency. The GPU-aware autoscaler in
 :mod:`ocrscout.runners._preflight` normally fills this in via

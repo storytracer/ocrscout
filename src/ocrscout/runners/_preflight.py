@@ -63,6 +63,27 @@ BW_GB_S_PER_CONCURRENT_REQUEST = 15
 AUTOSCALE_MAX_CONCURRENCY = 64
 AUTOSCALE_MAX_REGION_CONCURRENCY = 16
 
+# Performance target for per-request avg latency, in seconds. Used to derive
+# a third concurrency cap (beside KV-fits and the bandwidth/15 ceiling) when
+# the GPU is identified via dbgpu. Lower → smaller concurrency, faster
+# per-request response; higher → larger concurrency, slower per-request
+# response but identical aggregate throughput (decode is bandwidth-bound, so
+# total tok/s is fixed by ``bandwidth / model_bytes`` regardless of C — only
+# the per-request slice changes). This is *not* a runtime cutoff; it only
+# shapes the autoscaler's concurrency choice. The real timeout that fails
+# requests is ``backends/litellm.py:_DEFAULT_REQUEST_TIMEOUT`` (600s),
+# overridable per profile via ``backend_args.request_timeout``.
+AUTOSCALE_TARGET_REQUEST_LATENCY_S = 240.0
+
+# Default planning value for the average output-token count per request,
+# expressed as a fraction of the profile's ``sampling_args.max_tokens``.
+# Calibrated from the dots-mocr BHL run on H100 (~754 tokens observed avg
+# vs. max_tokens=20000 → ratio ~0.04); rounded up to 0.05 for safety.
+# Override per profile with ``metadata.expected_output_tokens`` when the
+# workload is far from this OCR-page baseline (e.g. SVG mode, long-form
+# generation).
+AUTOSCALE_DEFAULT_T_PLAN_FRACTION = 0.05
+
 _BYTE_SUFFIX_MULTIPLIERS = {
     "": 1,
     "k": 1_000, "K": 1024,
@@ -393,6 +414,54 @@ def _bandwidth_concurrency_cap(spec: GPUSpecification) -> int:
     return max(1, int(bw / BW_GB_S_PER_CONCURRENT_REQUEST))
 
 
+def _timeout_concurrency_cap(
+    profile: ModelProfile, gpu_spec: GPUSpecification | None
+) -> int | None:
+    """Concurrency cap that keeps avg request latency near the perf target.
+
+    Memory-bandwidth-bound decode model: under continuous batching, every
+    decode step reads the full model weights once and emits one token per
+    in-flight sequence. So aggregate throughput ≈ ``bandwidth/model_bytes``
+    independent of C, and per-sequence throughput ≈
+    ``bandwidth/(model_bytes×C)``. A request emitting ``T_plan`` tokens
+    therefore takes ~``T_plan × C × model_bytes / bandwidth`` seconds.
+    Solving for C at ``AUTOSCALE_TARGET_REQUEST_LATENCY_S`` yields the cap.
+
+    Returns ``None`` when we lack inputs (unknown GPU, missing model_size,
+    no ``max_tokens``) — caller falls back to existing ceilings. The cap
+    is not a safety check; the runtime safety check is the LiteLLM HTTP
+    timeout in the backend.
+    """
+    if gpu_spec is None or not gpu_spec.memory_bandwidth_gb_s:
+        return None
+    max_tokens = (profile.sampling_args or {}).get("max_tokens")
+    if not max_tokens:
+        return None
+    t_plan = (profile.metadata or {}).get("expected_output_tokens")
+    if not t_plan:
+        t_plan = max(1, int(int(max_tokens) * AUTOSCALE_DEFAULT_T_PLAN_FRACTION))
+    # Bandwidth-bound decode reads only the weights per step (KV cache
+    # contribution is small compared to weights for 1-7B-class models on
+    # typical OCR sequence lengths), so we want pure weight bytes here,
+    # not the weights + working overhead that estimate_model_overhead returns.
+    if not profile.model_size:
+        return None
+    params = parse_model_size(profile.model_size)
+    if params is None:
+        return None
+    dtype = str((profile.vllm_engine_args or {}).get("dtype", "auto")).lower()
+    bytes_per_param = _DTYPE_BYTES_PER_PARAM.get(dtype, 2)
+    model_bytes = int(params * bytes_per_param)
+    if model_bytes <= 0:
+        return None
+    bw_bytes_s = gpu_spec.memory_bandwidth_gb_s * 1e9
+    cap = int(
+        AUTOSCALE_TARGET_REQUEST_LATENCY_S * bw_bytes_s
+        / (int(t_plan) * model_bytes)
+    )
+    return max(1, cap)
+
+
 def _concurrency_ceiling_for(
     profile: ModelProfile, gpu_spec: GPUSpecification | None = None
 ) -> int:
@@ -688,7 +757,11 @@ def autoscale_kv_budgets(
         else:
             max_from_kv = kv_slice // per_request_kv
             ceiling = _concurrency_ceiling_for(p, gpu.spec)
-            concurrency = max(1, min(int(max_from_kv), ceiling))
+            timeout_cap = _timeout_concurrency_cap(p, gpu.spec)
+            limits = [int(max_from_kv), ceiling]
+            if timeout_cap is not None:
+                limits.append(timeout_cap)
+            concurrency = max(1, min(limits))
             kv = concurrency * per_request_kv
 
         decisions[p.name] = AutoscaleDecision(
@@ -705,7 +778,8 @@ def autoscale_kv_budgets(
             f"GPU {gpu.name}: free {human_bytes(gpu.free_bytes)} / total "
             f"{human_bytes(gpu.total_bytes)}; cap {human_bytes(gpu.cap_bytes)}; "
             f"bandwidth {gpu.spec.memory_bandwidth_gb_s:.0f} GB/s "
-            f"(dbgpu: {gpu.spec.name!r}) → concurrency cap {bw_cap}. "
+            f"(dbgpu: {gpu.spec.name!r}) → concurrency cap {bw_cap}; "
+            f"perf target {AUTOSCALE_TARGET_REQUEST_LATENCY_S:.0f}s avg latency. "
             f"Auto-scaled {len(decisions)} profile(s):"
         )
     else:
@@ -716,11 +790,16 @@ def autoscale_kv_budgets(
             f"Auto-scaled {len(decisions)} profile(s):"
         )
     lines = [gpu_line]
-    for name, d in decisions.items():
+    for p in profiles:
+        d = decisions[p.name]
+        timeout_cap = _timeout_concurrency_cap(p, gpu.spec)
+        suffix = ""
+        if timeout_cap is not None and timeout_cap == d.concurrent_requests:
+            suffix = " [perf-target bound]"
         lines.append(
-            f"  {name} (overhead {human_bytes(d.overhead_bytes)}, "
+            f"  {p.name} (overhead {human_bytes(d.overhead_bytes)}, "
             f"KV {human_bytes(d.kv_cache_memory_bytes)}, "
-            f"concurrency {d.concurrent_requests})"
+            f"concurrency {d.concurrent_requests}){suffix}"
         )
     return "\n".join(lines), decisions
 
