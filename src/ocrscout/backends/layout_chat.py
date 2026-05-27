@@ -1,24 +1,30 @@
 """LayoutChatBackend: layout-detector-driven, region-level OCR over LiteLLM.
 
-A single producer thread iterates pages and runs the layout detector
-serially (one detector instance, GPU-resident); for each detected region
-it submits a POST task to a shared ``ThreadPoolExecutor``. A
-``BoundedSemaphore`` caps in-flight region POSTs across pages — the same
-``region_concurrency`` knob now bounds the cross-page in-flight queue,
-not a per-page batch. As each region completes, the worker stores its
-block in a per-page assembler under a global lock; when a page's last
-region completes, its ``page_id`` is enqueued onto a completion queue
-that the generator drains and yields. Pages yield in completion order,
+A pool of ``N`` CPU detector workers ingests pages from a shared
+``pages_queue``; each owns its own ``PpDocLayoutV3Detector`` instance
+(the detector class is not thread-safe). On completing detection, the
+same worker opens the cost record for its page and submits the page's
+regions directly onto the region executor under a shared
+``BoundedSemaphore`` — keeping the detect → submit hop at microsecond
+latency (no intermediate submitter thread). Region workers POST through
+LiteLLM, mutate per-page state under a global lock, and enqueue the
+state onto a completion queue when the page's last region completes;
+the generator drains it and yields. Pages yield in completion order,
 not input order — the caller (``cli/run.py:_run_one_model``) materializes
 via ``list()`` and re-keys by ``page_id``, so this is invisible.
 
-Two stalls this design eliminates vs. strict per-page sequencing:
+Three stalls this design eliminates vs. strict per-page sequencing
+through one producer:
 
 - Detector dead time between pages: vLLM keeps draining region POSTs
   from previously-detected pages while the next page's layout runs.
 - Slow-region tail: a page's slowest region no longer holds back its
-  own page-yield + every subsequent page's start; it's just one of N
+  own page-yield + every subsequent page's start; it's just one of M
   in-flight items competing for cycles.
+- Detector serialization: ``N`` CPU detector workers run forward
+  passes in parallel (PyTorch's ATen kernels release the GIL), so the
+  detector phase is no longer the single-threaded floor on s/page on
+  fast-vLLM hosts.
 
 Requires an active Runner (LiteLLM proxy + at least one backing vLLM
 serve). Subprocess vLLM is unsupported here because the per-region launch
@@ -59,6 +65,22 @@ _DEFAULT_REGION_CONCURRENCY = 8
 autoscaler via ``backend_args.region_concurrency`` (or the runner's
 state file for submit-time workers); only applies when both lookups
 return nothing."""
+_DEFAULT_RESERVED_CPUS = 2
+"""CPUs withheld from the detector pool's autosize: one for the main /
+yield thread, one for litellm + HTTP work. Region executor threads are
+I/O-bound (HTTP wait on vLLM), so they don't compete for CPU
+meaningfully. The auto-derived pool fills the rest, scaling linearly
+with ``sched_getaffinity``; no hard cap. Override via
+``backend_args.detector_workers``, ``--detector-workers``, or
+``OCRSCOUT_DETECTOR_WORKERS`` if a profile-specific value is needed."""
+OCRSCOUT_DETECTOR_WORKERS_ENV = "OCRSCOUT_DETECTOR_WORKERS"
+"""Runtime override for detector worker count. Same precedence story as
+``region_concurrency``: explicit profile > state-file override (set by
+the runner) > env > auto."""
+OCRSCOUT_DETECTOR_TORCH_THREADS_ENV = "OCRSCOUT_DETECTOR_TORCH_THREADS"
+"""Runtime override for ``torch.set_num_threads(V)`` — PyTorch's intra-op
+parallelism per detector forward. Default is the leftover CPU budget split
+evenly across detector workers (floor 1)."""
 _DEFAULT_REQUEST_TIMEOUT = 300.0
 _MODELS_PROBE_TIMEOUT = 15.0
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
@@ -108,6 +130,74 @@ def _resolve_region_concurrency(profile: ModelProfile) -> int:
     return _DEFAULT_REGION_CONCURRENCY
 
 
+def _available_cpus() -> int:
+    """CPUs visible to this process. ``sched_getaffinity`` respects cgroup
+    and ``taskset`` masks (which a generic ``os.cpu_count()`` does not);
+    falls back to ``cpu_count`` on platforms without the affinity API
+    (macOS)."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def _resolve_detector_workers(profile: ModelProfile) -> int:
+    """Precedence: explicit profile value > state-file override > env > auto.
+
+    Auto: ``max(1, (available_cpus - reserved) // 2)`` — half the
+    available CPUs go to detector workers, the other half become
+    ``torch.set_num_threads(V)`` budget so each forward pass gets some
+    intra-op parallelism. Together that's ``N × V ≈ available -
+    reserved`` cores in flight (e.g. 24-core → N=11, V=2; 8-core →
+    N=3, V=2). No hard cap — the ``reserved`` constant is the safety
+    buffer. Pathologically large boxes (128+ cores) can pin via the
+    env / profile overrides if 60+ detector instances is too much
+    resident weight.
+    """
+    explicit = (profile.backend_args or {}).get("detector_workers")
+    if explicit is not None:
+        return max(1, int(explicit))
+    override = _state_override(profile.name, "detector_workers")
+    if override is not None:
+        return max(1, override)
+    raw_env = os.environ.get(OCRSCOUT_DETECTOR_WORKERS_ENV)
+    if raw_env:
+        try:
+            return max(1, int(raw_env))
+        except ValueError:
+            log.warning(
+                "%s=%r is not an int; ignoring",
+                OCRSCOUT_DETECTOR_WORKERS_ENV, raw_env,
+            )
+    available = _available_cpus()
+    budget = max(1, available - _DEFAULT_RESERVED_CPUS)
+    return max(1, budget // 2 or 1)
+
+
+def _resolve_torch_threads_per_op(profile: ModelProfile, n_workers: int) -> int:
+    """``torch.set_num_threads(V)`` value. Profile override → env → auto.
+
+    Auto: leftover CPU budget after the detector workers' own threads,
+    split per worker. The product ``n_workers × V`` should land near the
+    available core count to avoid oversubscription.
+    """
+    explicit = (profile.backend_args or {}).get("detector_torch_threads")
+    if explicit is not None:
+        return max(1, int(explicit))
+    raw_env = os.environ.get(OCRSCOUT_DETECTOR_TORCH_THREADS_ENV)
+    if raw_env:
+        try:
+            return max(1, int(raw_env))
+        except ValueError:
+            log.warning(
+                "%s=%r is not an int; ignoring",
+                OCRSCOUT_DETECTOR_TORCH_THREADS_ENV, raw_env,
+            )
+    available = _available_cpus()
+    budget = max(1, available - _DEFAULT_RESERVED_CPUS)
+    return max(1, budget // max(1, n_workers))
+
+
 class LayoutChatBackend(ModelBackend):
     """Layout-aware OCR over the LiteLLM proxy."""
 
@@ -148,8 +238,12 @@ class LayoutChatBackend(ModelBackend):
             )
 
         detector_cls = registry.get("layout_detectors", profile.layout_detector)
+        n_workers = _resolve_detector_workers(profile)
         try:
-            detector = detector_cls(**profile.layout_detector_args)
+            detectors = [
+                detector_cls(**profile.layout_detector_args)
+                for _ in range(n_workers)
+            ]
         except Exception as e:
             raise BackendError(
                 f"LayoutChatBackend: failed to instantiate layout detector "
@@ -165,7 +259,7 @@ class LayoutChatBackend(ModelBackend):
             pages=[p.page_id for p in pages],
             extra={
                 "pages_runtime": list(pages),
-                "detector": detector,
+                "detectors": detectors,
             },
         )
 
@@ -176,23 +270,34 @@ class LayoutChatBackend(ModelBackend):
             raise BackendError("LayoutChatBackend.run: missing proxy URL")
 
         pages: list[PageImage] = list(invocation.extra.get("pages_runtime", []))
-        detector = invocation.extra["detector"]
+        detectors: list[Any] = list(invocation.extra["detectors"])
+        if not detectors:
+            raise BackendError("LayoutChatBackend.run: empty detector pool")
+        n_workers = len(detectors)
         timeout = float(
             profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT)
         )
         region_concurrency = max(1, _resolve_region_concurrency(profile))
+        torch_threads = _resolve_torch_threads_per_op(profile, n_workers)
         sampling = _split_sampling(profile.sampling_args or {})
         prefix = f"[{profile.name}]"
         total_pages = len(pages)
 
         log.info(
             "%s starting %d page(s) against %s "
-            "(region concurrency=%d cross-page, detector=%s)",
-            prefix, total_pages, proxy_url, region_concurrency, profile.layout_detector,
+            "(region concurrency=%d cross-page, detector=%s, "
+            "detector workers=%d, torch threads/op=%d)",
+            prefix, total_pages, proxy_url, region_concurrency,
+            profile.layout_detector, n_workers, torch_threads,
         )
 
         if total_pages == 0:
             return
+
+        # PyTorch intra-op parallelism is process-global. We set it once
+        # here, before any detector worker calls `_ensure_loaded()`, so
+        # every forward pass uses the same partitioned thread budget.
+        _set_torch_intraop_threads(torch_threads)
 
         t_total = time.perf_counter()
 
@@ -206,56 +311,140 @@ class LayoutChatBackend(ModelBackend):
         # the earlier page's still-pending workers would write to the new
         # state's results list, masquerading as the new page's regions.
         done_queue: queue.Queue[Any] = queue.Queue()
-        producer_exc: list[BaseException] = []
+        # Unbounded — the page list is already materialized in memory by
+        # the caller, so buffering page refs here adds no real cost.
+        pages_queue: queue.Queue[Any] = queue.Queue()
+        for page_idx, page in enumerate(pages, start=1):
+            pages_queue.put((page_idx, page))
+        # One sentinel per detector worker — each pops exactly one.
+        for _ in range(n_workers):
+            pages_queue.put(_SENTINEL)
+
+        cancel_event = threading.Event()
+        worker_exc: list[BaseException] = []
+        done_workers_lock = threading.Lock()
+        done_workers = [0]
+        # ``pages_completed`` is the source of truth for completion.
+        # Either ``_submit_state`` (for empty/detector-error pages) or
+        # ``_make_region_worker``'s last-region branch increments it; the
+        # one that takes it to ``total_pages`` is responsible for pushing
+        # ``_SENTINEL`` to ``done_queue``. This guarantees the sentinel
+        # always trails the last real page, so the main thread can't
+        # exit early while region work is still in flight.
+        pages_completed_lock = threading.Lock()
+        pages_completed = [0]
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=region_concurrency,
             thread_name_prefix="layout_chat_region",
         ) as executor:
 
-            def _producer_loop() -> None:
-                try:
-                    for page_idx, page in enumerate(pages, start=1):
-                        _produce_one_page(
-                            page=page,
-                            page_idx=page_idx,
-                            total_pages=total_pages,
-                            detector=detector,
-                            proxy_url=proxy_url,
-                            profile=profile,
-                            sampling=sampling,
-                            timeout=timeout,
-                            log_prefix=prefix,
-                            state_lock=state_lock,
-                            inflight_sem=inflight_sem,
-                            done_queue=done_queue,
-                            executor=executor,
-                        )
-                except BaseException as e:  # noqa: BLE001
-                    producer_exc.append(e)
-                finally:
-                    done_queue.put(_SENTINEL)
+            def _publish_page(state: _PageState) -> None:
+                """Push a fully-assembled (or empty / detector-failed)
+                page to ``done_queue``; whoever takes ``pages_completed``
+                to ``total_pages`` also pushes the terminating sentinel.
 
-            producer = threading.Thread(
-                target=_producer_loop,
-                name="layout_chat_producer",
-                daemon=True,
-            )
-            producer.start()
+                The lock is held across both ``put()`` calls so concurrent
+                publishers strictly serialize: state_N goes in before
+                state_N+1, and ``_SENTINEL`` lands after the final state.
+                ``Queue.put`` doesn't block on an unbounded queue, so
+                holding the lock is fine."""
+                with pages_completed_lock:
+                    pages_completed[0] += 1
+                    is_last = pages_completed[0] >= total_pages
+                    done_queue.put(state)
+                    if is_last:
+                        done_queue.put(_SENTINEL)
+
+            detector_threads: list[threading.Thread] = []
+            for i, det in enumerate(detectors):
+                t = threading.Thread(
+                    target=_detector_worker_loop,
+                    name=f"layout_chat_detector_{i}",
+                    daemon=True,
+                    kwargs=dict(
+                        worker_idx=i,
+                        n_workers=n_workers,
+                        detector=det,
+                        pages_queue=pages_queue,
+                        total_pages=total_pages,
+                        proxy_url=proxy_url,
+                        profile=profile,
+                        sampling=sampling,
+                        timeout=timeout,
+                        log_prefix=prefix,
+                        state_lock=state_lock,
+                        inflight_sem=inflight_sem,
+                        publish_page=_publish_page,
+                        executor=executor,
+                        cancel_event=cancel_event,
+                        worker_exc=worker_exc,
+                        done_workers=done_workers,
+                        done_workers_lock=done_workers_lock,
+                        done_queue=done_queue,
+                    ),
+                )
+                t.start()
+                detector_threads.append(t)
 
             yielded = 0
             try:
                 while yielded < total_pages:
-                    item = done_queue.get()
+                    try:
+                        item = done_queue.get(timeout=1.0)
+                    except queue.Empty:
+                        # Heartbeat: are we making forward progress? If
+                        # every detector worker has exited AND
+                        # ``publish_page`` never reached ``total_pages``,
+                        # the missing pages were lost (crash or
+                        # interrupted mid-submit). Surface that here so
+                        # we don't hang on an unreachable sentinel.
+                        with done_workers_lock:
+                            all_workers_done = done_workers[0] >= n_workers
+                        if all_workers_done:
+                            with pages_completed_lock:
+                                completed = pages_completed[0]
+                            # If no in-flight region work either, we're
+                            # truly stuck. Conservative check: if all
+                            # detector workers are done AND completed
+                            # count hasn't moved past what's already
+                            # yielded by a meaningful amount, we're done.
+                            # publish_page would have pushed _SENTINEL
+                            # if completed reached total_pages, so
+                            # completed < total_pages here means lost.
+                            if completed < total_pages:
+                                log.error(
+                                    "%s detector workers all exited but "
+                                    "only %d/%d pages completed; some "
+                                    "pages were lost. Yielded %d so far.",
+                                    prefix, completed, total_pages, yielded,
+                                )
+                                break
+                        continue
                     if item is _SENTINEL:
                         break
                     yield _assemble_raw(item, profile, prefix, total_pages)
                     yielded += 1
             finally:
-                producer.join()
+                # On normal completion this is a no-op; on early-exit
+                # (caller stopped iterating) it tells detector workers to
+                # drain and exit. Belt-and-braces sentinels guarantee no
+                # worker is left blocked on `pages_queue.get()`.
+                cancel_event.set()
+                for _ in range(n_workers):
+                    pages_queue.put(_SENTINEL)
+                for t in detector_threads:
+                    t.join()
 
-        if producer_exc:
-            raise producer_exc[0]
+        if worker_exc:
+            if len(worker_exc) > 1:
+                log.error(
+                    "%s multiple detector workers crashed (%d total); "
+                    "raising the first. All exceptions: %s",
+                    prefix, len(worker_exc),
+                    [f"{type(e).__name__}: {e}" for e in worker_exc],
+                )
+            raise worker_exc[0]
 
         log.info(
             "%s layout-chat finished %d pages in %.1fs",
@@ -263,12 +452,30 @@ class LayoutChatBackend(ModelBackend):
         )
 
 
-def _produce_one_page(
+def _set_torch_intraop_threads(n: int) -> None:
+    """Idempotent ``torch.set_num_threads(n)``. Best-effort: if torch
+    isn't yet importable (e.g. the ``[layout]`` extra isn't installed
+    despite a layout_chat profile somehow making it this far), log and
+    move on — the first detector worker's ``_ensure_loaded`` will then
+    raise the real ImportError."""
+    try:
+        import torch  # type: ignore[import-not-found]
+    except ImportError:
+        log.debug("torch not importable; skipping set_num_threads(%d)", n)
+        return
+    try:
+        torch.set_num_threads(max(1, int(n)))
+    except Exception as e:  # noqa: BLE001
+        log.warning("torch.set_num_threads(%d) failed: %s", n, e)
+
+
+def _detector_worker_loop(
     *,
-    page: PageImage,
-    page_idx: int,
-    total_pages: int,
+    worker_idx: int,
+    n_workers: int,
     detector: Any,
+    pages_queue: queue.Queue[Any],
+    total_pages: int,
     proxy_url: str,
     profile: ModelProfile,
     sampling: tuple[dict[str, Any], dict[str, Any]],
@@ -276,18 +483,78 @@ def _produce_one_page(
     log_prefix: str,
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
-    done_queue: queue.Queue[Any],
+    publish_page: Callable[[_PageState], None],
     executor: concurrent.futures.ThreadPoolExecutor,
+    cancel_event: threading.Event,
+    worker_exc: list[BaseException],
+    done_workers: list[int],
+    done_workers_lock: threading.Lock,
+    done_queue: queue.Queue[Any],
 ) -> None:
-    """Producer-side body for one page: detect layout, build a fresh
-    ``_PageState``, capture it directly in each region worker's closure,
-    then submit one task per region under the in-flight semaphore. The
-    state is never keyed in any shared dict — workers hold a direct
-    reference, so input pages with duplicate ``page_id``s can't cross-
-    contaminate each other's results."""
-    cost_mod.recorder.open_page(page.page_id, profile.name)
-    t_start = time.perf_counter()
+    """One detector worker: pop pages, detect, open the cost record,
+    submit regions. Each worker owns its own detector instance — the
+    detector class is not thread-safe (one shared ``nn.Module`` per
+    instance, lazy load has no lock)."""
+    try:
+        while True:
+            if cancel_event.is_set():
+                return
+            item = pages_queue.get()
+            if item is _SENTINEL:
+                return
+            page_idx, page = item
+            state = _detect_one_page(
+                page=page,
+                page_idx=page_idx,
+                total_pages=total_pages,
+                detector=detector,
+                log_prefix=log_prefix,
+            )
+            _submit_state(
+                state=state,
+                profile=profile,
+                proxy_url=proxy_url,
+                sampling=sampling,
+                timeout=timeout,
+                state_lock=state_lock,
+                inflight_sem=inflight_sem,
+                publish_page=publish_page,
+                executor=executor,
+            )
+    except BaseException as e:  # noqa: BLE001
+        worker_exc.append(e)
+        log.exception(
+            "%s detector worker %d crashed; other workers continue",
+            log_prefix, worker_idx,
+        )
+    finally:
+        with done_workers_lock:
+            done_workers[0] += 1
+        # NOTE: do NOT push _SENTINEL here. ``publish_page`` is the only
+        # authority on completion — it pushes _SENTINEL strictly after
+        # the last real page. A detector worker that finishes ``detect``
+        # + submits regions returns immediately; the regions may still
+        # be in flight in the executor, and pushing _SENTINEL now would
+        # let the yielder exit before those regions complete. The
+        # crash-recovery path is the main thread's timeout-poll, which
+        # detects "all detector workers exited and no progress" and
+        # raises ``worker_exc``.
 
+
+def _detect_one_page(
+    *,
+    page: PageImage,
+    page_idx: int,
+    total_pages: int,
+    detector: Any,
+    log_prefix: str,
+) -> _PageState:
+    """Run the layout detector for one page. Returns a fully-built
+    ``_PageState`` — either with ``ordered`` populated (success), or
+    with ``detector_error`` set (per-page detector exception), or with
+    ``total_regions == 0`` (empty detection). Never raises; per-page
+    failures are kept local so sibling pages still progress."""
+    t_start = time.perf_counter()
     try:
         regions = detector.detect(page)
     except Exception as e:  # noqa: BLE001
@@ -295,34 +562,28 @@ def _produce_one_page(
             "%s page %d/%d %s detector FAIL: %s",
             log_prefix, page_idx, total_pages, page.file_id, e,
         )
-        done_queue.put(
-            _PageState(
-                page=page,
-                page_idx=page_idx,
-                ordered=[],
-                total_regions=0,
-                remaining=0,
-                t_start=t_start,
-                detector_error=f"{type(e).__name__}: {e}",
-            )
+        return _PageState(
+            page=page,
+            page_idx=page_idx,
+            ordered=[],
+            total_regions=0,
+            remaining=0,
+            t_start=t_start,
+            detector_error=f"{type(e).__name__}: {e}",
         )
-        return
 
     if not regions:
-        done_queue.put(
-            _PageState(
-                page=page,
-                page_idx=page_idx,
-                ordered=[],
-                total_regions=0,
-                remaining=0,
-                t_start=t_start,
-            )
+        return _PageState(
+            page=page,
+            page_idx=page_idx,
+            ordered=[],
+            total_regions=0,
+            remaining=0,
+            t_start=t_start,
         )
-        return
 
     ordered = _sort_reading_order(regions)
-    state = _PageState(
+    return _PageState(
         page=page,
         page_idx=page_idx,
         ordered=ordered,
@@ -332,21 +593,50 @@ def _produce_one_page(
         results=[None] * len(ordered),
     )
 
-    for position, region in enumerate(ordered):
+
+def _submit_state(
+    *,
+    state: _PageState,
+    profile: ModelProfile,
+    proxy_url: str,
+    sampling: tuple[dict[str, Any], dict[str, Any]],
+    timeout: float,
+    state_lock: threading.Lock,
+    inflight_sem: threading.BoundedSemaphore,
+    publish_page: Callable[[_PageState], None],
+    executor: concurrent.futures.ThreadPoolExecutor,
+) -> None:
+    """Open the page's cost record, then dispatch region work. For empty
+    or detector-failed states, publish the page immediately so the
+    yielder still emits a ``RawOutput`` for it.
+
+    ``open_page`` must precede the first ``executor.submit(...)`` —
+    region workers won't pick up the task until after submit returns,
+    so this ordering guarantees the cost recorder's page slot exists
+    before any region's ``record_request`` callback fires."""
+    cost_mod.recorder.open_page(state.page.page_id, profile.name)
+
+    if state.total_regions == 0:
+        # Empty detection or detector error: nothing to submit; the
+        # yielder will assemble an empty (or error-tagged) RawOutput.
+        publish_page(state)
+        return
+
+    for position, region in enumerate(state.ordered):
         inflight_sem.acquire()
         executor.submit(
             _make_region_worker(
                 state=state,
                 position=position,
                 region=region,
-                page=page,
+                page=state.page,
                 profile=profile,
                 proxy_url=proxy_url,
                 sampling=sampling,
                 timeout=timeout,
                 state_lock=state_lock,
                 inflight_sem=inflight_sem,
-                done_queue=done_queue,
+                publish_page=publish_page,
             )
         )
 
@@ -363,14 +653,14 @@ def _make_region_worker(
     timeout: float,
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
-    done_queue: queue.Queue[Any],
+    publish_page: Callable[[_PageState], None],
 ) -> Callable[[], None]:
     """Build the closure submitted to the executor for one region.
 
     The closure runs ``_post_region``, releases the in-flight semaphore in
     ``finally`` (so even an unhandled error frees the slot), then mutates
     the captured ``state`` under ``state_lock``; when the page's last
-    region completes, it enqueues the state onto ``done_queue``."""
+    region completes, it publishes the state via ``publish_page``."""
 
     def _work() -> None:
         try:
@@ -391,7 +681,7 @@ def _make_region_worker(
             state.remaining -= 1
             is_done = state.remaining == 0
         if is_done:
-            done_queue.put(state)
+            publish_page(state)
 
     return _work
 

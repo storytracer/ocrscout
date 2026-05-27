@@ -58,11 +58,18 @@ def apply(
              "for this worker. Sets concurrent_requests / region_concurrency "
              "and sizes vLLM's KV cache to fit.",
     ),
+    detector_workers: int | None = typer.Option(
+        None, "--detector-workers", min=1,
+        help="Override the CPU detector pool size for layout_chat profiles "
+             "on this worker. Default: auto-derived from sched_getaffinity.",
+    ),
     verbose: int = typer.Option(0, "-v", "--verbose", count=True),
     quiet: bool = typer.Option(False, "-q", "--quiet"),
 ) -> None:
     """Run a pipeline previously serialized to YAML."""
     setup_logging(verbosity=verbose, quiet=quiet)
+    if detector_workers is not None:
+        os.environ["OCRSCOUT_DETECTOR_WORKERS"] = str(detector_workers)
 
     try:
         raw = yaml.safe_load(pipeline.read_text(encoding="utf-8"))

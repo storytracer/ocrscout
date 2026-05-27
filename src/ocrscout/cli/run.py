@@ -158,6 +158,13 @@ def run(
              "to fit. Refuses if it doesn't fit. Default: auto-derived from "
              "detected GPU capacity.",
     ),
+    detector_workers: int | None = typer.Option(
+        None, "--detector-workers", min=1,
+        help="Override the CPU detector pool size for `backend: layout_chat` "
+             "profiles. Each worker owns its own PP-DocLayoutV3 instance and "
+             "runs in parallel on CPU. Default: auto-derived from "
+             "`sched_getaffinity` (capped at 8).",
+    ),
     resume: bool = typer.Option(
         False, "--resume",
         help="Skip pages already present in <output-dir>/data/train-*.parquet "
@@ -179,6 +186,12 @@ def run(
 ) -> None:
     """Run multiple OCR models against a source and emit a comparison."""
     setup_logging(verbosity=verbose, quiet=quiet)
+    if detector_workers is not None:
+        # The layout_chat backend reads this env var in its
+        # `_resolve_detector_workers` precedence chain (profile > state >
+        # env > auto). Setting it here covers both ephemeral runs and any
+        # subprocess workers the runner spawns, since env vars inherit.
+        os.environ["OCRSCOUT_DETECTOR_WORKERS"] = str(detector_workers)
     if benchmark is None and source is None and source_name == "hf_dataset":
         raise typer.BadParameter(
             "--source is required when using the default `hf_dataset` "

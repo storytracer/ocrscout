@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,12 @@ def submit(
              "`ocrscout launch --batch-concurrency`); changing it from here "
              "is rejected so the live KV-cache and concurrency stay coherent.",
     ),
+    detector_workers: int | None = typer.Option(
+        None, "--detector-workers", min=1,
+        help="Override the CPU detector pool size for layout_chat profiles. "
+             "Safe to set per-submit (CPU-only, no live-stack coupling). "
+             "Default: auto-derived from sched_getaffinity.",
+    ),
     verbose: int = typer.Option(0, "-v", "--verbose", count=True),
     quiet: bool = typer.Option(False, "-q", "--quiet"),
 ) -> None:
@@ -101,6 +108,9 @@ def submit(
             "`ocrscout down`, then relaunch with `ocrscout launch "
             "--batch-concurrency N`."
         )
+
+    if detector_workers is not None:
+        os.environ["OCRSCOUT_DETECTOR_WORKERS"] = str(detector_workers)
 
     state = state_mod.read_state()
     runner_name = runner or (state.runner if state else None) or "local"
