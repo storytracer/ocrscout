@@ -1009,7 +1009,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             )
 
         if rights_local_parquet is not None:
-            rights_path: str = str(rights_local_parquet)
+            rights_paths: list[str] = [str(rights_local_parquet)]
         else:
             try:
                 from huggingface_hub import snapshot_download
@@ -1020,14 +1020,20 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 ) from e
             # Pull every parquet shard in the dataset — different publishers
             # use different layouts (`data/train-*.parquet`, top-level
-            # `*.parquet`, `train/*.parquet`, …) and DuckDB happily reads a
-            # recursive glob, so we don't need to care which.
+            # `rights_classified.parquet`, `train/*.parquet`, …). Allow both
+            # top-level and nested patterns: `**/*.parquet` alone won't match
+            # files at the snapshot root.
             local_dir = snapshot_download(
                 repo_id=rights_repo,
                 repo_type="dataset",
-                allow_patterns=["**/*.parquet"],
+                allow_patterns=["*.parquet", "**/*.parquet"],
             )
-            rights_path = f"{local_dir}/**/*.parquet"
+            rights_paths = [str(p) for p in Path(local_dir).rglob("*.parquet")]
+            if not rights_paths:
+                raise ScoutError(
+                    f"no *.parquet files found in HF dataset {rights_repo!r} "
+                    f"(snapshot at {local_dir}). Check the dataset layout."
+                )
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         conn = duckdb.connect(":memory:")
@@ -1035,6 +1041,10 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         rights_join_sql = " AND ".join(
             f"NULLIF(c.{col}, '') IS NOT DISTINCT FROM NULLIF(i.{col}, '')"
             for col in cls.COPYRIGHT_JOIN_COLUMNS
+        )
+        # DuckDB list literal: read_parquet(['a.parquet', 'b.parquet', ...])
+        rights_path_list = (
+            "[" + ", ".join(f"'{p}'" for p in rights_paths) + "]"
         )
 
         conn.execute(
@@ -1057,7 +1067,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                     c.classification AS Rights
                 FROM read_parquet('{item_parquet}') AS i
                 LEFT JOIN read_parquet('{title_parquet}') AS t USING (TitleID)
-                JOIN read_parquet('{rights_path}') AS c
+                JOIN read_parquet({rights_path_list}) AS c
                   ON {rights_join_sql}
                 WHERE c.parsing_success = TRUE
             ) TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
