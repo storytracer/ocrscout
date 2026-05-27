@@ -110,7 +110,7 @@ def submit(
         source_args["path"] = source
     if pages is not None:
         source_args.setdefault("sample", pages)
-        source_args.setdefault("seed", seed)
+    source_args.setdefault("seed", seed)
     if start_idx is not None:
         source_args["start_idx"] = start_idx
     if end_idx is not None:

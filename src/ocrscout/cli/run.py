@@ -193,7 +193,11 @@ def run(
         # Sampling is pushed down into the adapter so cheap pre-listing
         # avoids downloading the whole prefix just to discard most of it.
         source_args.setdefault("sample", sample)
-        source_args.setdefault("seed", seed)
+    # --seed reaches the adapter regardless of how sample was set (typer
+    # --sample flag or --source-arg sample=N), and regardless of whether
+    # the adapter pre-samples at all (BHL applies seed to the rank query
+    # even without an explicit sample).
+    source_args.setdefault("seed", seed)
     comparison_names = _parse_comparisons_flag(comparisons)
     cfg = PipelineConfig(
         name="run",
