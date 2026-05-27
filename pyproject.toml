@@ -87,9 +87,13 @@ viewer = [
 #
 # transformers>=4.59.0 is the first release that ships
 # PPDocLayoutV3ForObjectDetection / PPDocLayoutV3ImageProcessor.
+# opencv-python-headless is a hard runtime requirement of
+# PPDocLayoutV3ImageProcessor (preprocess uses cv2.resize/warpAffine);
+# headless avoids pulling in Qt/GTK on server hosts.
 layout = [
     "transformers>=4.59.0",
     "torch>=2.0.0",
+    "opencv-python-headless>=4.8.0",
 ]
 # Biodiversity Heritage Library source + OCR reference adapter.
 # DuckDB drives the TSV→parquet catalog conversion (refresh) and the
