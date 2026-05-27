@@ -43,7 +43,7 @@ ocrscout is extended through Abstract Base Classes and Python entry points.
    - `Runner` — orchestrates the compute stack (LiteLLM proxy + N vLLM backends) on whatever infrastructure the user picks. Built-ins: `local` (daemonised processes via [src/ocrscout/runners/local.py](src/ocrscout/runners/local.py)), `skypilot` (Kubernetes pool via [src/ocrscout/runners/skypilot.py](src/ocrscout/runners/skypilot.py)), `hf` (HuggingFace Jobs API via [src/ocrscout/runners/hf.py](src/ocrscout/runners/hf.py)). See "Runners" below.
    - `LayoutDetector` — emits typed `LayoutRegion`s (bbox + native category) for a `PageImage`. Consumed by layout-aware backends like `LayoutChatBackend`. Built-in: `pp-doclayout-v3` (transformers + torch via the `[layout]` extra). See "Layout-aware OCR" below.
    - `Normalizer` — converts a `RawOutput` + `PageImage` into a `DoclingDocument`.
-   - `ExportAdapter` — writes a stream of `ExportRecord` objects to a destination. The built-in `parquet` adapter does incremental shard writes (one file per `batch_size` rows, default 1000) plus a `progress.json` checkpoint that powers `--resume`.
+   - `ExportAdapter` — writes a stream of `ExportRecord` objects to a destination. The built-in `parquet` adapter does incremental shard writes (one file per `batch_size` rows, default 1000); `--resume` is powered by reading the shards' `(page_id, model)` columns directly (see "Incremental Parquet + checkpoint/resume" below).
    - `Comparison` — one analytic axis (text / document / layout / future semantic). Takes typed `PredictionView` + `BaselineView`, returns a typed `ComparisonResult` subclass. See "Comparisons subsystem" below.
    - `ComparisonRenderer` — terminal/HTML/Gradio surfaces for one `ComparisonResult` subclass. Same registry pattern as comparisons themselves.
    - `Benchmark` — bundles a source, reference adapter, and a list of comparisons with a canonical summary protocol.
@@ -101,10 +101,14 @@ Active runner state lives in `~/.ocrscout/state.yaml` (atomic write via tmp + re
 ### CLI lifecycle
 
 ```bash
-# Default: ephemeral. Ctrl-C reliably kills the entire stack — no state
-# is left on disk. Pass --keep-up to use the persistent daemonised
-# path so the stack outlives this invocation for follow-up `submit`s.
+# Default: ephemeral + model-major. With -P 1 (default), one vLLM serve
+# is up at a time: spawn → all pages → tear down → next model. Preflight
+# checks max(per-profile), not sum, so the matrix only has to fit the
+# largest single model. --keep-up forces the persistent daemonised path
+# with all serves resident together (today's pre-refactor behavior),
+# useful when follow-up `submit`s should skip relaunch.
 uv run ocrscout run --source ./images/ --models dots-mocr,glm-ocr-layout
+uv run ocrscout run --source ./images/ --models dots-mocr,glm-ocr-layout --resume
 
 # Stateful lifecycle. The CLI is stateless across commands — closing
 # the terminal between them is fine; daemons survive.
@@ -138,11 +142,13 @@ PR_SET_PDEATHSIG is **not** used on the persistent path — by design the daemon
 1. **`PR_SET_PDEATHSIG=SIGTERM`** set in each child's preexec_fn via ctypes-bound `prctl`. The kernel SIGTERMs the child the instant its parent dies. Linux only — no-op on macOS.
 2. **`start_new_session=True`** on every Popen so the controlling terminal's Ctrl-C doesn't double-deliver. The orchestrator owns the signal and propagates explicit termination.
 3. **`atexit` registration** that calls `terminate_all()` (reverse-order SIGTERM → 10s grace → SIGKILL on each process group). Catches clean exits from non-signal paths.
-4. **SIGINT/SIGTERM/SIGHUP handlers** that call `terminate_all()` synchronously before re-raising. Handlers are installed lazily on first spawn and restored on teardown.
+4. **SIGINT/SIGTERM/SIGHUP handlers** that call `terminate_all()` synchronously before re-raising. Handlers are installed lazily on first spawn and restored on teardown. To keep handler chains from ricocheting across the model-major chunk loop, `_install_handlers_if_needed` substitutes `SIG_DFL` whenever the "prior" handler is itself another `EphemeralStack._signal_handler` bound method.
 
 The ephemeral path writes **nothing** under `~/.ocrscout/state.yaml` or `~/.ocrscout/pids/`. Log files still land in `~/.ocrscout/logs/` so `ocrscout logs` can tail them while the run is live. As a direct consequence, `ocrscout submit` after an ephemeral `run` cleanly errors with "no active stack" — submit is stateful and ephemeral runs opt out.
 
 This bifurcation closes a class of bugs where Ctrl-C during a `ocrscout run` left orphaned vLLM children holding GPU memory: with PDEATHSIG, the leaf vllm-serve dies regardless of which intermediate `uv run` wrapper Python recorded as the immediate child.
+
+**Model-major chunked dispatch** (ephemeral only). `run_pipeline()` in [src/ocrscout/cli/run.py](src/ocrscout/cli/run.py) partitions the requested models by `runtime` (`vllm` / `hosted` / `cpu`) and, for the ephemeral path, walks the vLLM list in chunks of `--parallel-models` (default 1): each chunk = one fresh `EphemeralStack` launch + `_execute` over that chunk's models + `runner.down()` before the next chunk. `LocalRunner._launch_ephemeral` guards against re-entry by erroring if `self._ephemeral_stack` is non-None and not closed — defense in depth; the chunk loop always tears down first. Hosted profiles trail in one final proxy-only launch (no vLLM upstreams); CPU profiles run in-process with no proxy at all. `--keep-up` opts out of chunking entirely and uses the original single-launch parallel-spawn path so a follow-up `submit` against the persistent stack pays no relaunch cost. A persistent stack already up at the top of `run_pipeline()` (`state_mod.read_state()` matches `local`) also bypasses chunking — reuse the existing stack via the standard `_matches_existing` model-set check, error cleanly on mismatch.
 
 **Reuse**: `LocalRunner.launch(models=…)` reads `state.yaml` first. If a persistent stack is already up and matches the requested models + proxy port (and `phase == "ready"`), it returns the existing handle without spawning anything — for both the persistent and ephemeral branches. `ocrscout run` skips its `finally` teardown via `reused_existing` so a `launch` followed by `run` doesn't leave the stack down. A mismatch errors out with a hint to call `ocrscout down`.
 
@@ -156,11 +162,13 @@ A `ModelProfile` validator rejects `runtime: vllm` profiles missing this field a
 
 ### GPU budget preflight
 
-`--gpu-budget` (default 0.85) is the collective ceiling fraction of total VRAM the stack may claim — it's a sanity check, not a splitter. At spawn time, `_preflight_kv_budgets` sums each profile's `kv_cache_memory_bytes` plus a per-profile overhead estimate (model weights from `model_size` × bytes-per-param from `dtype`, plus a 25%-of-weights / 1 GiB-min working slack for activations + cudagraphs + allocator), and rejects the run if the total would exceed `min(total_VRAM × gpu_budget, free_VRAM × 0.95)`. The error message names each profile's KV + overhead contribution so you can see which to shrink. If `model_size` is missing or unparseable, ocrscout falls back to a flat 8 GiB conservative estimate.
+`--gpu-budget` (default 0.85) is the collective ceiling fraction of total VRAM the stack may claim — it's a sanity check, not a splitter. At each launch, `_preflight_kv_budgets` sums each profile's `kv_cache_memory_bytes` plus a per-profile overhead estimate (model weights from `model_size` × bytes-per-param from `dtype`, plus a 25%-of-weights / 1 GiB-min working slack for activations + cudagraphs + allocator), and rejects the launch if the total would exceed `min(total_VRAM × gpu_budget, free_VRAM × 0.95)`. The error message names each profile's KV + overhead contribution so you can see which to shrink. If `model_size` is missing or unparseable, ocrscout falls back to a flat 8 GiB conservative estimate.
+
+Under ephemeral model-major dispatch the preflight runs **once per chunk** with only that chunk's profiles, so with the default `--parallel-models 1` the effective check is `max(per-profile (KV + overhead))` across the matrix rather than `sum(...)`. A benchmark matrix only needs to fit the largest single model. `--keep-up` and `ocrscout launch` retain the original behavior where the sum is checked at the one-shot multi-model launch.
 
 ### Sequential model execution by default
 
-`--parallel-models` defaults to `1` even when multiple models are launched: vLLM servers all spawn in parallel (one startup cost), but page requests run against one server at a time. On a single GPU, concurrent execution just halves throughput per model and yields contended s/page numbers that aren't useful for benchmarking. Sequential gives each model the full GPU, produces honest per-model timings, and total wall-clock is ~equivalent (the GPU is the bottleneck either way). Override with `-P > 1` only if you have separate GPUs per model.
+`--parallel-models` defaults to `1`, which under ephemeral `ocrscout run` means **chunk size 1**: spawn one vLLM serve (plus its proxy), run all pages through it, tear down, spawn the next. Each model gets the full GPU, the preflight only has to fit one profile at a time, and per-model s/page numbers come out uncontended. Trade-off: vLLM cold-start (~30–60s) is paid N times instead of once, so for tiny test runs the swap cost can dominate; for real benchmark runs (hundreds+ of pages per model) it's noise. Override with `-P N > 1` to widen the chunk to N concurrent serves (preflight cap applies per chunk); only useful if you have VRAM headroom for N simultaneous models. `--keep-up` forces the original single-launch parallel-spawn path (all serves resident together) and ignores `--parallel-models`.
 
 ### SkyPilotRunner notes
 
@@ -202,7 +210,9 @@ After a model's `_execute` loop finishes a page, `cli/run.py` calls `cost.record
 
 ## Incremental Parquet + checkpoint/resume
 
-[src/ocrscout/exports/parquet.py](src/ocrscout/exports/parquet.py) auto-flushes the row buffer every `batch_size` rows (default 1000) to `data/train-NNNNN.parquet`. A sibling `<output>/progress.json` records every flushed `page_id` atomically (tmp + rename). On `ocrscout submit --resume` (or `ocrscout apply --resume` on a SkyPilot/HF retry), the dispatcher loads `progress.json`, filters out already-done page ids from the source's deterministic sample, and only dispatches what remains. Partial output is always readable; a crash loses at most one un-flushed batch.
+[src/ocrscout/exports/parquet.py](src/ocrscout/exports/parquet.py) auto-flushes the row buffer every `batch_size` rows (default 1000) to `data/train-NNNNN.parquet`. A sibling `<output>/progress.json` records every flushed `page_id` atomically (tmp + rename) — still written for run-level metadata (source, models, batch index continuity), but **no longer load-bearing for resume**. Partial output is always readable; a crash loses at most one un-flushed batch.
+
+`--resume` (now exposed on `ocrscout run`, `ocrscout submit`, and `ocrscout apply`) reads the per-model done-set straight from the parquet shards via `done_pairs_from_parquet(output_dir)` — pyarrow with `columns=["page_id", "model"]` so only those two columns hit disk. The result is a `dict[model_name, set[page_id]]` that `_execute` consults per model: a page already done for model A is still attempted for model B if B hadn't processed it yet. The single source of truth is the parquet itself; the resume cursor cannot drift from what's actually on disk, which the older `progress.json`-keyed-by-page-id scheme could under multi-model runs.
 
 Existing readers (inspect, viewer, publish) already glob `data/train-*.parquet` so they see all shards transparently.
 
@@ -362,7 +372,7 @@ The project is in rapid-prototyping mode. The previous test suite was deleted (r
 2. **Single + multi-model scouting**: `LiteLLMBackend` over a LiteLLM proxy, layout-aware OCR via `layout_chat`, per-page metrics + comparison subsystem.
 3. **Runner abstraction**: `Runner` ABC; `LocalRunner` with proper daemonisation; `SkyPilotRunner` for K8s pools; `HuggingFaceRunner` for HF Jobs.
 4. **Cost tracking**: in-process LiteLLM `success_callback` → per-page `litellm_cost` / `gpu_time_cost` / tokens / `elapsed_seconds` columns; `ocrscout costs` for DuckDB aggregation.
-5. **Incremental Parquet + checkpoint/resume**: `data/train-NNNNN.parquet` shards + `progress.json` checkpoint; `--resume` filters done pages.
+5. **Incremental Parquet + checkpoint/resume**: `data/train-NNNNN.parquet` shards are the source of truth; `--resume` reads `(page_id, model)` pairs from the shards via `done_pairs_from_parquet` and filters per-model.
 6. **Flat CLI**: `launch / submit / status / down / logs / run / benchmark / costs / apply` plus the existing `inspect / viewer / introspect / publish`. **Two-level for source admin**: `source <name> <verb>` (`setup`, `refresh`, `info`, `clear`, …) — see "Source admin subsystem".
 
 **Open:**

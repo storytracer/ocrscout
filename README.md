@@ -36,7 +36,7 @@ Behind the scenes:
 
 - **Runs each model for you.** Loads each one onto the GPU, runs your pages through it, and shuts down cleanly when it's done. Manages GPU memory if you load several at once.
 - **Normalises every output.** One model returns Markdown, another HTML, another its own custom token stream. ocrscout converts every result into a common document model so you can compare apples to apples.
-- **Writes one HuggingFace-shaped dataset.** One row per `(page, model)` in `data/train-*.parquet` — incrementally flushed during the run with a `progress.json` checkpoint, so a partial run is always readable and a crash + restart picks up where it left off. Each row carries timings, success/failure, the normalised document, a pre-rendered Markdown rendering, plus per-page cost / token / GPU-context columns (`litellm_cost`, `input_tokens`, `output_tokens`, `elapsed_seconds`, `gpu_type`, `cost_per_hour`, `gpu_time_cost`) populated automatically by the unified LiteLLM proxy that fronts every model call.
+- **Writes one HuggingFace-shaped dataset.** One row per `(page, model)` in `data/train-*.parquet` — incrementally flushed during the run, so a partial run is always readable and `--resume` picks up where it left off (per-model: a page already done for model A is still attempted for model B if B hadn't processed it yet — the parquet shards themselves are the resume cursor). Each row carries timings, success/failure, the normalised document, a pre-rendered Markdown rendering, plus per-page cost / token / GPU-context columns (`litellm_cost`, `input_tokens`, `output_tokens`, `elapsed_seconds`, `gpu_type`, `cost_per_hour`, `gpu_time_cost`) populated automatically by the unified LiteLLM proxy that fronts every model call.
 - **Has a browser viewer.** Flip through pages, switch between models, see bounding boxes overlaid on the source image, compare two artifacts word-by-word, place the page's reference baseline alongside any model output for direct comparison.
 - **Scores predictions against any baseline.** Drop in a reference adapter (plain-text files, BHL legacy OCR, future ALTO/hOCR) and ocrscout runs a configurable suite of comparisons per page — text similarity always, character/word error rates with the `[eval]` extra, structural and layout deltas when both sides carry the relevant data. Reference is *not* assumed to be ground truth: provenance (`method`, `engine`, `confidence`) is captured so you can interpret the numbers as accuracy-vs-truth or agreement-vs-incumbent depending on the source.
 - **Scales from one machine to a cloud pool.** One Runner abstraction (`local`, `skypilot`, `hf`) drives every deployment. Start with `ocrscout run` on your workstation, scale to an OVHcloud / AWS / GCP Kubernetes pool via `--runner skypilot --gpu L4 --workers 3`, or hand off to HuggingFace-sponsored compute via `--runner hf`. Same command shape, same Parquet output, same cost columns.
@@ -166,15 +166,17 @@ The LiteLLM proxy is the unifying layer: it gives every model the same OpenAI-co
 
 ### "Just run it" — `ocrscout run`
 
-You point ocrscout at a folder, it spins up the local stack, runs the pages, and shuts down. Models stay warm for the duration of the run, then teardown is clean:
+You point ocrscout at a folder, it spins up the local stack, runs the pages, and shuts down. By default the dispatch is **model-major**: one vLLM serve at a time — spawn → all pages → tear down → next model. Each model gets the full GPU (so the timing numbers are honest), and the GPU-memory preflight only needs to fit the **largest single model**, not the sum of all of them. That means a benchmark matrix of e.g. `dots-mocr` (3B) + `glm-ocr-layout` (0.9B) runs comfortably on a 16 GB GPU even though their combined working set wouldn't fit.
 
 ```bash
 uv run ocrscout run --source ./images/ --models dots-mocr,glm-ocr-layout,paddleocr-vl-layout
 ```
 
-If you only need one model, no flag changes — the same command works. ocrscout sums the GPU memory each model needs and refuses to spawn a config that won't fit, so you don't waste time discovering OOMs mid-run. Models run sequentially by default (each one gets the full GPU, giving honest timing numbers); pass `--parallel-models 2` only if you have separate GPUs per model.
+The trade-off is vLLM cold-start (~30–60s) gets paid once per model instead of once per run. For real benchmark workloads (hundreds+ pages per model) it's noise; for tiny test runs it can dominate.
 
-Pass `--keep-up` to leave the stack running after the pipeline finishes — useful when you're iterating on prompts and want to skip the launch cost on subsequent runs.
+Pass `--parallel-models N` to widen the chunk to N concurrent serves — useful if you have VRAM headroom and want to amortize the cold-start cost. Pass `--keep-up` to switch back to the old behavior: every requested model loaded simultaneously and the stack left running after the pipeline finishes, so subsequent `ocrscout submit` calls against the same stack skip the launch cost entirely.
+
+Pass `--resume` to skip pages already in `data/train-*.parquet` (per-model: a page already done for model A is still attempted for model B if B hadn't processed it yet).
 
 ### "Stateful workflow" — `launch` / `submit` / `status` / `down`
 
@@ -191,7 +193,7 @@ uv run ocrscout submit --source ./scans/ --output ./out/ --pages 1000
 uv run ocrscout status
 uv run ocrscout logs <job-id>
 
-# Resume after a crash (skips page ids in <output>/progress.json)
+# Resume after a crash (per-model: reads (page_id, model) pairs from <output>/data/train-*.parquet)
 uv run ocrscout submit --source ./scans/ --output ./out/ --resume
 
 # Tear down when done
@@ -295,7 +297,7 @@ The extension points (each is a Python Abstract Base Class):
 - **`Runner`** — orchestrates the compute stack (LiteLLM proxy + N vLLM backends) for OCR workloads. Built-in: `local` (daemonised processes on this machine), `skypilot` (Kubernetes pool via SkyPilot), `hf` (HuggingFace Jobs API). Add new runners for AI Factory, Slurm, your in-house scheduler, etc.
 - **`LayoutDetector`** — finds typed regions on a page image. Used by layout-aware backends. Built-in: PP-DocLayoutV3.
 - **`Normalizer`** — converts a model's raw output into ocrscout's common document format. Add one when a new model emits a custom output dialect.
-- **`ExportAdapter`** — writes results somewhere. Built-in: parquet (incremental shards + `progress.json` checkpoint for resume). Add a CSV or JSON-Lines exporter, or write to a database.
+- **`ExportAdapter`** — writes results somewhere. Built-in: parquet (incremental shards; `--resume` reads `(page_id, model)` pairs from the shards directly). Add a CSV or JSON-Lines exporter, or write to a database.
 - **`Comparison`** — one analytic axis between a prediction and a baseline. Built-in: text similarity (with optional CER/WER), document structure deltas, layout IoU. Add a semantic comparison, an LLM-as-judge, table-cell F1, anything you need. Each `Comparison` produces a typed `ComparisonResult`.
 - **`ComparisonRenderer`** — renders a `ComparisonResult` for terminal, HTML, and the in-viewer Compare mode. Built-in renderers ship for each built-in comparison; downstream packages can register their own.
 - **`Benchmark`** — bundles a fixed source + reference adapter + comparison suite into a named, citable benchmark.
