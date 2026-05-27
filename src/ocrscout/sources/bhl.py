@@ -1012,17 +1012,22 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             rights_path: str = str(rights_local_parquet)
         else:
             try:
-                from huggingface_hub import hf_hub_download
+                from huggingface_hub import snapshot_download
             except ImportError as e:
                 raise ScoutError(
                     "huggingface_hub is required to resolve a remote rights "
                     "repo; install via `pip install ocrscout[bhl]`."
                 ) from e
-            rights_path = hf_hub_download(
+            # Pull every parquet shard in the dataset — different publishers
+            # use different layouts (`data/train-*.parquet`, top-level
+            # `*.parquet`, `train/*.parquet`, …) and DuckDB happily reads a
+            # recursive glob, so we don't need to care which.
+            local_dir = snapshot_download(
                 repo_id=rights_repo,
-                filename=cls.COPYRIGHT_PARQUET_PATH,
                 repo_type="dataset",
+                allow_patterns=["**/*.parquet"],
             )
+            rights_path = f"{local_dir}/**/*.parquet"
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
         conn = duckdb.connect(":memory:")
