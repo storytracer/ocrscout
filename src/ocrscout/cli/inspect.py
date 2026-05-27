@@ -163,11 +163,14 @@ def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
             "document_table_count_delta": raw.get("document_table_count_delta"),
             "document_picture_count_delta": raw.get("document_picture_count_delta"),
             "layout_iou_mean": raw.get("layout_iou_mean"),
-            # Hardware/cost context. Timing data lives in `metrics_json`
-            # (loaded above); the cost-callback's `elapsed_seconds` /
-            # `litellm_cost` / `gpu_time_cost` flat columns aren't read by
-            # the inspector — the dispatcher's `run_seconds_total` /
-            # `run_seconds_per_page` are the single source of truth.
+            # Per-page wall-clock from the cost callback (min(start) to
+            # max(end) across that page's region requests). Used as the
+            # per-row "s/page" so cross-page batching's actual per-page
+            # latency is visible — the dispatcher's `run_seconds_per_page`
+            # is a run-wide average and lives in `metrics_json` for the
+            # aggregate table only.
+            "elapsed_seconds": raw.get("elapsed_seconds"),
+            # Hardware/cost context.
             "gpu_type": raw.get("gpu_type"),
             "provider": raw.get("provider"),
             "cost_per_hour": raw.get("cost_per_hour"),
@@ -416,10 +419,13 @@ def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
         m = r["metrics"]
         items = _fmt_int(m.get("item_count"))
         chars = _fmt_int(m.get("text_length"))
-        # Throughput-based per-page time stamped by the dispatcher
-        # (same value across all rows of a model — single source of truth
-        # with the run aggregate above).
-        s_per_page = _fmt_seconds_human(m.get("run_seconds_per_page"))
+        # Per-page wall-clock from the cost callback so cross-page
+        # batching's actual per-page latency variance is visible.
+        # Falls back to the dispatcher's run-wide average when the
+        # backend didn't go through the cost callback (e.g. Tesseract).
+        s_per_page = _fmt_seconds_human(
+            r.get("elapsed_seconds") or m.get("run_seconds_per_page")
+        )
         snippet = _snippet_from_doc(r["document_json"], snippet_length)
 
         file_label = r["file_id"] if r["file_id"] != last_file else ""
@@ -463,7 +469,9 @@ def _show_page(rows: list[dict[str, Any]], *, page_id: str) -> None:
             f"({r['output_format']}) ===[/bold cyan]"
         )
         m = r["metrics"]
-        s_per_page = _fmt_seconds_human(m.get("run_seconds_per_page"))
+        s_per_page = _fmt_seconds_human(
+            r.get("elapsed_seconds") or m.get("run_seconds_per_page")
+        )
         rprint(
             f"[dim]items={m.get('item_count')}  chars={m.get('text_length')}  "
             f"s/page={s_per_page}[/dim]"
