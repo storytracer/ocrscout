@@ -16,6 +16,7 @@ preprocessing and decoding heuristics; this is 80 LOC and works.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any, ClassVar
 
 from ocrscout.errors import BackendError
@@ -60,6 +61,15 @@ class PpDocLayoutV3Detector(LayoutDetector):
         self._model: Any = None
         self._processor: Any = None
         self._torch: Any = None
+        # Per-instance lock guarding ``_ensure_loaded``. Defense-in-depth
+        # against concurrent first-loads even when the backend forgets to
+        # call ``warm_up`` serially.
+        self._load_lock = threading.Lock()
+
+    def warm_up(self) -> None:
+        """Force model + processor load. Safe to call repeatedly and
+        from any thread."""
+        self._ensure_loaded()
 
     def detect(self, page: PageImage) -> list[LayoutRegion]:
         if page.image is None:
@@ -117,42 +127,62 @@ class PpDocLayoutV3Detector(LayoutDetector):
         return regions
 
     def _ensure_loaded(self) -> None:
+        # Fast path: already loaded. The lock acquire below would also
+        # return immediately, but skipping it on the hot path saves a
+        # mutex round-trip per ``detect`` call.
         if self._model is not None:
             return
-        try:
-            import torch  # type: ignore[import-not-found]
-            from transformers import (  # type: ignore[import-not-found]
-                AutoImageProcessor,
-                AutoModelForObjectDetection,
+        with self._load_lock:
+            # Double-checked: another thread may have loaded while we
+            # waited on the lock.
+            if self._model is not None:
+                return
+            try:
+                import torch  # type: ignore[import-not-found]
+                from transformers import (  # type: ignore[import-not-found]
+                    AutoImageProcessor,
+                    AutoModelForObjectDetection,
+                )
+            except ImportError as e:  # pragma: no cover
+                raise BackendError(
+                    "PpDocLayoutV3Detector needs transformers + torch; "
+                    "install ocrscout[layout]"
+                ) from e
+
+            log.info(
+                "loading PP-DocLayoutV3 from %s%s on %s",
+                self._model_id,
+                f"@{self._revision}" if self._revision else "",
+                self._device,
             )
-        except ImportError as e:  # pragma: no cover
-            raise BackendError(
-                "PpDocLayoutV3Detector needs transformers + torch; "
-                "install ocrscout[layout]"
-            ) from e
+            dtype = _resolve_torch_dtype(torch, self._torch_dtype)
+            load_kwargs: dict[str, Any] = {}
+            if self._revision is not None:
+                load_kwargs["revision"] = self._revision
+            if dtype is not None:
+                load_kwargs["dtype"] = dtype
 
-        log.info(
-            "loading PP-DocLayoutV3 from %s%s on %s",
-            self._model_id,
-            f"@{self._revision}" if self._revision else "",
-            self._device,
-        )
-        dtype = _resolve_torch_dtype(torch, self._torch_dtype)
-        load_kwargs: dict[str, Any] = {}
-        if self._revision is not None:
-            load_kwargs["revision"] = self._revision
-        if dtype is not None:
-            load_kwargs["dtype"] = dtype
-
-        self._processor = AutoImageProcessor.from_pretrained(
-            self._model_id, **{k: v for k, v in load_kwargs.items() if k != "dtype"}
-        )
-        self._model = AutoModelForObjectDetection.from_pretrained(
-            self._model_id, **load_kwargs
-        )
-        self._model.eval()
-        self._model.to(self._device)
-        self._torch = torch
+            # Build everything into local variables first; commit to
+            # ``self`` only after all calls (including ``.to(device)``)
+            # succeed. If anything raises midway — most commonly the
+            # meta-tensor copy error on a freshly-fetched checkpoint —
+            # ``self._model`` stays None and the next call retries
+            # cleanly instead of getting wedged on a partially-loaded
+            # instance.
+            processor = AutoImageProcessor.from_pretrained(
+                self._model_id,
+                **{k: v for k, v in load_kwargs.items() if k != "dtype"},
+            )
+            model = AutoModelForObjectDetection.from_pretrained(
+                self._model_id, **load_kwargs
+            )
+            model.eval()
+            model.to(self._device)
+            self._processor = processor
+            self._torch = torch
+            # ``self._model`` is the load-completed sentinel — assign
+            # LAST so the fast-path check above is sound.
+            self._model = model
 
 
 def _resolve_torch_dtype(torch: Any, name: str) -> Any:

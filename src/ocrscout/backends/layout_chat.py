@@ -250,6 +250,25 @@ class LayoutChatBackend(ModelBackend):
                 f"{profile.layout_detector!r}: {e}"
             ) from e
 
+        # Warm up each detector serially BEFORE the worker pool starts.
+        # Concurrent first-loads of the same HF model race inside
+        # transformers / accelerate — symptoms in the wild: ``Cannot copy
+        # out of meta tensor`` on `.to(device)`, partial-init detector
+        # instances whose ``_torch`` stays None, and subsequent
+        # ``AttributeError: 'NoneType' object has no attribute
+        # 'inference_mode'`` on every detect() call. Serial warm-up
+        # closes the race: the first load populates the HF cache and
+        # global transformers state; every subsequent instance hits the
+        # warm path. Cost is paid once per benchmark run, before any
+        # page is touched.
+        for i, det in enumerate(detectors):
+            try:
+                det.warm_up()
+            except Exception as e:
+                raise BackendError(
+                    f"LayoutChatBackend: detector #{i} warm-up failed: {e}"
+                ) from e
+
         cost_mod.ensure_callback_registered()
 
         return BackendInvocation(
