@@ -44,7 +44,13 @@ from ocrscout.types import BackendInvocation, PageImage, RawOutput
 log = logging.getLogger(__name__)
 
 _DEFAULT_REQUEST_TIMEOUT = 300.0
-_DEFAULT_CONCURRENT_REQUESTS = 16
+_DEFAULT_CONCURRENT_REQUESTS = 8
+"""Per-page client-side concurrency. For single-GPU small-VLM OCR (3B-class
+models with ``max_tokens`` in the thousands-to-20k range) 8 keeps the engine
+saturated without inflating KV queue time on cap-token requests — going past
+~8 trades latency for marginal throughput on memory-bandwidth-bound decode.
+Hosted profiles (where the provider handles batching) can safely raise this
+via ``backend_args.concurrent_requests``."""
 
 # Subset of vLLM/OpenAI sampling fields the proxy forwards. Anything outside
 # this allowlist is passed through ``extra_body`` so vLLM-specific extensions

@@ -98,9 +98,9 @@ sampling_args:
   max_tokens: 6000
 
 # Region-level concurrency: how many regions of one page are dispatched in
-# parallel to the chat endpoint. Pages stay sequential. Default 16.
+# parallel to the chat endpoint. Pages stay sequential. Default 8.
 backend_args:
-  region_concurrency: 16
+  region_concurrency: 8
 
 metadata:
   notes: |

@@ -42,7 +42,7 @@ from ocrscout.types import BackendInvocation, LayoutRegion, PageImage, RawOutput
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_REGION_CONCURRENCY = 16
+_DEFAULT_REGION_CONCURRENCY = 8
 _DEFAULT_REQUEST_TIMEOUT = 300.0
 _MODELS_PROBE_TIMEOUT = 15.0
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
