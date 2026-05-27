@@ -183,6 +183,19 @@ python_version = "3.11"
 strict_optional = true
 warn_unused_ignores = true
 
+[tool.uv]
+# Exclude rapidocr: docling pulls it in as the default OCR engine for
+# its StandardPdfPipeline, but ocrscout only ever uses docling's
+# VlmPipeline (routed through our vLLM backends), so it's dead weight.
+# It also drags in the full opencv-python, whose cv2/typing/ directory
+# shadows the stdlib typing module inside vLLM's multiprocessing.spawn
+# workers and crashes EngineCore on startup. The `sys_platform ==
+# 'never'` marker is uv's idiom for "this requirement is never
+# satisfiable" — uv drops it from the resolution.
+override-dependencies = [
+    "rapidocr ; sys_platform == 'never'",
+]
+
 [dependency-groups]
 dev = [
     "playwright",
