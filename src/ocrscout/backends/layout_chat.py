@@ -352,11 +352,33 @@ class LayoutChatBackend(ModelBackend):
         # exit early while region work is still in flight.
         pages_completed_lock = threading.Lock()
         pages_completed = [0]
+        # ``pages_dispatched`` is incremented at the START of
+        # ``_submit_state`` — every page that's been popped from
+        # ``pages_queue`` and handed to the region executor (or
+        # short-circuited via publish_page for empty/error pages).
+        # Used by the main thread's heartbeat: a "no progress" timeout
+        # is only a true stall if every dispatched page has also
+        # completed. While ``completed < dispatched`` there's still
+        # legitimate region work in flight (some pages have 40+ regions
+        # and slow regions can sit on the wire for tens of seconds),
+        # so the main thread keeps waiting instead of declaring loss.
+        pages_dispatched_lock = threading.Lock()
+        pages_dispatched = [0]
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=region_concurrency,
             thread_name_prefix="layout_chat_region",
         ) as executor:
+
+            def _mark_dispatched() -> None:
+                """Called at the head of ``_submit_state`` for every
+                page handed to the region executor (including empty /
+                detector-error pages that publish directly). Pairs
+                with ``_publish_page``: while ``pages_completed <
+                pages_dispatched``, region work is still in flight and
+                the main thread must keep waiting."""
+                with pages_dispatched_lock:
+                    pages_dispatched[0] += 1
 
             def _publish_page(state: _PageState) -> None:
                 """Push a fully-assembled (or empty / detector-failed)
@@ -394,6 +416,7 @@ class LayoutChatBackend(ModelBackend):
                         log_prefix=prefix,
                         state_lock=state_lock,
                         inflight_sem=inflight_sem,
+                        mark_dispatched=_mark_dispatched,
                         publish_page=_publish_page,
                         executor=executor,
                         cancel_event=cancel_event,
@@ -412,34 +435,48 @@ class LayoutChatBackend(ModelBackend):
                     try:
                         item = done_queue.get(timeout=1.0)
                     except queue.Empty:
-                        # Heartbeat: are we making forward progress? If
-                        # every detector worker has exited AND
-                        # ``publish_page`` never reached ``total_pages``,
-                        # the missing pages were lost (crash or
-                        # interrupted mid-submit). Surface that here so
-                        # we don't hang on an unreachable sentinel.
+                        # Heartbeat: are we genuinely stuck, or just
+                        # waiting on slow region work? Region POSTs
+                        # against a busy vLLM can take 30-60s per
+                        # request, and a single page with 40+ regions
+                        # can sit in the executor longer than the
+                        # poll window. A "no progress for 1s" silence
+                        # alone is NOT a stall signal — it's only a
+                        # genuine loss when every dispatched page has
+                        # also completed AND the dispatched count
+                        # under-runs ``total_pages`` (i.e. some pages
+                        # never made it through _submit_state due to
+                        # detector crashes).
                         with done_workers_lock:
                             all_workers_done = done_workers[0] >= n_workers
-                        if all_workers_done:
-                            with pages_completed_lock:
-                                completed = pages_completed[0]
-                            # If no in-flight region work either, we're
-                            # truly stuck. Conservative check: if all
-                            # detector workers are done AND completed
-                            # count hasn't moved past what's already
-                            # yielded by a meaningful amount, we're done.
-                            # publish_page would have pushed _SENTINEL
-                            # if completed reached total_pages, so
-                            # completed < total_pages here means lost.
-                            if completed < total_pages:
-                                log.error(
-                                    "%s detector workers all exited but "
-                                    "only %d/%d pages completed; some "
-                                    "pages were lost. Yielded %d so far.",
-                                    prefix, completed, total_pages, yielded,
-                                )
-                                break
-                        continue
+                        if not all_workers_done:
+                            continue
+                        with pages_completed_lock:
+                            completed = pages_completed[0]
+                        with pages_dispatched_lock:
+                            dispatched = pages_dispatched[0]
+                        if completed < dispatched:
+                            # Region work still in flight; keep waiting.
+                            continue
+                        # All dispatched pages have published. If the
+                        # dispatched count fell short of total_pages,
+                        # some pages were lost — surface it and break.
+                        # Otherwise publish_page already pushed the
+                        # final _SENTINEL, which we'll see next.
+                        if dispatched < total_pages:
+                            log.error(
+                                "%s detector workers all exited and "
+                                "all dispatched pages completed, but "
+                                "only %d/%d pages were dispatched "
+                                "(%d lost in-flight). Yielded %d so far.",
+                                prefix, dispatched, total_pages,
+                                total_pages - dispatched, yielded,
+                            )
+                            break
+                        # dispatched == total_pages but no _SENTINEL yet
+                        # — shouldn't happen (publish_page pushes it on
+                        # the last completion). Defensive break.
+                        break
                     if item is _SENTINEL:
                         break
                     yield _assemble_raw(item, profile, prefix, total_pages)
@@ -502,6 +539,7 @@ def _detector_worker_loop(
     log_prefix: str,
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
+    mark_dispatched: Callable[[], None],
     publish_page: Callable[[_PageState], None],
     executor: concurrent.futures.ThreadPoolExecutor,
     cancel_event: threading.Event,
@@ -537,6 +575,7 @@ def _detector_worker_loop(
                 timeout=timeout,
                 state_lock=state_lock,
                 inflight_sem=inflight_sem,
+                mark_dispatched=mark_dispatched,
                 publish_page=publish_page,
                 executor=executor,
             )
@@ -622,6 +661,7 @@ def _submit_state(
     timeout: float,
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
+    mark_dispatched: Callable[[], None],
     publish_page: Callable[[_PageState], None],
     executor: concurrent.futures.ThreadPoolExecutor,
 ) -> None:
@@ -632,8 +672,13 @@ def _submit_state(
     ``open_page`` must precede the first ``executor.submit(...)`` —
     region workers won't pick up the task until after submit returns,
     so this ordering guarantees the cost recorder's page slot exists
-    before any region's ``record_request`` callback fires."""
+    before any region's ``record_request`` callback fires.
+
+    ``mark_dispatched`` is called BEFORE any region work could publish,
+    so the main thread's ``pages_completed >= pages_dispatched`` check
+    can never see completion racing ahead of dispatch."""
     cost_mod.recorder.open_page(state.page.page_id, profile.name)
+    mark_dispatched()
 
     if state.total_regions == 0:
         # Empty detection or detector error: nothing to submit; the
