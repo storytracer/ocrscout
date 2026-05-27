@@ -85,14 +85,10 @@ vllm_engine_args:
   max_num_batched_tokens: 16384
   enable_prefix_caching: false
   enforce_eager: true
-  kv_cache_memory_bytes: 2G
 
 sampling_args:
   temperature: 0.0
   max_tokens: 4096
-
-backend_args:
-  region_concurrency: 8
 
 metadata:
   notes: |

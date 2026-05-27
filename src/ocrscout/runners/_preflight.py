@@ -1,16 +1,20 @@
-"""KV-budget preflight for ``runtime: vllm`` profiles.
+"""KV-budget preflight and autoscaling for ``runtime: vllm`` profiles.
 
-Sums each profile's declared ``vllm_engine_args.kv_cache_memory_bytes``
-plus a per-profile overhead estimate (weights from ``model_size`` ×
-bytes-per-param from ``dtype``, plus a working slack) and rejects the
-launch when the total would exceed
-``min(total_VRAM × gpu_budget, free_VRAM × 0.95)``. Reused by every
-``Runner`` that has to size the GPU footprint of a planned launch
-(``LocalRunner`` today; future GPU-aware remote runners can call the
-same helper).
+Two complementary functions, sharing a probe of the active GPU's
+``min(total × gpu_budget, free × 0.95)`` headroom:
 
-Extracted from the previous monolithic ``managed.py`` so step 6's hard
-cut can delete that module without leaving Runners unwired.
+* :func:`preflight_kv_budgets` — validates that an explicit-KV launch fits.
+  Sums each profile's declared ``vllm_engine_args.kv_cache_memory_bytes``
+  plus a per-profile overhead estimate (weights from ``model_size`` ×
+  bytes-per-param from ``dtype``, plus working slack) and rejects when
+  the total exceeds the cap.
+
+* :func:`autoscale_kv_budgets` — computes KV and per-profile concurrency
+  from the cap when the profile YAML doesn't declare them. Caller mutates
+  the profile objects with the returned decisions before any spawn.
+
+Both are reused by every Runner that has to size the GPU footprint of
+a planned launch.
 """
 
 from __future__ import annotations
@@ -18,6 +22,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from ocrscout.errors import RunnerError
 from ocrscout.profile import ModelProfile
@@ -27,6 +32,15 @@ log = logging.getLogger(__name__)
 _FREE_HEADROOM = 0.95
 _OVERHEAD_PER_MODEL_BYTES = 8 * 1024**3
 _ENGINE_CAP_OVERHEAD_MULTIPLIER = 1.25
+
+# Autoscaler tuning. Both are deliberately module constants — single edits
+# retune the whole fleet. The per-token coefficient is a rule of thumb for
+# 3B–7B-class VLMs (derived from
+# ``2 × num_layers × num_kv_heads × head_dim × dtype_bytes``); the ceiling
+# reflects empirical diminishing returns past 64 concurrent requests from
+# vision-encoder cache thrashing and prefill contention.
+AUTOSCALE_PER_TOKEN_BYTES = 30_000
+AUTOSCALE_MAX_CONCURRENCY = 64
 
 _BYTE_SUFFIX_MULTIPLIERS = {
     "": 1,
@@ -197,6 +211,166 @@ def preflight_kv_budgets(
         f"free {human_bytes(free_b)} / total {human_bytes(total_b)})"
     )
     return summary, caps
+
+
+@dataclass(frozen=True)
+class AutoscaleDecision:
+    """What the autoscaler decided for one profile."""
+
+    profile_name: str
+    kv_cache_memory_bytes: int
+    concurrent_requests: int
+    overhead_bytes: int
+    max_model_len: int
+
+
+@dataclass(frozen=True)
+class GpuProbe:
+    """Snapshot of the active GPU at autoscale time."""
+
+    name: str
+    total_bytes: int
+    free_bytes: int
+    cap_bytes: int
+
+
+def probe_gpu(gpu_budget: float) -> GpuProbe:
+    """Read free/total VRAM from the first visible CUDA device and compute
+    the autoscale cap. Raises ``RunnerError`` if no GPU is visible —
+    autoscale cannot proceed without a real device to size for.
+    """
+    if not (0.0 < gpu_budget <= 1.0):
+        raise RunnerError(f"--gpu-budget must be in (0, 1]; got {gpu_budget!r}")
+    devices = cuda_devices()
+    if not devices:
+        raise RunnerError(
+            "autoscale requires a visible CUDA device. None detected — check "
+            "CUDA_VISIBLE_DEVICES, the NVIDIA driver, and nvitop installation. "
+            "Set kv_cache_memory_bytes / backend_args.concurrent_requests "
+            "explicitly on the profile to bypass autoscale."
+        )
+    dev = devices[0]
+    try:
+        free_b = int(dev.memory_free())
+        total_b = int(dev.memory_total())
+    except Exception as e:  # noqa: BLE001
+        raise RunnerError(f"nvitop memory query failed: {e}") from e
+    cap = min(int(free_b * _FREE_HEADROOM), int(total_b * gpu_budget))
+    return GpuProbe(
+        name=str(dev.name()), total_bytes=total_b, free_bytes=free_b, cap_bytes=cap
+    )
+
+
+def autoscale_kv_budgets(
+    profiles: Sequence[ModelProfile],
+    gpu_budget: float,
+    *,
+    batch_concurrency: int | None = None,
+    probe: GpuProbe | None = None,
+) -> tuple[str, dict[str, AutoscaleDecision]]:
+    """Decide KV cache size + per-profile concurrency from the active GPU.
+
+    Returns ``(summary, decisions)`` where ``decisions[profile.name]`` is
+    an :class:`AutoscaleDecision`. The caller mutates each profile's
+    ``vllm_engine_args["kv_cache_memory_bytes"]`` and ``backend_args``
+    from these values before any spawn.
+
+    KV cap = ``min(free × 0.95, total × gpu_budget)`` minus the sum of
+    per-profile weight + working overhead. KV is split proportionally
+    across the chunk by ``max_model_len × per_token_bytes`` so chunks
+    that mix profiles with very different context lengths each get a
+    fair slice. When ``batch_concurrency`` is set, that value is honored
+    per profile and KV is derived from it; raises if a profile's slice
+    cannot hold the requested concurrency.
+    """
+    if not profiles:
+        raise RunnerError("autoscale_kv_budgets: profiles list is empty")
+    if batch_concurrency is not None and batch_concurrency < 1:
+        raise RunnerError(
+            f"--batch-concurrency must be a positive integer; got {batch_concurrency!r}"
+        )
+
+    gpu = probe if probe is not None else probe_gpu(gpu_budget)
+
+    overheads: dict[str, int] = {
+        p.name: estimate_model_overhead(p) for p in profiles
+    }
+    total_overhead = sum(overheads.values())
+    available_kv = gpu.cap_bytes - total_overhead
+    if available_kv <= 0:
+        per_profile = ", ".join(
+            f"{p.name}: overhead {human_bytes(overheads[p.name])}"
+            for p in profiles
+        )
+        raise RunnerError(
+            f"autoscale: model weights + working overhead "
+            f"({human_bytes(total_overhead)}) already exceed the GPU cap "
+            f"{human_bytes(gpu.cap_bytes)} on {gpu.name}; nothing left for "
+            f"KV cache. Per-profile breakdown: {per_profile}. Reduce "
+            f"--parallel-models, raise --gpu-budget, or free GPU memory."
+        )
+
+    # Proportional weights for the kv split.
+    def _max_len(p: ModelProfile) -> int:
+        raw = (p.vllm_engine_args or {}).get("max_model_len")
+        if raw is None:
+            raise RunnerError(
+                f"autoscale: profile {p.name!r} is missing "
+                f"vllm_engine_args.max_model_len; autoscale needs it to "
+                f"size KV cache. Add it to the profile YAML."
+            )
+        return int(raw)
+
+    max_lens = {p.name: _max_len(p) for p in profiles}
+    weights = {
+        name: max_lens[name] * AUTOSCALE_PER_TOKEN_BYTES for name in max_lens
+    }
+    weight_total = sum(weights.values()) or 1
+
+    decisions: dict[str, AutoscaleDecision] = {}
+    for p in profiles:
+        kv_slice = int(available_kv * weights[p.name] / weight_total)
+        per_request_kv = max_lens[p.name] * AUTOSCALE_PER_TOKEN_BYTES
+
+        if batch_concurrency is not None:
+            concurrency = batch_concurrency
+            kv = concurrency * per_request_kv
+            if kv > kv_slice:
+                raise RunnerError(
+                    f"autoscale: --batch-concurrency {batch_concurrency} on "
+                    f"profile {p.name!r} needs {human_bytes(kv)} of KV cache "
+                    f"but only {human_bytes(kv_slice)} is available after "
+                    f"weights+overhead on {gpu.name} (cap "
+                    f"{human_bytes(gpu.cap_bytes)}). Lower "
+                    f"--batch-concurrency, raise --gpu-budget, lower "
+                    f"--parallel-models, or pick profiles with smaller "
+                    f"max_model_len."
+                )
+        else:
+            max_from_kv = kv_slice // per_request_kv
+            concurrency = max(1, min(int(max_from_kv), AUTOSCALE_MAX_CONCURRENCY))
+            kv = concurrency * per_request_kv
+
+        decisions[p.name] = AutoscaleDecision(
+            profile_name=p.name,
+            kv_cache_memory_bytes=kv,
+            concurrent_requests=concurrency,
+            overhead_bytes=overheads[p.name],
+            max_model_len=max_lens[p.name],
+        )
+
+    lines = [
+        f"GPU {gpu.name}: free {human_bytes(gpu.free_bytes)} / total "
+        f"{human_bytes(gpu.total_bytes)}; cap {human_bytes(gpu.cap_bytes)}. "
+        f"Auto-scaled {len(decisions)} profile(s):"
+    ]
+    for name, d in decisions.items():
+        lines.append(
+            f"  {name} (overhead {human_bytes(d.overhead_bytes)}, "
+            f"KV {human_bytes(d.kv_cache_memory_bytes)}, "
+            f"concurrency {d.concurrent_requests})"
+        )
+    return "\n".join(lines), decisions
 
 
 def cuda_devices() -> list:

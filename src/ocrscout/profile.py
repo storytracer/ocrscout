@@ -32,12 +32,11 @@ Runtime = Literal["vllm", "hosted", "cpu"]
 OutputFormat = Literal["markdown", "doctags", "layout_json"]
 
 DEFAULT_VLLM_ENGINE_ARGS: dict[str, Any] = {
-    # Trim CUDA graph capture sizes — vLLM's default is [1..512], but with
-    # backend_args.concurrent_requests defaulting to ~16 we will never see
-    # batches above ~32. Capturing fewer graphs saves ~1 GiB of GPU memory
-    # (absorbed by KV cache) and ~2s of startup per engine. Override
-    # per-profile by setting ``cudagraph_capture_sizes`` in
-    # ``vllm_engine_args``.
+    # Trim CUDA graph capture sizes — vLLM's default is [1..512], but most
+    # auto-scaled launches sit under 32. Capturing fewer graphs saves ~1
+    # GiB of GPU memory (absorbed by KV cache) and ~2s of startup per
+    # engine. The autoscaler extends this list with the chosen concurrency
+    # when it exceeds the top bucket (avoids eager mode at high concurrency).
     "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 24, 32],
     # Every shipped OCR VLM ships custom modeling code on the Hub and
     # requires this. Override to ``false`` only for a profile that pins a
@@ -92,8 +91,10 @@ class ModelProfile(BaseModel):
     """What infrastructure the active Runner provisions for this model.
 
     * ``vllm`` — Runner spawns ``vllm serve`` and exposes it through
-      LiteLLM. Requires ``vllm_engine_args.kv_cache_memory_bytes`` so the
-      KV-budget preflight has what it needs.
+      LiteLLM. ``vllm_engine_args.kv_cache_memory_bytes`` is optional;
+      when absent, the Runner's autoscaler computes it from the detected
+      GPU. Set it explicitly only as an escape hatch for a profile that
+      needs a hand-tuned value.
     * ``hosted`` — Runner adds a provider entry to the LiteLLM config but
       spawns no local server. API keys come from env. No vLLM fields
       apply.
@@ -199,18 +200,6 @@ class ModelProfile(BaseModel):
                     "backend='layout_chat' requires runtime='vllm' "
                     f"(got {self.runtime!r}); the OSS VLMs it wraps need a "
                     "local vLLM serve."
-                )
-
-        # runtime: vllm → the Runner's KV-budget preflight needs the absolute
-        # cache size declared on the profile. Skipping this would mean the
-        # preflight has no way to validate combined GPU footprint at launch.
-        if self.runtime == "vllm":
-            kv = (self.vllm_engine_args or {}).get("kv_cache_memory_bytes")
-            if kv is None:
-                raise ValueError(
-                    f"runtime='vllm' requires vllm_engine_args.kv_cache_memory_bytes "
-                    f"on profile {self.name!r}. Add a value like "
-                    f"`kv_cache_memory_bytes: 16G` to the profile YAML."
                 )
 
         # runtime: hosted → vLLM-specific fields are meaningless and a sign

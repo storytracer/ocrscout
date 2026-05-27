@@ -97,6 +97,15 @@ class RunnerStateFile(BaseModel):
     phase_updated_at: str | None = None
     """ISO8601 timestamp of the most recent phase transition. Used by
     ``is_stale_launching`` to flag crashed launchers."""
+    backend_overrides: dict[str, dict[str, int]] = Field(default_factory=dict)
+    """Per-profile backend kwargs the runner decided at launch.
+
+    Outer key is ``profile.name``; inner dict carries
+    ``{"concurrent_requests": N, "region_concurrency": N}``. Backends
+    running in submitted-worker processes consult this so the GPU-aware
+    autoscale decision made at ``ocrscout launch`` time survives the
+    launch → submit → worker handoff. Empty for ephemeral runs (no
+    handoff; profile mutation is visible in-process)."""
 
 
 def state_dir() -> Path:

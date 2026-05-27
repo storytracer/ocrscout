@@ -182,6 +182,13 @@ class ExportRecord(BaseModel):
     litellm_cost: float | None = None
     gpu_time_cost: float | None = None
 
+    # Autoscaler context. Populated for runtime: vllm rows from the active
+    # profile at the time the page ran; null for hosted / cpu rows.
+    # region_concurrency is only meaningful for backend: layout_chat.
+    kv_cache_memory_bytes: int | None = None
+    concurrent_requests: int | None = None
+    region_concurrency: int | None = None
+
 
 class RunMetrics(BaseModel):
     """Final metrics envelope for a complete run."""

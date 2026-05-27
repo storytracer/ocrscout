@@ -43,7 +43,6 @@ vllm_engine_args:
   max_num_batched_tokens: 16384
   enable_prefix_caching: false
   enforce_eager: true
-  kv_cache_memory_bytes: 2G
 
 # Greedy / deterministic sampling per upstream paddleocr-vl.py:424-427.
 sampling_args:

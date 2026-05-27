@@ -67,13 +67,6 @@ chat_template_content_format: string
 # necessary for dense pages (8192 truncates layout JSON mid-string).
 vllm_engine_args:
   max_model_len: 24000
-  # Absolute KV cache budget (vLLM accepts SI suffixes: lowercase k/m/g =
-  # decimal, uppercase K/M/G = binary). 16 GiB → ~25× concurrency at
-  # max_model_len=24000 for this model class. Sized to comfortably exceed
-  # the default 16-way client concurrency. Excludes model weights + working
-  # memory + cudagraphs (~6 GiB more); managed mode adds an 8 GiB per-model
-  # overhead estimate when preflighting against --gpu-budget.
-  kv_cache_memory_bytes: 2G
 # Deterministic decoding for OCR/layout extraction so reruns of the same
 # page produce identical output (matches dots-ocr.yaml). The metadata note
 # below describes when to override this for SVG mode.

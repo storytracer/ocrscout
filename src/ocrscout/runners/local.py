@@ -65,7 +65,16 @@ from ocrscout.runners._daemon import (
     terminate,
     uptime_seconds,
 )
-from ocrscout.runners._preflight import preflight_kv_budgets
+from ocrscout.runners._preflight import (
+    AUTOSCALE_MAX_CONCURRENCY,
+    AUTOSCALE_PER_TOKEN_BYTES,
+    AutoscaleDecision,
+    autoscale_kv_budgets,
+    estimate_model_overhead,
+    parse_bytes,
+    preflight_kv_budgets,
+    probe_gpu,
+)
 from ocrscout.state import GpuConfig, ManagedProcess, RunnerStateFile
 from ocrscout.types import (
     JobHandle,
@@ -114,6 +123,7 @@ class LocalRunner(Runner):
         gpu_budget: float = _DEFAULT_GPU_BUDGET,
         ready_timeout: float = _DEFAULT_READY_TIMEOUT,
         persistent: bool = True,
+        batch_concurrency: int | None = None,
         **_: Any,
     ) -> RunnerHandle:
         if not models:
@@ -138,11 +148,13 @@ class LocalRunner(Runner):
                 models=models, gpu_type=gpu_type, base_port=base_port,
                 proxy_port=proxy_port, gpu_budget=gpu_budget,
                 ready_timeout=ready_timeout,
+                batch_concurrency=batch_concurrency,
             )
         return self._launch_ephemeral(
             models=models, gpu_type=gpu_type, base_port=base_port,
             proxy_port=proxy_port, gpu_budget=gpu_budget,
             ready_timeout=ready_timeout,
+            batch_concurrency=batch_concurrency,
         )
 
     # --- persistent path -----------------------------------------------------
@@ -156,6 +168,7 @@ class LocalRunner(Runner):
         proxy_port: int,
         gpu_budget: float,
         ready_timeout: float,
+        batch_concurrency: int | None,
     ) -> RunnerHandle:
         profiles = [resolve(name) for name in models]
         vllm_profiles = [p for p in profiles if p.runtime == "vllm"]
@@ -163,8 +176,14 @@ class LocalRunner(Runner):
 
         vllm_ports = _allocate_ports(base_port, len(vllm_profiles))
         gpu_caps: dict[str, float] = {}
+        autoscale_extra: dict[str, Any] = {}
 
         if vllm_profiles:
+            autoscale_extra = _autoscale_and_apply(
+                vllm_profiles=vllm_profiles,
+                gpu_budget=gpu_budget,
+                batch_concurrency=batch_concurrency,
+            )
             summary, gpu_caps = preflight_kv_budgets(vllm_profiles, gpu_budget)
             log.info(summary)
 
@@ -176,6 +195,19 @@ class LocalRunner(Runner):
         # 'launching' means "do not trust these PIDs"; subsequent
         # ``update_state_processes`` calls append corrected entries as
         # daemons come up.
+        backend_overrides = _backend_overrides_from_autoscale(autoscale_extra)
+        args_record: dict[str, Any] = {
+            "base_port": base_port,
+            "proxy_port": proxy_port,
+            "gpu_budget": gpu_budget,
+        }
+        if batch_concurrency is not None:
+            args_record["batch_concurrency"] = batch_concurrency
+        if autoscale_extra:
+            # Stash the full autoscale context so reused launches and
+            # subsequent ocrscout commands can render a runtime.yaml
+            # without re-probing the GPU.
+            args_record["autoscale"] = autoscale_extra
         state = RunnerStateFile(
             runner=self.name,
             models=models,
@@ -183,11 +215,8 @@ class LocalRunner(Runner):
             processes=[],
             gpu=gpu_cfg,
             launched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            args={
-                "base_port": base_port,
-                "proxy_port": proxy_port,
-                "gpu_budget": gpu_budget,
-            },
+            args=args_record,
+            backend_overrides=backend_overrides,
         )
         state_mod.write_state_launching(state)
 
@@ -251,6 +280,10 @@ class LocalRunner(Runner):
                  proxy_url, ",".join(models))
         return _handle_from_state(state)
 
+    # `_handle_from_state` reads `state.args["autoscale"]` so reused
+    # launches and the immediate post-launch handle both carry the
+    # autoscale context for downstream consumers (runtime.yaml writer).
+
     # --- ephemeral path ------------------------------------------------------
 
     def _launch_ephemeral(
@@ -262,6 +295,7 @@ class LocalRunner(Runner):
         proxy_port: int,
         gpu_budget: float,
         ready_timeout: float,
+        batch_concurrency: int | None,
     ) -> RunnerHandle:
         if self._ephemeral_stack is not None and not self._ephemeral_stack._closed:
             # Model-major chunking on the CLI side always calls down() before
@@ -278,7 +312,13 @@ class LocalRunner(Runner):
         vllm_ports = _allocate_ports(base_port, len(vllm_profiles))
 
         gpu_caps: dict[str, float] = {}
+        autoscale_extra: dict[str, Any] = {}
         if vllm_profiles:
+            autoscale_extra = _autoscale_and_apply(
+                vllm_profiles=vllm_profiles,
+                gpu_budget=gpu_budget,
+                batch_concurrency=batch_concurrency,
+            )
             summary, gpu_caps = preflight_kv_budgets(vllm_profiles, gpu_budget)
             log.info(summary)
 
@@ -335,7 +375,9 @@ class LocalRunner(Runner):
         proxy_url = f"http://localhost:{proxy_port}/v1"
         log.info("LocalRunner ephemeral ready: proxy=%s  models=%s",
                  proxy_url, ",".join(models))
-        return _handle_from_ephemeral_stack(stack, proxy_url, models)
+        return _handle_from_ephemeral_stack(
+            stack, proxy_url, models, autoscale=autoscale_extra,
+        )
 
     # --- submit / status / logs / down --------------------------------------
 
@@ -653,6 +695,147 @@ def _spawn_litellm_proxy(*, proxy_port: int) -> ManagedProcess:
     )
 
 
+def _autoscale_and_apply(
+    *,
+    vllm_profiles: Sequence[ModelProfile],
+    gpu_budget: float,
+    batch_concurrency: int | None,
+) -> dict[str, Any]:
+    """Run the GPU-aware autoscaler over ``vllm_profiles`` (those that
+    don't declare an explicit ``kv_cache_memory_bytes``), mutate the
+    profile objects in place, and return a JSON-serialisable context
+    describing the decisions for downstream consumers (runtime.yaml,
+    state.yaml).
+
+    Profiles with an explicit YAML value are honored as-is — the
+    autoscaler doesn't override user intent — but they still appear in
+    the returned context so consumers can render a complete record.
+    """
+    needs_scaling = [
+        p for p in vllm_profiles
+        if (p.vllm_engine_args or {}).get("kv_cache_memory_bytes") is None
+    ]
+    explicit = [
+        p for p in vllm_profiles
+        if (p.vllm_engine_args or {}).get("kv_cache_memory_bytes") is not None
+    ]
+
+    gpu = probe_gpu(gpu_budget)
+    scaled: dict[str, AutoscaleDecision] = {}
+    if needs_scaling:
+        summary, scaled = autoscale_kv_budgets(
+            needs_scaling, gpu_budget,
+            batch_concurrency=batch_concurrency, probe=gpu,
+        )
+        log.info(summary)
+        for p in needs_scaling:
+            d = scaled[p.name]
+            _apply_decision_to_profile(p, d)
+
+    if explicit and batch_concurrency is not None:
+        # The override is global; warn the user that profile-declared KV
+        # is being respected anyway so they're not surprised.
+        for p in explicit:
+            log.warning(
+                "profile %r declares an explicit kv_cache_memory_bytes; "
+                "honoring it and ignoring --batch-concurrency for this profile.",
+                p.name,
+            )
+
+    profile_records: dict[str, dict[str, Any]] = {}
+    for p in vllm_profiles:
+        if p.name in scaled:
+            d = scaled[p.name]
+            profile_records[p.name] = {
+                "explicit_kv_in_yaml": False,
+                "overhead_bytes": d.overhead_bytes,
+                "kv_cache_memory_bytes": d.kv_cache_memory_bytes,
+                "concurrent_requests": d.concurrent_requests,
+                "region_concurrency": d.concurrent_requests,
+                "max_model_len": d.max_model_len,
+            }
+        else:
+            # Explicit profile: read back the values that will reach vLLM.
+            kv_raw = (p.vllm_engine_args or {}).get("kv_cache_memory_bytes")
+            cr = (p.backend_args or {}).get("concurrent_requests")
+            rc = (p.backend_args or {}).get("region_concurrency")
+            max_len = int((p.vllm_engine_args or {}).get("max_model_len") or 0)
+            profile_records[p.name] = {
+                "explicit_kv_in_yaml": True,
+                "overhead_bytes": estimate_model_overhead(p),
+                "kv_cache_memory_bytes": parse_bytes(kv_raw) if kv_raw is not None else 0,
+                "concurrent_requests": int(cr) if cr is not None else 0,
+                "region_concurrency": int(rc) if rc is not None else 0,
+                "max_model_len": max_len,
+            }
+
+    return {
+        "gpu": {
+            "name": gpu.name,
+            "total_bytes": gpu.total_bytes,
+            "free_bytes_at_launch": gpu.free_bytes,
+            "cap_bytes": gpu.cap_bytes,
+        },
+        "gpu_budget": gpu_budget,
+        "batch_concurrency_override": batch_concurrency,
+        "per_token_bytes": AUTOSCALE_PER_TOKEN_BYTES,
+        "max_concurrency_ceiling": AUTOSCALE_MAX_CONCURRENCY,
+        "profiles": profile_records,
+    }
+
+
+def _apply_decision_to_profile(
+    profile: ModelProfile, decision: AutoscaleDecision
+) -> None:
+    """Mutate the profile with the autoscaler's KV + concurrency choices.
+
+    Uses ``setdefault`` on the backend args so an explicit profile value
+    (rare — most profiles don't set these) still wins. Extends
+    ``cudagraph_capture_sizes`` when the chosen concurrency exceeds the
+    largest pre-captured bucket; otherwise vLLM would run that batch
+    size eagerly, paying ~30% latency for no benefit.
+    """
+    eng = dict(profile.vllm_engine_args or {})
+    eng["kv_cache_memory_bytes"] = decision.kv_cache_memory_bytes
+
+    capture = list(eng.get("cudagraph_capture_sizes") or [])
+    if not capture or decision.concurrent_requests > max(capture):
+        # Inherit the profile default's existing buckets and add the
+        # chosen concurrency. ``cudagraph_capture_sizes`` is overridable
+        # per profile; if the YAML set it explicitly, we extend that list.
+        from ocrscout.profile import DEFAULT_VLLM_ENGINE_ARGS
+
+        base = capture or list(DEFAULT_VLLM_ENGINE_ARGS["cudagraph_capture_sizes"])
+        if decision.concurrent_requests not in base:
+            base.append(decision.concurrent_requests)
+        eng["cudagraph_capture_sizes"] = sorted(set(base))
+
+    profile.vllm_engine_args = eng
+
+    backend = dict(profile.backend_args or {})
+    backend.setdefault("concurrent_requests", decision.concurrent_requests)
+    backend.setdefault("region_concurrency", decision.concurrent_requests)
+    profile.backend_args = backend
+
+
+def _backend_overrides_from_autoscale(
+    autoscale_extra: dict[str, Any],
+) -> dict[str, dict[str, int]]:
+    """Slim down the autoscale context to the per-profile concurrency
+    pair the submit-time worker backends consult through state.yaml.
+    Empty when the autoscale context is empty (hosted-only runs)."""
+    out: dict[str, dict[str, int]] = {}
+    for name, rec in (autoscale_extra.get("profiles") or {}).items():
+        cr = int(rec.get("concurrent_requests") or 0)
+        rc = int(rec.get("region_concurrency") or 0)
+        if cr > 0 or rc > 0:
+            out[name] = {
+                "concurrent_requests": cr,
+                "region_concurrency": rc,
+            }
+    return out
+
+
 def _engine_args_to_cli(engine_args: dict) -> list[str]:
     """Translate ``vllm_engine_args`` into ``vllm serve`` CLI flags."""
     out: list[str] = []
@@ -910,11 +1093,18 @@ def _handle_from_state(state: RunnerStateFile) -> RunnerHandle:
         for proc in state.processes
         if proc.name.startswith("vllm-") and proc.port is not None
     ]
+    extra: dict[str, Any] = {"models": state.models}
+    autoscale = (state.args or {}).get("autoscale")
+    if isinstance(autoscale, dict):
+        extra["autoscale"] = autoscale
+    batch_concurrency = (state.args or {}).get("batch_concurrency")
+    if isinstance(batch_concurrency, int):
+        extra["batch_concurrency"] = batch_concurrency
     return RunnerHandle(
         runner=state.runner,
         proxy_url=state.proxy_url or "",
         endpoints=endpoints,
-        extra={"models": state.models},
+        extra=extra,
     )
 
 
@@ -922,6 +1112,8 @@ def _handle_from_ephemeral_stack(
     stack: _ephemeral.EphemeralStack,
     proxy_url: str,
     models: list[str],
+    *,
+    autoscale: dict[str, Any] | None = None,
 ) -> RunnerHandle:
     endpoints = [
         RunnerEndpoint(
@@ -932,9 +1124,12 @@ def _handle_from_ephemeral_stack(
         for p in stack.processes
         if p.name.startswith("vllm-") and p.port is not None
     ]
+    extra: dict[str, Any] = {"models": models, "ephemeral": True}
+    if autoscale:
+        extra["autoscale"] = autoscale
     return RunnerHandle(
         runner="local",
         proxy_url=proxy_url,
         endpoints=endpoints,
-        extra={"models": models, "ephemeral": True},
+        extra=extra,
     )

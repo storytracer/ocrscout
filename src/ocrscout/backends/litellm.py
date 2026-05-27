@@ -45,12 +45,82 @@ log = logging.getLogger(__name__)
 
 _DEFAULT_REQUEST_TIMEOUT = 300.0
 _DEFAULT_CONCURRENT_REQUESTS = 8
-"""Per-page client-side concurrency. For single-GPU small-VLM OCR (3B-class
-models with ``max_tokens`` in the thousands-to-20k range) 8 keeps the engine
-saturated without inflating KV queue time on cap-token requests — going past
-~8 trades latency for marginal throughput on memory-bandwidth-bound decode.
-Hosted profiles (where the provider handles batching) can safely raise this
-via ``backend_args.concurrent_requests``."""
+"""Fallback per-page client-side concurrency. The GPU-aware autoscaler in
+:mod:`ocrscout.runners._preflight` normally fills this in via
+``backend_args.concurrent_requests`` (or via the runner's state file for
+submit-time workers); this default only applies to hosted profiles, manual
+single-shot calls without a Runner, or when both lookups return nothing."""
+
+
+def _resolve_concurrent_requests(profile: ModelProfile) -> int:
+    """Precedence: explicit profile value > state-file override > default.
+
+    State-file override is how the launch → submit → worker handoff
+    inherits the autoscaler's decision: ``LocalRunner._launch_persistent``
+    writes ``state.backend_overrides[profile.name]["concurrent_requests"]``
+    and the worker process (separate Python interpreter, re-resolves
+    profiles from YAML) reads it back here.
+    """
+    explicit = (profile.backend_args or {}).get("concurrent_requests")
+    if explicit is not None:
+        return int(explicit)
+    override = _state_override(profile.name, "concurrent_requests")
+    if override is not None:
+        return override
+    return _DEFAULT_CONCURRENT_REQUESTS
+
+
+_BACKEND_OVERRIDES_ENV = "OCRSCOUT_BACKEND_OVERRIDES"
+"""Env-var carrier for the autoscaler's per-profile concurrency
+decisions during in-process (ephemeral) runs. Format is a JSON-encoded
+``{profile_name: {key: int}}`` mapping. ``run_pipeline`` sets this
+after each ``runner.launch(...)`` so backends and ExportRecord-stamping
+see the same numbers without round-tripping through state.yaml.
+
+Persistent / launch + submit + worker handoff uses state.yaml
+(``RunnerStateFile.backend_overrides``) instead — workers are separate
+Python processes that don't inherit the launching shell's env."""
+
+
+def _state_override(profile_name: str, key: str) -> int | None:
+    """Read the autoscaler's per-profile concurrency decision.
+
+    Sources, in precedence order:
+
+    * ``OCRSCOUT_BACKEND_OVERRIDES`` env var — in-process channel set by
+      ``run_pipeline`` after each ephemeral launch.
+    * ``state.yaml`` ``backend_overrides`` — cross-process channel set
+      by ``LocalRunner._launch_persistent`` for submit-time workers.
+
+    Returns ``None`` when neither is available; the caller falls back to
+    the module default. Swallows JSON / state errors so a malformed
+    side-channel never blocks the backend from running.
+    """
+    raw = os.environ.get(_BACKEND_OVERRIDES_ENV)
+    if raw:
+        try:
+            import json as _json
+
+            data = _json.loads(raw)
+            v = data.get(profile_name, {}).get(key)
+            if v is not None:
+                return int(v)
+        except (ValueError, TypeError):
+            pass
+
+    from ocrscout import state as state_mod
+
+    try:
+        state = state_mod.read_state()
+    except Exception:  # noqa: BLE001
+        return None
+    if state is None:
+        return None
+    rec = state.backend_overrides.get(profile_name)
+    if not rec:
+        return None
+    val = rec.get(key)
+    return int(val) if val is not None else None
 
 # Subset of vLLM/OpenAI sampling fields the proxy forwards. Anything outside
 # this allowlist is passed through ``extra_body`` so vLLM-specific extensions
@@ -111,12 +181,7 @@ class LiteLLMBackend(ModelBackend):
             profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT)
         )
         concurrent_requests = max(
-            1,
-            int(
-                profile.backend_args.get(
-                    "concurrent_requests", _DEFAULT_CONCURRENT_REQUESTS
-                )
-            ),
+            1, _resolve_concurrent_requests(profile),
         )
         sampling = _split_sampling(profile.sampling_args or {})
         prefix = f"[{profile.name}]"

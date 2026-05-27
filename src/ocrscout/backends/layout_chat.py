@@ -33,7 +33,11 @@ from collections.abc import Iterator, Sequence
 from typing import Any, ClassVar
 
 from ocrscout import cost as cost_mod
-from ocrscout.backends.litellm import _build_messages, _split_sampling
+from ocrscout.backends.litellm import (
+    _build_messages,
+    _split_sampling,
+    _state_override,
+)
 from ocrscout.errors import BackendError
 from ocrscout.interfaces.backend import ModelBackend
 from ocrscout.profile import ModelProfile
@@ -43,11 +47,30 @@ from ocrscout.types import BackendInvocation, LayoutRegion, PageImage, RawOutput
 log = logging.getLogger(__name__)
 
 _DEFAULT_REGION_CONCURRENCY = 8
+"""Fallback per-page region concurrency. Normally filled in by the
+autoscaler via ``backend_args.region_concurrency`` (or the runner's
+state file for submit-time workers); only applies when both lookups
+return nothing."""
 _DEFAULT_REQUEST_TIMEOUT = 300.0
 _MODELS_PROBE_TIMEOUT = 15.0
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
 # small same-row jitter without conflating rows on tightly-packed pages.
 _READING_ORDER_ROW_PX = 50
+
+
+def _resolve_region_concurrency(profile: ModelProfile) -> int:
+    """Precedence: explicit profile value > state-file override > default.
+
+    Same semantics as the litellm backend's ``_resolve_concurrent_requests``;
+    state-file is the launch → submit → worker handoff path.
+    """
+    explicit = (profile.backend_args or {}).get("region_concurrency")
+    if explicit is not None:
+        return int(explicit)
+    override = _state_override(profile.name, "region_concurrency")
+    if override is not None:
+        return override
+    return _DEFAULT_REGION_CONCURRENCY
 
 
 class LayoutChatBackend(ModelBackend):
@@ -122,14 +145,7 @@ class LayoutChatBackend(ModelBackend):
         timeout = float(
             profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT)
         )
-        region_concurrency = max(
-            1,
-            int(
-                profile.backend_args.get(
-                    "region_concurrency", _DEFAULT_REGION_CONCURRENCY
-                )
-            ),
-        )
+        region_concurrency = max(1, _resolve_region_concurrency(profile))
         sampling = _split_sampling(profile.sampling_args or {})
         prefix = f"[{profile.name}]"
 

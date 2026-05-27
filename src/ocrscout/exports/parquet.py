@@ -403,6 +403,9 @@ def _record_to_row(record: ExportRecord) -> dict[str, Any]:
         "output_tokens": record.output_tokens,
         "litellm_cost": record.litellm_cost,
         "gpu_time_cost": record.gpu_time_cost,
+        "kv_cache_memory_bytes": record.kv_cache_memory_bytes,
+        "concurrent_requests": record.concurrent_requests,
+        "region_concurrency": record.region_concurrency,
     }
 
 

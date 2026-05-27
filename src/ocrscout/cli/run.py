@@ -150,6 +150,14 @@ def run(
              "GPU. Ignored under `--keep-up` (which forces single-launch "
              "parallel spawn, today's behavior).",
     ),
+    batch_concurrency: int | None = typer.Option(
+        None, "--batch-concurrency", min=1,
+        help="Override the GPU-aware autoscaler's per-profile concurrency. "
+             "Sets `concurrent_requests` (litellm) and `region_concurrency` "
+             "(layout_chat) to N, then sizes vLLM's `kv_cache_memory_bytes` "
+             "to fit. Refuses if it doesn't fit. Default: auto-derived from "
+             "detected GPU capacity.",
+    ),
     resume: bool = typer.Option(
         False, "--resume",
         help="Skip pages already present in <output-dir>/data/train-*.parquet "
@@ -264,7 +272,199 @@ def run(
         gpu_budget=gpu_budget,
         keep_up=keep_up,
         resume=resume,
+        batch_concurrency=batch_concurrency,
     )
+
+
+def _export_backend_overrides(handle_extra: dict) -> dict[str, dict[str, int]]:
+    """Slim the autoscale context on a RunnerHandle down to the per-profile
+    concurrency + KV dict the env-var side channel transports.
+
+    The KV slot lets ``_autoscale_values_for_profile`` stamp the right
+    value onto ExportRecord even though the profile YAML no longer
+    carries it; ``_state_override`` in the backend only consults
+    ``concurrent_requests`` / ``region_concurrency``.
+    """
+    autoscale = (handle_extra or {}).get("autoscale") or {}
+    profiles = autoscale.get("profiles") or {}
+    out: dict[str, dict[str, int]] = {}
+    for name, rec in profiles.items():
+        cr = int(rec.get("concurrent_requests") or 0)
+        rc = int(rec.get("region_concurrency") or 0)
+        kv = int(rec.get("kv_cache_memory_bytes") or 0)
+        if cr > 0 or rc > 0 or kv > 0:
+            entry: dict[str, int] = {}
+            if cr > 0:
+                entry["concurrent_requests"] = cr
+            if rc > 0:
+                entry["region_concurrency"] = rc
+            if kv > 0:
+                entry["kv_cache_memory_bytes"] = kv
+            out[name] = entry
+    return out
+
+
+def _write_runtime_yaml(
+    cfg: PipelineConfig,
+    runner,
+    handle,
+    gpu_budget: float,
+    batch_concurrency: int | None,
+    parallel_models: int,
+) -> None:
+    """Persist a per-run ``<output_dir>/runtime.yaml`` capturing the
+    autoscaler's decisions for this launch.
+
+    The file is a sibling of ``pipeline.yaml`` already written at
+    ``ocrscout run`` start: where pipeline.yaml records *what the user
+    asked for*, runtime.yaml records *what the runner decided*. Read by
+    ``ocrscout inspect`` to render a Run-context header.
+
+    No-op when ``cfg.output_dir`` isn't set (defensive — every CLI
+    entrypoint provides one today).
+    """
+    if cfg.output_dir is None:
+        return
+    out_dir = Path(cfg.output_dir)
+    if not out_dir.is_dir():
+        # `ocrscout run` mkdirs this; if a caller hasn't yet, skip
+        # quietly rather than try to second-guess them.
+        return
+
+    from ocrscout.runtime import (
+        AutoscaleProfileRecord,
+        AutoscaleRuntime,
+        GpuRuntime,
+        RunnerRuntime,
+        RuntimeContext,
+        now_iso,
+        ocrscout_version,
+        write_runtime_context,
+    )
+
+    autoscale_extra = (handle.extra or {}).get("autoscale") or {}
+    gpu_info = autoscale_extra.get("gpu") or {}
+    gpu_block: GpuRuntime | None = None
+    if gpu_info.get("name"):
+        gpu_block = GpuRuntime(
+            name=str(gpu_info["name"]),
+            total_bytes=int(gpu_info.get("total_bytes") or 0),
+            free_bytes_at_launch=int(gpu_info.get("free_bytes_at_launch") or 0),
+        )
+
+    autoscale_block: AutoscaleRuntime | None = None
+    profile_recs: dict[str, AutoscaleProfileRecord] = {}
+    for name, rec in (autoscale_extra.get("profiles") or {}).items():
+        profile_recs[name] = AutoscaleProfileRecord(
+            explicit_kv_in_yaml=bool(rec.get("explicit_kv_in_yaml", False)),
+            overhead_bytes=int(rec.get("overhead_bytes") or 0),
+            kv_cache_memory_bytes=int(rec.get("kv_cache_memory_bytes") or 0),
+            concurrent_requests=int(rec.get("concurrent_requests") or 0),
+            region_concurrency=int(rec.get("region_concurrency") or 0),
+            max_model_len=int(rec.get("max_model_len") or 0),
+        )
+    if profile_recs:
+        autoscale_block = AutoscaleRuntime(
+            per_token_bytes=int(autoscale_extra.get("per_token_bytes") or 0),
+            max_concurrency_ceiling=int(
+                autoscale_extra.get("max_concurrency_ceiling") or 0
+            ),
+            profiles=profile_recs,
+        )
+
+    ctx = RuntimeContext(
+        ocrscout_version=ocrscout_version(),
+        started_at=now_iso(),
+        gpu=gpu_block,
+        runner=RunnerRuntime(
+            name=getattr(runner, "name", "unknown"),
+            gpu_budget=gpu_budget,
+            batch_concurrency_override=batch_concurrency,
+            parallel_models=parallel_models,
+        ),
+        autoscale=autoscale_block,
+    )
+    try:
+        write_runtime_context(out_dir, ctx)
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not write runtime.yaml to %s: %s", out_dir, e)
+
+
+def _autoscale_values_for_profile(
+    profile,
+) -> tuple[int | None, int | None, int | None]:
+    """Recover the autoscaler's decisions for ``profile`` so they can be
+    stamped onto each row's ExportRecord.
+
+    Returns ``(concurrent_requests, region_concurrency, kv_cache_memory_bytes)``.
+    Hosted / cpu profiles return ``(None, None, None)`` for the KV slot;
+    backend defaults still apply for concurrency.
+
+    Sources: the env-var side channel (set by ``_publish_backend_overrides``
+    after each launch) for ephemeral in-process runs, then state.yaml for
+    launch+submit+worker. Falls back to whatever the profile YAML carries
+    (the explicit-KV escape hatch).
+    """
+    from ocrscout.backends.litellm import _state_override
+
+    kv: int | None = None
+    yaml_kv = (profile.vllm_engine_args or {}).get("kv_cache_memory_bytes")
+    if yaml_kv is not None:
+        try:
+            from ocrscout.runners._preflight import parse_bytes
+
+            kv = parse_bytes(yaml_kv)
+        except Exception:  # noqa: BLE001
+            kv = None
+    # State.yaml carries the autoscaler-computed KV; check both via the
+    # env var (in-process) and the state file.
+    if kv is None:
+        env_raw = os.environ.get("OCRSCOUT_BACKEND_OVERRIDES")
+        if env_raw:
+            try:
+                rec = json.loads(env_raw).get(profile.name, {})
+                if rec.get("kv_cache_memory_bytes") is not None:
+                    kv = int(rec["kv_cache_memory_bytes"])
+            except (ValueError, TypeError):
+                pass
+    if kv is None:
+        try:
+            st = state_mod.read_state()
+        except Exception:  # noqa: BLE001
+            st = None
+        if st is not None:
+            args_autoscale = (st.args or {}).get("autoscale") or {}
+            rec = (args_autoscale.get("profiles") or {}).get(profile.name) or {}
+            v = rec.get("kv_cache_memory_bytes")
+            if v is not None:
+                kv = int(v)
+
+    cr = _state_override(profile.name, "concurrent_requests")
+    if cr is None:
+        explicit_cr = (profile.backend_args or {}).get("concurrent_requests")
+        cr = int(explicit_cr) if explicit_cr is not None else None
+    rc = _state_override(profile.name, "region_concurrency")
+    if rc is None:
+        explicit_rc = (profile.backend_args or {}).get("region_concurrency")
+        rc = int(explicit_rc) if explicit_rc is not None else None
+
+    return cr, rc, kv
+
+
+def _publish_backend_overrides(handle_extra: dict) -> None:
+    """Set the ``OCRSCOUT_BACKEND_OVERRIDES`` env var so backends and the
+    ExportRecord stamping see the autoscaler's per-profile concurrency.
+
+    Idempotent: empty overrides clears the var so a hosted-only launch
+    doesn't leak prior values into the next chunk.
+    """
+    from ocrscout.backends.litellm import _BACKEND_OVERRIDES_ENV
+
+    overrides = _export_backend_overrides(handle_extra)
+    if overrides:
+        os.environ[_BACKEND_OVERRIDES_ENV] = json.dumps(overrides)
+    else:
+        os.environ.pop(_BACKEND_OVERRIDES_ENV, None)
 
 
 def run_pipeline(
@@ -276,6 +476,7 @@ def run_pipeline(
     gpu_budget: float = 0.85,
     keep_up: bool = False,
     resume: bool = False,
+    batch_concurrency: int | None = None,
 ) -> None:
     """Launch the required runner (if any), run the pipeline, tear down.
 
@@ -338,8 +539,12 @@ def run_pipeline(
                 proxy_port=proxy_port,
                 gpu_budget=gpu_budget,
                 persistent=keep_up,
+                batch_concurrency=batch_concurrency,
             )
             os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+            _publish_backend_overrides(handle.extra)
+            _write_runtime_yaml(cfg, runner, handle, gpu_budget,
+                                batch_concurrency, parallel_models)
             if reused_existing:
                 log.info("Reusing already-running local stack")
         except RunnerError as e:
@@ -349,6 +554,7 @@ def run_pipeline(
         try:
             _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
         finally:
+            _publish_backend_overrides({})
             if not keep_up and not reused_existing:
                 try:
                     runner.down()
@@ -383,8 +589,15 @@ def run_pipeline(
                 proxy_port=proxy_port,
                 gpu_budget=gpu_budget,
                 persistent=False,
+                batch_concurrency=batch_concurrency,
             )
             os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+            _publish_backend_overrides(handle.extra)
+            # Each chunk gets its own runtime.yaml snapshot; last chunk
+            # wins on disk. Adequate for the typical "all chunks share
+            # the same GPU and the same flags" case.
+            _write_runtime_yaml(cfg, runner, handle, gpu_budget,
+                                batch_concurrency, parallel_models)
         except RunnerError as e:
             log.error(
                 "Runner launch failed for chunk %s: %s", chunk_models, e,
@@ -399,6 +612,7 @@ def run_pipeline(
                 resume=resume,
             )
         finally:
+            _publish_backend_overrides({})
             try:
                 runner.down()
             except Exception as e:  # noqa: BLE001
@@ -416,6 +630,7 @@ def run_pipeline(
                 persistent=False,
             )
             os.environ["OCRSCOUT_VLLM_URL"] = handle.proxy_url
+            _publish_backend_overrides(handle.extra)
         except RunnerError as e:
             log.error("Runner launch failed for hosted chunk: %s", e)
             raise typer.Exit(code=1) from e
@@ -427,6 +642,7 @@ def run_pipeline(
                 resume=resume,
             )
         finally:
+            _publish_backend_overrides({})
             try:
                 runner.down()
             except Exception as e:  # noqa: BLE001
@@ -633,6 +849,14 @@ def _run_one_model(
         log.error("[%s] setup failed: %s", model_name, e)
         return _ModelRunResult(ok=0, failed=len(pages), run_seconds=0.0)
 
+    # Resolve the autoscaler-decided concurrency / KV so each ExportRecord
+    # carries the values that actually shaped the run (queryable per-row
+    # without joining external metadata). Same precedence chain the
+    # backend uses, so the stamped numbers match what really ran.
+    record_concurrency, record_region_concurrency, record_kv = (
+        _autoscale_values_for_profile(profile)
+    )
+
     log.info(
         "[%s] starting (backend=%s, runtime=%s, normalizer=%s)",
         model_name, profile.backend, profile.runtime, normalizer_name,
@@ -763,6 +987,9 @@ def _run_one_model(
             output_tokens=output_tokens,
             litellm_cost=litellm_cost,
             gpu_time_cost=gpu_time_cost,
+            kv_cache_memory_bytes=record_kv,
+            concurrent_requests=record_concurrency,
+            region_concurrency=record_region_concurrency,
         )
         exporter.write(record)
         ok += 1

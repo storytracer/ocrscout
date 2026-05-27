@@ -89,18 +89,12 @@ vllm_engine_args:
   max_model_len: 8192
   limit_mm_per_prompt:
     image: 1
-  kv_cache_memory_bytes: 2G
   max_num_batched_tokens: 8192
 
 sampling_args:
   temperature: 0.0
   repetition_penalty: 1.1
   max_tokens: 6000
-
-# Region-level concurrency: how many regions of one page are dispatched in
-# parallel to the chat endpoint. Pages stay sequential. Default 8.
-backend_args:
-  region_concurrency: 8
 
 metadata:
   notes: |

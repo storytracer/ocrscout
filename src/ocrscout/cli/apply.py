@@ -52,6 +52,12 @@ def apply(
              "picks up where the first left off without recomputing.",
     ),
     parallel_models: int = typer.Option(1, "--parallel-models", "-P"),
+    batch_concurrency: int | None = typer.Option(
+        None, "--batch-concurrency", min=1,
+        help="Override the GPU-aware autoscaler's per-profile concurrency "
+             "for this worker. Sets concurrent_requests / region_concurrency "
+             "and sizes vLLM's KV cache to fit.",
+    ),
     verbose: int = typer.Option(0, "-v", "--verbose", count=True),
     quiet: bool = typer.Option(False, "-q", "--quiet"),
 ) -> None:
@@ -92,6 +98,11 @@ def apply(
 
     try:
         from ocrscout.cli.run import run_pipeline
-        run_pipeline(cfg, parallel_models=parallel_models, resume=resume)
+        run_pipeline(
+            cfg,
+            parallel_models=parallel_models,
+            resume=resume,
+            batch_concurrency=batch_concurrency,
+        )
     except ProfileNotFound as e:
         raise typer.BadParameter(str(e)) from e

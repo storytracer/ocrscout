@@ -58,8 +58,15 @@ def launch(
     gpu_budget: float = typer.Option(
         0.85, "--gpu-budget",
         help="Maximum total GPU memory the stack may collectively claim "
-             "(local only). Per-model KV is set by the profile's "
-             "kv_cache_memory_bytes; this bounds the sum + overhead.",
+             "(local only). The autoscaler sizes per-model KV from this "
+             "budget; the same value bounds explicit profile overrides too.",
+    ),
+    batch_concurrency: int | None = typer.Option(
+        None, "--batch-concurrency", min=1,
+        help="Override the GPU-aware autoscaler's per-profile concurrency. "
+             "Sets `concurrent_requests` / `region_concurrency` to N and "
+             "sizes vLLM's `kv_cache_memory_bytes` to fit. Refuses if it "
+             "doesn't fit. Default: auto-derived from detected GPU capacity.",
     ),
     ready_timeout: float = typer.Option(
         600.0, "--ready-timeout",
@@ -91,6 +98,7 @@ def launch(
             proxy_port=proxy_port,
             gpu_budget=gpu_budget,
             ready_timeout=ready_timeout,
+            batch_concurrency=batch_concurrency,
         )
     except ProfileNotFound as e:
         raise typer.BadParameter(str(e)) from e

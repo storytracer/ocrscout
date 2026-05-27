@@ -34,7 +34,6 @@ vllm_engine_args:
   max_model_len: 8192
   limit_mm_per_prompt:
     image: 1
-  kv_cache_memory_bytes: 2G
   # vLLM's per-step encoder cache is sized from max_num_batched_tokens. The
   # auto-profiled default (~6084 on a single GB10) overflows on dense
   # ~7 MP scans (e.g. BHL), which produce ~6100 vision tokens and trip

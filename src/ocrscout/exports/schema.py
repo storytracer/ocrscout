@@ -81,6 +81,18 @@ RESULTS_FEATURES: Features = Features(
         "output_tokens": Value("int64"),
         "litellm_cost": Value("float64"),
         "gpu_time_cost": Value("float64"),
+        # Autoscaler context. Stamped per row from the active profile at
+        # the time the page ran, so cross-run / cross-hardware DuckDB
+        # queries can correlate throughput / $-per-page with the
+        # concurrency the runner chose. ``kv_cache_memory_bytes`` and
+        # ``concurrent_requests`` are populated for every ``runtime: vllm``
+        # row; ``region_concurrency`` is populated only when the row
+        # came from ``backend: layout_chat`` (null for full-page
+        # ``backend: litellm`` rows). Hosted-API rows leave all three
+        # null since the autoscaler doesn't apply.
+        "kv_cache_memory_bytes": Value("int64"),
+        "concurrent_requests": Value("int32"),
+        "region_concurrency": Value("int32"),
     }
 )
 

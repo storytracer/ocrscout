@@ -62,13 +62,6 @@ vllm_engine_args:
   max_model_len: 24000
   limit_mm_per_prompt:
     image: 1
-  # Absolute KV cache budget (vLLM accepts SI suffixes: lowercase k/m/g =
-  # decimal, uppercase K/M/G = binary). 16 GiB → ~25× concurrency at
-  # max_model_len=24000 for this model class. Sized to comfortably exceed
-  # the default 16-way client concurrency. Excludes model weights + working
-  # memory + cudagraphs (~6 GiB more); managed mode adds an 8 GiB per-model
-  # overhead estimate when preflighting against --gpu-budget.
-  kv_cache_memory_bytes: 2G
 
 # Upstream uses temperature=0.0 (deterministic OCR) and no top_p
 # (uv-scripts/ocr/dots-ocr.py:305). max_tokens kept strictly below

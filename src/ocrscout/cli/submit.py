@@ -81,11 +81,26 @@ def submit(
         None, "--runner",
         help="Runner to submit through. Defaults to whatever's in state.yaml.",
     ),
+    batch_concurrency: int | None = typer.Option(
+        None, "--batch-concurrency", min=1,
+        help="Reserved for symmetry with `ocrscout run`. Submit reuses the "
+             "concurrency the runner decided at launch time (see "
+             "`ocrscout launch --batch-concurrency`); changing it from here "
+             "is rejected so the live KV-cache and concurrency stay coherent.",
+    ),
     verbose: int = typer.Option(0, "-v", "--verbose", count=True),
     quiet: bool = typer.Option(False, "-q", "--quiet"),
 ) -> None:
     """Submit a fire-and-forget pipeline run to the active runner."""
     setup_logging(verbosity=verbose, quiet=quiet)
+
+    if batch_concurrency is not None:
+        raise typer.BadParameter(
+            "--batch-concurrency cannot be changed at submit time; the "
+            "live vLLM stack was sized at launch. Tear down with "
+            "`ocrscout down`, then relaunch with `ocrscout launch "
+            "--batch-concurrency N`."
+        )
 
     state = state_mod.read_state()
     runner_name = runner or (state.runner if state else None) or "local"

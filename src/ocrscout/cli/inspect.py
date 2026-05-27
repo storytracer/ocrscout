@@ -84,6 +84,8 @@ def inspect(
         rprint(f"[yellow]{output_dir} contains no rows.[/yellow]")
         return
 
+    _show_runtime_header(output_dir)
+
     if compare is not None:
         if page is None:
             rprint("[red]--compare requires --page <file_id>[/red]")
@@ -169,6 +171,9 @@ def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
             "gpu_type": raw.get("gpu_type"),
             "provider": raw.get("provider"),
             "cost_per_hour": raw.get("cost_per_hour"),
+            "kv_cache_memory_bytes": raw.get("kv_cache_memory_bytes"),
+            "concurrent_requests": raw.get("concurrent_requests"),
+            "region_concurrency": raw.get("region_concurrency"),
         })
     return out
 
@@ -183,6 +188,58 @@ _FLAT_COLUMN_HEADERS: dict[str, str] = {
     "document_picture_count_delta": "Δ pictures",
     "layout_iou_mean": "iou mean",
 }
+
+
+def _show_runtime_header(output_dir: Path) -> None:
+    """Render the autoscaler context from ``<output_dir>/runtime.yaml`` if
+    present. No-op for older runs that predate the file."""
+    from ocrscout.runtime import read_runtime_context
+
+    try:
+        ctx = read_runtime_context(output_dir)
+    except Exception as e:  # noqa: BLE001
+        rprint(f"[yellow](runtime.yaml present but unreadable: {e})[/yellow]")
+        return
+    if ctx is None:
+        return
+
+    gpu_label = (
+        f"{ctx.gpu.name} (free "
+        f"{_fmt_gib(ctx.gpu.free_bytes_at_launch)} / total "
+        f"{_fmt_gib(ctx.gpu.total_bytes)})"
+        if ctx.gpu
+        else "no GPU recorded"
+    )
+    table = Table(title=f"Run context — {gpu_label}", show_header=False)
+    table.add_column("k", style="dim")
+    table.add_column("v")
+    table.add_row(
+        "runner",
+        f"{ctx.runner.name}  "
+        f"gpu_budget={ctx.runner.gpu_budget:.2f}  "
+        f"parallel-models={ctx.runner.parallel_models}"
+        + (
+            f"  batch-concurrency={ctx.runner.batch_concurrency_override}"
+            if ctx.runner.batch_concurrency_override is not None
+            else ""
+        ),
+    )
+    if ctx.autoscale:
+        for name, rec in ctx.autoscale.profiles.items():
+            tag = " [dim](explicit)[/dim]" if rec.explicit_kv_in_yaml else ""
+            table.add_row(
+                name + tag,
+                f"concurrency={rec.concurrent_requests}  "
+                f"kv={_fmt_gib(rec.kv_cache_memory_bytes)}  "
+                f"max_model_len={rec.max_model_len}",
+            )
+    Console().print(table)
+
+
+def _fmt_gib(n: int | None) -> str:
+    if n is None or n <= 0:
+        return "—"
+    return f"{n / (1024 ** 3):.1f} GiB"
 
 
 def _show_aggregate(rows: list[dict[str, Any]]) -> None:
@@ -248,6 +305,16 @@ def _show_aggregate(rows: list[dict[str, Any]]) -> None:
             if total is not None and cost_per_hour is not None
             else None
         )
+        concurrency = next(
+            (r.get("concurrent_requests") for r in model_rows
+             if r.get("concurrent_requests")),
+            None,
+        )
+        kv_bytes = next(
+            (r.get("kv_cache_memory_bytes") for r in model_rows
+             if r.get("kv_cache_memory_bytes")),
+            None,
+        )
         aggregates.append({
             "model": model,
             "succeeded": succeeded,
@@ -258,10 +325,15 @@ def _show_aggregate(rows: list[dict[str, Any]]) -> None:
             "provider": provider,
             "cost_per_hour": cost_per_hour,
             "est_cost": est_cost,
+            "concurrency": concurrency,
+            "kv_bytes": kv_bytes,
         })
 
     show_gpu = any(a["gpu_type"] or a["provider"] for a in aggregates)
     show_cost = any(a["cost_per_hour"] is not None for a in aggregates)
+    show_concurrency = any(
+        a["concurrency"] or a["kv_bytes"] for a in aggregates
+    )
 
     table = Table(title="run aggregate — batch throughput per model")
     table.add_column("model", style="bold")
@@ -271,6 +343,9 @@ def _show_aggregate(rows: list[dict[str, Any]]) -> None:
     table.add_column("avg/page", justify="right")
     if show_gpu:
         table.add_column("gpu", style="dim")
+    if show_concurrency:
+        table.add_column("concur", justify="right", style="dim")
+        table.add_column("kv", justify="right", style="dim")
     if show_cost:
         table.add_column("$/hr", justify="right", style="dim")
         table.add_column("est $", justify="right", style="dim")
@@ -289,6 +364,11 @@ def _show_aggregate(rows: list[dict[str, Any]]) -> None:
                 if (a["gpu_type"] or a["provider"]) else "—"
             )
             cells.append(gpu_label)
+        if show_concurrency:
+            cells.append(
+                str(a["concurrency"]) if a["concurrency"] else "—"
+            )
+            cells.append(_fmt_gib(a["kv_bytes"]))
         if show_cost:
             cells.append(
                 f"{a['cost_per_hour']:.2f}"
