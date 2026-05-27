@@ -346,10 +346,14 @@ def _write_runtime_yaml(
     gpu_info = autoscale_extra.get("gpu") or {}
     gpu_block: GpuRuntime | None = None
     if gpu_info.get("name"):
+        bw_raw = gpu_info.get("memory_bandwidth_gb_s")
+        spec_name = gpu_info.get("dbgpu_spec_name")
         gpu_block = GpuRuntime(
             name=str(gpu_info["name"]),
             total_bytes=int(gpu_info.get("total_bytes") or 0),
             free_bytes_at_launch=int(gpu_info.get("free_bytes_at_launch") or 0),
+            memory_bandwidth_gb_s=float(bw_raw) if bw_raw is not None else None,
+            dbgpu_spec_name=str(spec_name) if spec_name else None,
         )
 
     autoscale_block: AutoscaleRuntime | None = None

@@ -21,11 +21,15 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from ocrscout.errors import RunnerError
 from ocrscout.profile import ModelProfile
+
+if TYPE_CHECKING:
+    from dbgpu import GPUSpecification
 
 log = logging.getLogger(__name__)
 
@@ -36,22 +40,26 @@ _ENGINE_CAP_OVERHEAD_MULTIPLIER = 1.25
 # Autoscaler tuning. Deliberately module constants — single edits retune the
 # whole fleet. The per-token coefficient is a rule of thumb for 3B–7B-class
 # VLMs (derived from ``2 × num_layers × num_kv_heads × head_dim × dtype_bytes``).
-#
-# Two concurrency ceilings because the two backends have very different
-# concurrency semantics:
-#
-# * ``backend: litellm`` (whole-page batches): 64 in-flight pages stagger
-#   naturally — different prompts, different decode lengths, vLLM's continuous
-#   batching schedules them well. Throughput scales up to ~64 before encoder
-#   cache thrashing / prefill contention dominate.
-#
-# * ``backend: layout_chat`` (per-page region fan-out): N region crops POSTed
-#   *simultaneously* against the same image. All start together, all want the
-#   same vision-encoder work, all compete in one giant prefill batch followed
-#   by a long decode tail. Empirical sweet spot is ~16 — benchmarks across
-#   H100 / A10 / L4 / DGX Spark showed glm-ocr-layout regressing ~30% at 64
-#   vs 16, regardless of available VRAM. The burst pattern caps the benefit.
 AUTOSCALE_PER_TOKEN_BYTES = 30_000
+
+# Bandwidth-derived concurrency cap. When the active GPU can be identified
+# via dbgpu, ``concurrency_cap = max(1, floor(bandwidth_gb_s / BW_GB_S_PER_CONCURRENT_REQUEST))``
+# is the autoscaler's per-backend ceiling — replacing the empirical
+# per-backend constants below. The constant is a first-order proxy for
+# "decode-step bandwidth headroom one concurrent in-flight request needs";
+# the relationship isn't perfectly linear (cache effects, attention pattern,
+# unified vs discrete memory) but bandwidth/N is the right shape. Calibrated
+# so the four benchmark GPUs (H100/A10/L4/GB10) at concurrency=16 do not
+# regress: H100→136, A10→40, L4→20, GB10→18. Tunable here; recalibrate when
+# sweep data is in hand.
+BW_GB_S_PER_CONCURRENT_REQUEST = 15
+
+# Safe per-backend fallback ceilings used only when the GPU is unknown to
+# dbgpu. The historical empirical values: 64 for ``backend: litellm``
+# (whole-page batches stagger naturally, vLLM continuous batching scales),
+# 16 for ``backend: layout_chat`` (the original per-page burst pattern
+# choked at higher concurrency; cross-page batching has since removed the
+# burst, but we keep 16 as the conservative unknown-GPU default).
 AUTOSCALE_MAX_CONCURRENCY = 64
 AUTOSCALE_MAX_REGION_CONCURRENCY = 16
 
@@ -106,19 +114,308 @@ def parse_model_size(s: str) -> int | None:
     return int(num * _PARAM_COUNT_SUFFIXES[suf])
 
 
-def _concurrency_ceiling_for(profile: ModelProfile) -> int:
-    """Per-backend ceiling on the autoscaler's auto-derived concurrency.
+@dataclass(frozen=True)
+class DeviceProbe:
+    """Nvitop-derived properties used to disambiguate dbgpu candidates.
 
-    ``backend: layout_chat`` profiles burst-fire same-image region requests
-    at the engine; empirical benchmarks (H100 / A10 / L4 / DGX Spark) show
-    the throughput peak around 16 and a ~30% regression at 64. All other
-    backends (whole-page ``litellm`` today) scale up to the wider 64
-    ceiling because requests stagger naturally.
+    All fields are optional because nvitop's underlying NVML coverage
+    varies by platform/driver — ``pci_bus_id`` / ``multi_processor_count``
+    error on ARM CUDA (GB10), ``power_max_limit`` errors on some MIG
+    instances, etc. The scorer treats a missing field as a non-vote
+    (neither penalty nor reward) so partial coverage still helps.
+
+    ``pcie_link_*`` are used as veto-only signals — a dbgpu candidate
+    whose ``bus_interface`` reports a strictly-lower PCIe generation or
+    width than the live card is *impossible* and gets eliminated before
+    scoring. Equal or higher values don't veto (slot-downlinks happen;
+    NVML can mis-report on some integrated SoCs).
+    """
+
+    memory_size_gb: float | None = None
+    cuda_compute_capability: tuple[int, int] | None = None
+    boost_clock_mhz: float | None = None
+    pcie_link_generation: int | None = None
+    pcie_link_width: int | None = None
+
+
+def _probe_device_properties(dev: object) -> DeviceProbe:
+    """Collect nvitop properties relevant for dbgpu disambiguation.
+
+    Each individual probe is wrapped in try/except because NVML coverage
+    isn't uniform; one missing field shouldn't disable the others.
+    """
+    def _safe(get: Callable[[], object]) -> object | None:
+        try:
+            v = get()
+        except Exception:  # noqa: BLE001
+            return None
+        if v in (None, "N/A", "Unknown"):
+            return None
+        return v
+
+    mem_total = _safe(lambda: dev.memory_total())  # type: ignore[attr-defined]
+    cc = _safe(lambda: dev.cuda_compute_capability)  # type: ignore[attr-defined]
+    max_sm_clock = _safe(lambda: dev.max_sm_clock)  # type: ignore[attr-defined]
+
+    # pynvml exposes PCIe link gen/width directly; nvitop doesn't wrap them.
+    # NVML is already initialized by nvitop's prior device enumeration.
+    pcie_gen: int | None = None
+    pcie_width: int | None = None
+    try:
+        import pynvml
+
+        physical_index = int(dev.physical_index)  # type: ignore[attr-defined]
+        h = pynvml.nvmlDeviceGetHandleByIndex(physical_index)
+        pcie_gen = int(pynvml.nvmlDeviceGetMaxPcieLinkGeneration(h))
+        pcie_width = int(pynvml.nvmlDeviceGetMaxPcieLinkWidth(h))
+    except Exception:  # noqa: BLE001
+        pass
+
+    return DeviceProbe(
+        memory_size_gb=(
+            float(mem_total) / (1024**3)
+            if isinstance(mem_total, (int, float)) else None
+        ),
+        cuda_compute_capability=(
+            (int(cc[0]), int(cc[1]))
+            if isinstance(cc, tuple) and len(cc) == 2 else None
+        ),
+        boost_clock_mhz=(
+            float(max_sm_clock)
+            if isinstance(max_sm_clock, (int, float)) else None
+        ),
+        pcie_link_generation=pcie_gen,
+        pcie_link_width=pcie_width,
+    )
+
+
+_BUS_INTERFACE_RE = re.compile(r"PCIe\s+(\d+)\.\d+\s+x(\d+)", re.IGNORECASE)
+
+
+def _parse_bus_interface(s: str | None) -> tuple[int, int] | None:
+    """Extract ``(generation, width)`` from a dbgpu ``bus_interface`` string
+    like ``"PCIe 4.0 x16"``. Returns ``None`` for unparseable / missing
+    strings."""
+    if not s:
+        return None
+    m = _BUS_INTERFACE_RE.search(s)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2))
+
+
+def _is_vetoed_by_bus(spec: GPUSpecification, probe: DeviceProbe) -> bool:
+    """A candidate is vetoed when its dbgpu-recorded bus capability is
+    *strictly less* than what the live card reports — a card can't run
+    at a generation/width it doesn't support, so any such candidate is
+    the wrong SKU. Equal-or-higher dbgpu values pass (slot-downlinks
+    are real; NVML can also under-report on integrated SoCs)."""
+    if probe.pcie_link_generation is None and probe.pcie_link_width is None:
+        return False
+    bus = _parse_bus_interface(spec.bus_interface)
+    if bus is None:
+        return False
+    spec_gen, spec_width = bus
+    if (
+        probe.pcie_link_generation is not None
+        and spec_gen < probe.pcie_link_generation
+    ):
+        return True
+    return (
+        probe.pcie_link_width is not None
+        and spec_width < probe.pcie_link_width
+    )
+
+
+def _score_candidate(spec: GPUSpecification, probe: DeviceProbe) -> int:
+    """Count probe fields that agree with the candidate spec within tolerance.
+
+    Score = 0 → no agreement (probably wrong SKU). Higher score → more
+    fields agree (better confidence). Used to break ambiguity among
+    word-boundary matches when multiple SKUs share a name token (H100
+    PCIe 80 vs 96 GB, A100 PCIe vs SXM4, H200 NVL vs SXM, etc.).
+    """
+    score = 0
+
+    # 10% memory tolerance — accounts for ECC reservation cutting usable
+    # VRAM vs the manufacturer's nominal value. 3% clock tolerance —
+    # driver-reported max clocks drift slightly across firmware revisions.
+    if (
+        probe.memory_size_gb is not None
+        and spec.memory_size_gb is not None
+        and abs(spec.memory_size_gb - probe.memory_size_gb)
+        / probe.memory_size_gb <= 0.10
+    ):
+        score += 1
+
+    if (
+        probe.cuda_compute_capability is not None
+        and spec.cuda_major_version is not None
+        and spec.cuda_minor_version is not None
+        and spec.cuda_major_version == probe.cuda_compute_capability[0]
+        and spec.cuda_minor_version == probe.cuda_compute_capability[1]
+    ):
+        score += 1
+
+    if (
+        probe.boost_clock_mhz is not None
+        and spec.boost_clock_mhz is not None
+        and abs(spec.boost_clock_mhz - probe.boost_clock_mhz)
+        / probe.boost_clock_mhz <= 0.03
+    ):
+        score += 1
+
+    return score
+
+
+def _lookup_gpu_specs(
+    gpu_name: str, device_probe: DeviceProbe | None = None
+) -> GPUSpecification | None:
+    """Identify a GPU's dbgpu :class:`GPUSpecification` from its name.
+
+    Three-stage matching:
+
+    1. Direct exact lookup (after stripping ``"NVIDIA "`` / ``"Tesla "``
+       prefixes) — cheap, unambiguous when nvidia-smi happens to align
+       with dbgpu's canonical name.
+    2. Word-boundary token match against every catalog entry — the
+       normalized input must appear as a complete whitespace-bounded
+       token in the spec name. Word-boundary matching distinguishes
+       "A10" (matches "A10 PCIe") from "A100" (does not collapse "A10"
+       into it).
+    3. When word-boundary returns multiple candidates and ``device_probe``
+       is populated, score each candidate by how many probe fields agree
+       (VRAM, CUDA compute capability, boost clock). Pick the candidate
+       with the strictly-best score; tie → pick the lowest-bandwidth one
+       as a safe under-estimate.
+
+    dbgpu's bundled ``search()`` uses fuzzy ratio with no quality
+    threshold and will happily return e.g. "Mobility FireGL 9000" for
+    "BogusGPU-9000" — so we don't call it.
+
+    Returns the matched ``GPUSpecification`` directly (so callers can
+    read any field they need), or ``None`` on miss / error / ambiguity
+    that the probe couldn't break. Never raises.
+    """
+    # Strip common vendor prefixes that nvidia-smi includes but dbgpu drops.
+    normalized = gpu_name.strip()
+    for prefix in ("NVIDIA ", "Tesla "):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+
+    try:
+        from dbgpu import GPUDatabase
+    except ImportError as e:
+        log.debug("dbgpu unavailable (%s); skipping bandwidth lookup", e)
+        return None
+
+    try:
+        db = GPUDatabase.default()
+    except Exception as e:  # noqa: BLE001
+        log.warning("dbgpu database load failed (%s); skipping bandwidth lookup", e)
+        return None
+
+    try:
+        spec = db[normalized]
+        if spec.memory_bandwidth_gb_s:
+            return spec
+    except KeyError:
+        # Fall through to word-boundary token match.
+        pass
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "dbgpu direct lookup failed for %r (%s); falling back to safe ceiling",
+            gpu_name, e,
+        )
+        return None
+
+    try:
+        token_re = re.compile(rf"(?:^|\s){re.escape(normalized)}(?:\s|$)")
+    except re.error:
+        return None
+    candidates = [
+        s for s in db.specs
+        if s.memory_bandwidth_gb_s and token_re.search(s.name)
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if device_probe is None:
+        log.warning(
+            "dbgpu: %r matched %d catalog entries (%s); no nvitop probe data "
+            "to disambiguate, falling back to safe concurrency ceiling.",
+            gpu_name, len(candidates), [s.name for s in candidates[:3]],
+        )
+        return None
+
+    # PCIe link gen/width are veto-only: a candidate whose bus_interface
+    # is strictly lower than the live card's reported max is impossible.
+    survivors = [s for s in candidates if not _is_vetoed_by_bus(s, device_probe)]
+    if not survivors:
+        log.warning(
+            "dbgpu: %r matched %d candidates (%s) but all were vetoed by the "
+            "PCIe link probe (gen=%s width=%s); falling back to safe ceiling.",
+            gpu_name, len(candidates), [s.name for s in candidates[:3]],
+            device_probe.pcie_link_generation, device_probe.pcie_link_width,
+        )
+        return None
+    if len(survivors) == 1:
+        return survivors[0]
+    candidates = survivors
+
+    scored = [(_score_candidate(s, device_probe), s) for s in candidates]
+    best_score = max(score for score, _ in scored)
+    if best_score == 0:
+        log.warning(
+            "dbgpu: %r matched %d candidates (%s) but none agree with the "
+            "nvitop probe; ambiguous, falling back to safe ceiling.",
+            gpu_name, len(candidates), [s.name for s in candidates[:3]],
+        )
+        return None
+    top = [s for score, s in scored if score == best_score]
+    if len(top) > 1:
+        chosen = min(top, key=lambda s: s.memory_bandwidth_gb_s)
+        log.info(
+            "dbgpu: %r → %d candidates tied at score %d (%s); picked %r "
+            "(lowest bandwidth) as safe under-estimate.",
+            gpu_name, len(top), best_score, [s.name for s in top], chosen.name,
+        )
+        return chosen
+    return top[0]
+
+
+def _bandwidth_concurrency_cap(spec: GPUSpecification) -> int:
+    """Bandwidth-derived concurrency ceiling for a matched GPU."""
+    bw = spec.memory_bandwidth_gb_s or 0.0
+    return max(1, int(bw / BW_GB_S_PER_CONCURRENT_REQUEST))
+
+
+def _concurrency_ceiling_for(
+    profile: ModelProfile, gpu_spec: GPUSpecification | None = None
+) -> int:
+    """Per-profile ceiling on the autoscaler's auto-derived concurrency.
+
+    When the GPU is identified via dbgpu, the ceiling is derived from the
+    GPU's memory bandwidth (``bandwidth_gb_s / BW_GB_S_PER_CONCURRENT_REQUEST``);
+    decode-step KV scans are bandwidth-bound, so a high-bandwidth GPU
+    (H100/HBM) can sustain far more in-flight requests than a low-bandwidth
+    one (L4/GDDR6 or GB10/LPDDR5X) before saturation.
+
+    When the GPU is *not* in dbgpu, fall back to a safe per-backend ceiling:
+    ``layout_chat`` profiles use ``AUTOSCALE_MAX_REGION_CONCURRENCY`` (16,
+    empirically validated across H100/A10/L4/DGX Spark); other backends use
+    ``AUTOSCALE_MAX_CONCURRENCY`` (64, whole-page batches stagger naturally).
 
     Only consulted in the auto-derived branch; an explicit
-    ``--batch-concurrency N`` from the user bypasses this — they get N
-    regardless of backend, which is the right call for benchmarking.
+    ``--batch-concurrency N`` from the user bypasses this entirely — they
+    get N regardless of GPU or backend, which is the right call for
+    benchmarking.
     """
+    if gpu_spec is not None:
+        return _bandwidth_concurrency_cap(gpu_spec)
     if profile.backend == "layout_chat":
         return AUTOSCALE_MAX_REGION_CONCURRENCY
     return AUTOSCALE_MAX_CONCURRENCY
@@ -263,6 +560,12 @@ class GpuProbe:
     total_bytes: int
     free_bytes: int
     cap_bytes: int
+    spec: GPUSpecification | None = None
+    """The matched dbgpu ``GPUSpecification`` when the device's nvitop
+    properties uniquely identified a catalog entry. ``None`` for unknown
+    or ambiguous GPUs — the autoscaler then falls back to the per-backend
+    safe ceiling. Callers can read any field directly (``memory_bandwidth_gb_s``,
+    ``memory_type``, ``boost_clock_mhz``, etc.)."""
 
 
 def probe_gpu(gpu_budget: float) -> GpuProbe:
@@ -287,8 +590,13 @@ def probe_gpu(gpu_budget: float) -> GpuProbe:
     except Exception as e:  # noqa: BLE001
         raise RunnerError(f"nvitop memory query failed: {e}") from e
     cap = min(int(free_b * _FREE_HEADROOM), int(total_b * gpu_budget))
+    name = str(dev.name())
     return GpuProbe(
-        name=str(dev.name()), total_bytes=total_b, free_bytes=free_b, cap_bytes=cap
+        name=name,
+        total_bytes=total_b,
+        free_bytes=free_b,
+        cap_bytes=cap,
+        spec=_lookup_gpu_specs(name, device_probe=_probe_device_properties(dev)),
     )
 
 
@@ -379,7 +687,7 @@ def autoscale_kv_budgets(
                 )
         else:
             max_from_kv = kv_slice // per_request_kv
-            ceiling = _concurrency_ceiling_for(p)
+            ceiling = _concurrency_ceiling_for(p, gpu.spec)
             concurrency = max(1, min(int(max_from_kv), ceiling))
             kv = concurrency * per_request_kv
 
@@ -391,11 +699,23 @@ def autoscale_kv_budgets(
             max_model_len=max_lens[p.name],
         )
 
-    lines = [
-        f"GPU {gpu.name}: free {human_bytes(gpu.free_bytes)} / total "
-        f"{human_bytes(gpu.total_bytes)}; cap {human_bytes(gpu.cap_bytes)}. "
-        f"Auto-scaled {len(decisions)} profile(s):"
-    ]
+    if gpu.spec is not None:
+        bw_cap = _bandwidth_concurrency_cap(gpu.spec)
+        gpu_line = (
+            f"GPU {gpu.name}: free {human_bytes(gpu.free_bytes)} / total "
+            f"{human_bytes(gpu.total_bytes)}; cap {human_bytes(gpu.cap_bytes)}; "
+            f"bandwidth {gpu.spec.memory_bandwidth_gb_s:.0f} GB/s "
+            f"(dbgpu: {gpu.spec.name!r}) → concurrency cap {bw_cap}. "
+            f"Auto-scaled {len(decisions)} profile(s):"
+        )
+    else:
+        gpu_line = (
+            f"GPU {gpu.name}: free {human_bytes(gpu.free_bytes)} / total "
+            f"{human_bytes(gpu.total_bytes)}; cap {human_bytes(gpu.cap_bytes)}; "
+            f"bandwidth unknown (not in dbgpu) → falling back to per-backend ceiling. "
+            f"Auto-scaled {len(decisions)} profile(s):"
+        )
+    lines = [gpu_line]
     for name, d in decisions.items():
         lines.append(
             f"  {name} (overhead {human_bytes(d.overhead_bytes)}, "

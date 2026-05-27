@@ -1156,6 +1156,16 @@ wheels = [
 ]
 
 [[package]]
+name = "dbgpu"
+version = "2025.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/d3/89/3f020bdd2236ba974f0c4f1b31ce67c54bd127ca0d2296ef48b8e94c3bc3/dbgpu-2025.12.tar.gz", hash = "sha256:d4a2fdc36ff5ff2af37e8fd8a3e0740ab2af73cc5e0fda199fdff3d6f1686f4e", size = 225653, upload-time = "2025-12-15T16:57:20.958Z" }
+
+[[package]]
 name = "decorator"
 version = "5.2.1"
 source = { registry = "https://pypi.org/simple" }
@@ -4112,6 +4122,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "datasets" },
+    { name = "dbgpu" },
     { name = "docling-core" },
     { name = "huggingface-hub" },
     { name = "litellm" },
@@ -4122,6 +4133,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "requests" },
     { name = "rich" },
+    { name = "thefuzz" },
     { name = "typer" },
 ]
 
@@ -4203,6 +4215,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "datasets", specifier = ">=3.0.0" },
+    { name = "dbgpu", specifier = ">=2025.0" },
     { name = "docling-core", specifier = ">=2.50.0" },
     { name = "duckdb", marker = "extra == 'bhl'", specifier = ">=1.1.0" },
     { name = "gcsfs", marker = "extra == 'cloud'", specifier = ">=2024.0.0" },
@@ -4233,6 +4246,7 @@ requires-dist = [
     { name = "s3fs", marker = "extra == 'bhl'", specifier = ">=2024.0.0" },
     { name = "s3fs", marker = "extra == 'cloud'", specifier = ">=2024.0.0" },
     { name = "skypilot-nightly", extras = ["kubernetes"], marker = "extra == 'skypilot'", specifier = ">=0.7.0" },
+    { name = "thefuzz", specifier = ">=0.22.0" },
     { name = "torch", marker = "extra == 'layout'", specifier = ">=2.0.0" },
     { name = "transformers", marker = "extra == 'layout'", specifier = ">=4.59.0" },
     { name = "transformers", marker = "extra == 'vllm'", specifier = ">=4.53.0" },
@@ -6965,6 +6979,18 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/46/58/8c37dea7bbf769b20d58e7ace7e5edfe65b849442b00ffcdd56be88697c6/tabulate-0.10.0.tar.gz", hash = "sha256:e2cfde8f79420f6deeffdeda9aaec3b6bc5abce947655d17ac662b126e48a60d", size = 91754, upload-time = "2026-03-04T18:55:34.402Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/55/db07de81b5c630da5cbf5c7df646580ca26dfaefa593667fc6f2fe016d2e/tabulate-0.10.0-py3-none-any.whl", hash = "sha256:f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3", size = 39814, upload-time = "2026-03-04T18:55:31.284Z" },
+]
+
+[[package]]
+name = "thefuzz"
+version = "0.22.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "rapidfuzz" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/4b/d3eb25831590d6d7d38c2f2e3561d3ba41d490dc89cd91d9e65e7c812508/thefuzz-0.22.1.tar.gz", hash = "sha256:7138039a7ecf540da323792d8592ef9902b1d79eb78c147d4f20664de79f3680", size = 19993, upload-time = "2024-01-19T19:18:23.135Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/82/4f/1695e70ceb3604f19eda9908e289c687ea81c4fecef4d90a9d1d0f2f7ae9/thefuzz-0.22.1-py3-none-any.whl", hash = "sha256:59729b33556850b90e1093c4cf9e618af6f2e4c985df193fdf3c5b5cf02ca481", size = 8245, upload-time = "2024-01-19T19:18:20.362Z" },
 ]
 
 [[package]]

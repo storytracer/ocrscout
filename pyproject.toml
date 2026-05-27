@@ -48,6 +48,14 @@ dependencies = [
     # no GPU runtime deps. Used by managed-mode GPU budgeting/telemetry.
     # Gracefully returns no devices on CPU-only hosts.
     "nvitop>=1.3.0",
+    # GPU spec database (memory bandwidth, VRAM, etc.) consumed by the
+    # autoscaler at launch time to derive per-GPU concurrency caps from
+    # memory bandwidth rather than a hardcoded constant. Pure data + tiny
+    # API. ``thefuzz`` is required by dbgpu's name-matching ``search`` for
+    # NVIDIA's varied product strings (e.g. nvidia-smi "H100 PCIe" vs
+    # dbgpu "H100 PCIe 80 GB"); pure Python, no compiled deps.
+    "dbgpu>=2025.0",
+    "thefuzz>=0.22.0",
 ]
 
 [project.optional-dependencies]

@@ -780,6 +780,10 @@ def _autoscale_and_apply(
             "total_bytes": gpu.total_bytes,
             "free_bytes_at_launch": gpu.free_bytes,
             "cap_bytes": gpu.cap_bytes,
+            "memory_bandwidth_gb_s": (
+                gpu.spec.memory_bandwidth_gb_s if gpu.spec else None
+            ),
+            "dbgpu_spec_name": gpu.spec.name if gpu.spec else None,
         },
         "gpu_budget": gpu_budget,
         "batch_concurrency_override": batch_concurrency,

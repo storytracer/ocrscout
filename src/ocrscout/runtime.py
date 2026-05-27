@@ -37,6 +37,13 @@ class GpuRuntime(BaseModel):
     name: str
     total_bytes: int
     free_bytes_at_launch: int
+    memory_bandwidth_gb_s: float | None = None
+    """Manufacturer-spec memory bandwidth from dbgpu when the GPU name
+    matched a catalog entry; ``None`` for unknown GPUs (autoscaler falls
+    back to the per-backend safe ceiling)."""
+    dbgpu_spec_name: str | None = None
+    """Canonical dbgpu name we matched to (e.g. ``"H100 PCIe 80 GB"``).
+    ``None`` when unmatched."""
 
 
 class RunnerRuntime(BaseModel):
