@@ -33,14 +33,27 @@ _FREE_HEADROOM = 0.95
 _OVERHEAD_PER_MODEL_BYTES = 8 * 1024**3
 _ENGINE_CAP_OVERHEAD_MULTIPLIER = 1.25
 
-# Autoscaler tuning. Both are deliberately module constants — single edits
-# retune the whole fleet. The per-token coefficient is a rule of thumb for
-# 3B–7B-class VLMs (derived from
-# ``2 × num_layers × num_kv_heads × head_dim × dtype_bytes``); the ceiling
-# reflects empirical diminishing returns past 64 concurrent requests from
-# vision-encoder cache thrashing and prefill contention.
+# Autoscaler tuning. Deliberately module constants — single edits retune the
+# whole fleet. The per-token coefficient is a rule of thumb for 3B–7B-class
+# VLMs (derived from ``2 × num_layers × num_kv_heads × head_dim × dtype_bytes``).
+#
+# Two concurrency ceilings because the two backends have very different
+# concurrency semantics:
+#
+# * ``backend: litellm`` (whole-page batches): 64 in-flight pages stagger
+#   naturally — different prompts, different decode lengths, vLLM's continuous
+#   batching schedules them well. Throughput scales up to ~64 before encoder
+#   cache thrashing / prefill contention dominate.
+#
+# * ``backend: layout_chat`` (per-page region fan-out): N region crops POSTed
+#   *simultaneously* against the same image. All start together, all want the
+#   same vision-encoder work, all compete in one giant prefill batch followed
+#   by a long decode tail. Empirical sweet spot is ~16 — benchmarks across
+#   H100 / A10 / L4 / DGX Spark showed glm-ocr-layout regressing ~30% at 64
+#   vs 16, regardless of available VRAM. The burst pattern caps the benefit.
 AUTOSCALE_PER_TOKEN_BYTES = 30_000
 AUTOSCALE_MAX_CONCURRENCY = 64
+AUTOSCALE_MAX_REGION_CONCURRENCY = 16
 
 _BYTE_SUFFIX_MULTIPLIERS = {
     "": 1,
@@ -91,6 +104,24 @@ def parse_model_size(s: str) -> int | None:
     num = float(m.group(1))
     suf = (m.group(2) or "B").upper()
     return int(num * _PARAM_COUNT_SUFFIXES[suf])
+
+
+def _concurrency_ceiling_for(profile: ModelProfile) -> int:
+    """Per-backend ceiling on the autoscaler's auto-derived concurrency.
+
+    ``backend: layout_chat`` profiles burst-fire same-image region requests
+    at the engine; empirical benchmarks (H100 / A10 / L4 / DGX Spark) show
+    the throughput peak around 16 and a ~30% regression at 64. All other
+    backends (whole-page ``litellm`` today) scale up to the wider 64
+    ceiling because requests stagger naturally.
+
+    Only consulted in the auto-derived branch; an explicit
+    ``--batch-concurrency N`` from the user bypasses this — they get N
+    regardless of backend, which is the right call for benchmarking.
+    """
+    if profile.backend == "layout_chat":
+        return AUTOSCALE_MAX_REGION_CONCURRENCY
+    return AUTOSCALE_MAX_CONCURRENCY
 
 
 def estimate_model_overhead(profile: ModelProfile) -> int:
@@ -348,7 +379,8 @@ def autoscale_kv_budgets(
                 )
         else:
             max_from_kv = kv_slice // per_request_kv
-            concurrency = max(1, min(int(max_from_kv), AUTOSCALE_MAX_CONCURRENCY))
+            ceiling = _concurrency_ceiling_for(p)
+            concurrency = max(1, min(int(max_from_kv), ceiling))
             kv = concurrency * per_request_kv
 
         decisions[p.name] = AutoscaleDecision(

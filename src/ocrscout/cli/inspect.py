@@ -227,9 +227,12 @@ def _show_runtime_header(output_dir: Path) -> None:
     if ctx.autoscale:
         for name, rec in ctx.autoscale.profiles.items():
             tag = " [dim](explicit)[/dim]" if rec.explicit_kv_in_yaml else ""
+            # Each profile has one of the two populated (per-backend
+            # ceiling fix). Render whichever is non-zero.
+            concurrency = rec.concurrent_requests or rec.region_concurrency
             table.add_row(
                 name + tag,
-                f"concurrency={rec.concurrent_requests}  "
+                f"concurrency={concurrency}  "
                 f"kv={_fmt_gib(rec.kv_cache_memory_bytes)}  "
                 f"max_model_len={rec.max_model_len}",
             )
@@ -305,9 +308,14 @@ def _show_aggregate(rows: list[dict[str, Any]]) -> None:
             if total is not None and cost_per_hour is not None
             else None
         )
+        # Each row has exactly one of the two populated depending on the
+        # backend (litellm → concurrent_requests, layout_chat →
+        # region_concurrency). Coalesce so the table renders the actual
+        # value the backend used.
         concurrency = next(
-            (r.get("concurrent_requests") for r in model_rows
-             if r.get("concurrent_requests")),
+            (r.get("concurrent_requests") or r.get("region_concurrency")
+             for r in model_rows
+             if r.get("concurrent_requests") or r.get("region_concurrency")),
             None,
         )
         kv_bytes = next(

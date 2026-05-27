@@ -746,12 +746,17 @@ def _autoscale_and_apply(
     for p in vllm_profiles:
         if p.name in scaled:
             d = scaled[p.name]
+            # Record concurrency under the key the profile's backend
+            # actually reads — the other one stays 0 so the runtime.yaml
+            # report reflects what the backend will use, not a fictitious
+            # "both at once" value.
+            is_layout = p.backend == "layout_chat"
             profile_records[p.name] = {
                 "explicit_kv_in_yaml": False,
                 "overhead_bytes": d.overhead_bytes,
                 "kv_cache_memory_bytes": d.kv_cache_memory_bytes,
-                "concurrent_requests": d.concurrent_requests,
-                "region_concurrency": d.concurrent_requests,
+                "concurrent_requests": 0 if is_layout else d.concurrent_requests,
+                "region_concurrency": d.concurrent_requests if is_layout else 0,
                 "max_model_len": d.max_model_len,
             }
         else:
@@ -789,11 +794,16 @@ def _apply_decision_to_profile(
 ) -> None:
     """Mutate the profile with the autoscaler's KV + concurrency choices.
 
-    Uses ``setdefault`` on the backend args so an explicit profile value
-    (rare — most profiles don't set these) still wins. Extends
-    ``cudagraph_capture_sizes`` when the chosen concurrency exceeds the
-    largest pre-captured bucket; otherwise vLLM would run that batch
-    size eagerly, paying ~30% latency for no benefit.
+    Uses ``setdefault`` on the relevant backend_args key so an explicit
+    profile value (rare — most profiles don't set this) still wins. Only
+    the key the backend will actually read is set: ``concurrent_requests``
+    for ``backend: litellm`` (whole-page batches), ``region_concurrency``
+    for ``backend: layout_chat`` (per-page region fan-out). Other backends
+    fall through to the litellm key as a sensible default.
+
+    Extends ``cudagraph_capture_sizes`` when the chosen concurrency
+    exceeds the largest pre-captured bucket; otherwise vLLM would run
+    that batch size eagerly, paying ~30% latency for no benefit.
     """
     eng = dict(profile.vllm_engine_args or {})
     eng["kv_cache_memory_bytes"] = decision.kv_cache_memory_bytes
@@ -813,8 +823,10 @@ def _apply_decision_to_profile(
     profile.vllm_engine_args = eng
 
     backend = dict(profile.backend_args or {})
-    backend.setdefault("concurrent_requests", decision.concurrent_requests)
-    backend.setdefault("region_concurrency", decision.concurrent_requests)
+    if profile.backend == "layout_chat":
+        backend.setdefault("region_concurrency", decision.concurrent_requests)
+    else:
+        backend.setdefault("concurrent_requests", decision.concurrent_requests)
     profile.backend_args = backend
 
 
