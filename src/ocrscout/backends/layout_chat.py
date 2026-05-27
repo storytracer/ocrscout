@@ -74,7 +74,14 @@ page."""
 @dataclass
 class _PageState:
     """Per-page assembly state shared between the producer (initial write)
-    and worker threads (post-completion mutation under ``state_lock``)."""
+    and worker threads (post-completion mutation under ``state_lock``).
+
+    ``results`` is pre-sized and indexed by *position in ``ordered``*, not
+    by ``region.id`` — detectors are free to return non-consecutive or
+    even duplicate region ids (PP-DocLayoutV3 numbers ids before its size
+    filter at [pp_doclayout_v3.py:95-107](src/ocrscout/layout_detectors/pp_doclayout_v3.py#L95-L107),
+    so the surviving list isn't guaranteed to be 0..N-1). Keying by
+    position makes assembly index-stable regardless."""
 
     page: PageImage
     page_idx: int
@@ -82,7 +89,7 @@ class _PageState:
     total_regions: int
     remaining: int
     t_start: float
-    results: dict[int, dict[str, Any]] = field(default_factory=dict)
+    results: list[dict[str, Any] | None] = field(default_factory=list)
     detector_error: str | None = None
 
 
@@ -314,13 +321,15 @@ def _produce_one_page(
         total_regions=len(ordered),
         remaining=len(ordered),
         t_start=t_start,
+        results=[None] * len(ordered),
     )
 
-    for region in ordered:
+    for position, region in enumerate(ordered):
         inflight_sem.acquire()
         executor.submit(
             _make_region_worker(
                 page_id=page.page_id,
+                position=position,
                 region=region,
                 page=page,
                 profile=profile,
@@ -338,6 +347,7 @@ def _produce_one_page(
 def _make_region_worker(
     *,
     page_id: str,
+    position: int,
     region: LayoutRegion,
     page: PageImage,
     profile: ModelProfile,
@@ -372,7 +382,7 @@ def _make_region_worker(
             inflight_sem.release()
         with state_lock:
             state = page_states[page_id]
-            state.results[region.id] = block
+            state.results[position] = block
             state.remaining -= 1
             is_done = state.remaining == 0
         if is_done:
@@ -410,7 +420,36 @@ def _assemble_raw(
             payload=json.dumps([]),
         )
 
-    blocks = [state.results[r.id] for r in state.ordered]
+    blocks: list[dict[str, Any]] = []
+    missing_positions: list[int] = []
+    for position, slot in enumerate(state.results):
+        if slot is None:
+            # A worker silently dropped its result — this should be unreachable
+            # given the lock + remaining-counter invariant. Filling with a
+            # failed block keeps the page assembly going and surfaces the
+            # diagnostic instead of crashing the whole run.
+            missing_positions.append(position)
+            blocks.append(
+                _failed_block(
+                    state.ordered[position],
+                    error="worker dropped result (no completion signal)",
+                )
+            )
+        else:
+            blocks.append(slot)
+
+    if missing_positions:
+        log.error(
+            "%s page %d/%d %s BUG: %d/%d region slot(s) are None at assembly "
+            "time (positions=%s, region_ids=%s, remaining=%d). Filled with "
+            "failed blocks; please report.",
+            log_prefix, page_idx, total_pages, page.file_id,
+            len(missing_positions), state.total_regions,
+            missing_positions,
+            [state.ordered[p].id for p in missing_positions],
+            state.remaining,
+        )
+
     n_failed = sum(1 for b in blocks if b.get("error"))
     elapsed = time.perf_counter() - state.t_start
     if n_failed:
