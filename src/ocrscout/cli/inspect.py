@@ -1,9 +1,11 @@
 """`ocrscout inspect` — read a previous run's output and surface comparisons.
 
-The summary view lists per-(page, model) stats with comparison-summary
-columns lifted from the parquet's flat metric columns (``text_similarity``,
-``layout_iou_mean``, etc.). The page view dumps each model's markdown and,
-when present, the page's reference text alongside its provenance.
+The default summary is run-level aggregates (one row per model: pages,
+failures, total/avg time, GPU + cost context). Add ``--per-page`` to also
+print the per-(page, model) table with comparison-summary columns lifted
+from the parquet's flat metric columns (``text_similarity``,
+``layout_iou_mean``, etc.). The page view dumps each model's markdown
+and, when present, the page's reference text alongside its provenance.
 
 The compare view dispatches through the comparison-renderer registry, so
 its output stays in lockstep with the viewer's Compare mode.
@@ -67,9 +69,15 @@ def inspect(
              "and open it in your default browser. No files are "
              "written. Press Ctrl-C to stop the server.",
     ),
+    per_page: bool = typer.Option(
+        False, "--per-page",
+        help="Also print the per-(page, model) table with comparison "
+             "metrics. Default is run-level aggregates only.",
+    ),
     snippet_length: int = typer.Option(
         80, "--snippet-length",
-        help="Characters of text preview shown in the summary table.",
+        help="Characters of text preview shown in the per-page table "
+             "(only used with --per-page).",
     ),
 ) -> None:
     """Read a previous run's parquet shards and print a per-page comparison."""
@@ -117,7 +125,7 @@ def inspect(
     elif page is not None:
         _show_page(rows, page_id=page)
     else:
-        _show_summary(rows, snippet_length=snippet_length)
+        _show_summary(rows, snippet_length=snippet_length, per_page=per_page)
 
 
 def _load_rows(output_dir: Path) -> list[dict[str, Any]]:
@@ -394,8 +402,15 @@ def _show_aggregate(rows: list[dict[str, Any]]) -> None:
     Console().print(table)
 
 
-def _show_summary(rows: list[dict[str, Any]], *, snippet_length: int) -> None:
+def _show_summary(
+    rows: list[dict[str, Any]],
+    *,
+    snippet_length: int,
+    per_page: bool,
+) -> None:
     _show_aggregate(rows)
+    if not per_page:
+        return
     rows_sorted = sorted(rows, key=lambda r: (r["file_id"], r["model"]))
 
     # Only show comparison columns that have at least one non-null value.
