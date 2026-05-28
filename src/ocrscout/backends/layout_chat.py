@@ -83,6 +83,16 @@ parallelism per detector forward. Default is the leftover CPU budget split
 evenly across detector workers (floor 1)."""
 _DEFAULT_REQUEST_TIMEOUT = 600.0
 _MODELS_PROBE_TIMEOUT = 15.0
+# ``elapsed`` above this in ``_assemble_raw`` indicates the page sat in
+# ``done_queue`` (or its regions sat in flight) far longer than any
+# legitimate request could take — almost certainly the consumer-side
+# stalled. Log the page at WARNING so the staleness is immediately
+# visible in `-q` runs and grep-friendly in CI output; the default INFO
+# "ok" line otherwise buries a 9-hour wait in plain text. The threshold
+# is set to twice the default request timeout — anything past 2× the
+# longest legitimate in-flight wait can't be explained by ordinary
+# slow-region cases.
+_STALL_WARN_ELAPSED_S = _DEFAULT_REQUEST_TIMEOUT * 2
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
 # small same-row jitter without conflating rows on tightly-packed pages.
 _READING_ORDER_ROW_PX = 50
@@ -531,14 +541,16 @@ class LayoutChatBackend(ModelBackend):
             # request timeout (default 600s), not by the unconsumed
             # backlog.
             executor.shutdown(wait=True, cancel_futures=True)
-            # Cancelled futures never ran ``_work``'s finally, so they
-            # never released the in-flight semaphore. Any detector
-            # worker still blocked on ``inflight_sem.acquire()`` needs
-            # those permits to unstick; releasing ``n_workers`` permits
-            # is enough (each worker can be blocked on at most one
-            # acquire). ``BoundedSemaphore`` raises ``ValueError`` if
-            # we release past the initial count, which is fine — that
-            # just means nothing was blocked.
+            # Belt-and-braces semaphore drain. ``_submit_state`` now
+            # polls ``cancel_event`` in its acquire loop, so workers
+            # shouldn't be stranded on the semaphore — but a future
+            # code path that bypasses the poll, or a worker that
+            # already passed acquire when its future got cancelled
+            # (consuming a permit ``_work``'s finally never released),
+            # would re-introduce the hang. Releasing ``n_workers``
+            # permits is enough to unstick any single-acquire blocker;
+            # ``BoundedSemaphore`` raises ``ValueError`` if we exceed
+            # the initial count, which is the common case and benign.
             for _ in range(n_workers):
                 try:
                     inflight_sem.release()
@@ -642,6 +654,7 @@ def _detector_worker_loop(
                 mark_dispatched=mark_dispatched,
                 publish_page=publish_page,
                 executor=executor,
+                cancel_event=cancel_event,
             )
     except BaseException as e:  # noqa: BLE001
         worker_exc.append(e)
@@ -763,6 +776,7 @@ def _submit_state(
     mark_dispatched: Callable[[], None],
     publish_page: Callable[[_PageState], None],
     executor: concurrent.futures.ThreadPoolExecutor,
+    cancel_event: threading.Event,
 ) -> None:
     """Open the page's cost record, then dispatch region work. For empty
     or detector-failed states, publish the page immediately so the
@@ -775,7 +789,15 @@ def _submit_state(
 
     ``mark_dispatched`` is called BEFORE any region work could publish,
     so the main thread's ``pages_completed >= pages_dispatched`` check
-    can never see completion racing ahead of dispatch."""
+    can never see completion racing ahead of dispatch.
+
+    ``cancel_event`` is checked between every region's
+    ``inflight_sem.acquire()`` so a Ctrl-C arriving mid-page (e.g.
+    while we're 30 regions deep into a 100-region page) doesn't strand
+    this worker on the semaphore until a future completes. Without
+    this check, a worker mid-``_submit_state`` is invisible to the
+    outer-loop ``cancel_event`` check and would hold up the bounded
+    detector-thread join in ``run()``."""
     cost_mod.recorder.open_page(state.page.page_id, profile.name)
     mark_dispatched()
 
@@ -786,7 +808,17 @@ def _submit_state(
         return
 
     for position, region in enumerate(state.ordered):
-        inflight_sem.acquire()
+        # Polling acquire so cancellation surfaces inside this loop.
+        # The 0.5s timeout is short enough that even a 100-region page
+        # gives up within a fraction of a second of ``cancel_event``
+        # being set, but long enough that steady-state acquires don't
+        # spin. The ``while/else`` returns when ``cancel_event`` flips
+        # and we never see a successful ``break``.
+        while not cancel_event.is_set():
+            if inflight_sem.acquire(timeout=0.5):
+                break
+        else:
+            return
         executor.submit(
             _make_region_worker(
                 state=state,
@@ -910,11 +942,26 @@ def _assemble_raw(
 
     n_failed = sum(1 for b in blocks if b.get("error"))
     elapsed = time.perf_counter() - state.t_start
+    # Promote suspiciously slow pages to WARNING — see
+    # ``_STALL_WARN_ELAPSED_S``. Pages that legitimately take this long
+    # don't exist in practice (request timeout is 600s and pages run
+    # regions concurrently), so an elapsed past 2× that is the strongest
+    # signal we get that the consumer-side stalled while regions sat
+    # ready in ``done_queue``. Surfacing it at WARNING means even ``-q``
+    # runs see the problem.
+    stalled = elapsed > _STALL_WARN_ELAPSED_S
     if n_failed:
         log.warning(
             "%s page %d/%d %s ok (%d/%d regions in %.1fs, %d failed)",
             log_prefix, page_idx, total_pages, page.file_id,
             state.total_regions - n_failed, state.total_regions, elapsed, n_failed,
+        )
+    elif stalled:
+        log.warning(
+            "%s page %d/%d %s ok (%d regions in %.1fs — STALE: elapsed > %.0fs, "
+            "consumer likely stalled while regions waited in done_queue)",
+            log_prefix, page_idx, total_pages, page.file_id,
+            state.total_regions, elapsed, _STALL_WARN_ELAPSED_S,
         )
     else:
         log.info(

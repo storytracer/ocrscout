@@ -593,12 +593,25 @@ def _vllm_serve_cmd(
 
     Shared by the persistent and ephemeral paths so both produce
     identical processes.
+
+    ``--host 127.0.0.1`` is non-negotiable: vLLM defaults to binding
+    ``0.0.0.0``, which on a public-IP cloud GPU box (e.g. Scaleway,
+    Lambda) lets anyone in the world submit inference requests to your
+    GPU and pollutes the cost callback with foreign traffic. Observed
+    in the wild on a 2500-page benchmark run: internet scanners hit
+    the API server hundreds of times over a single overnight session.
+    All ocrscout consumers reach the daemon via the loopback
+    ``OCRSCOUT_VLLM_URL``, so a strict loopback bind is functionally
+    identical from our side. The SkyPilot/HF runners spawn their own
+    worker-local LocalRunner stack on the worker pod, so they benefit
+    from the same lock-down without any code path needing 0.0.0.0.
     """
     cmd: list[str] = [
         "uv", "run",
         "--with", f"vllm{profile.vllm_version}",
         "--", "vllm", "serve",
         profile.model_id,
+        "--host", "127.0.0.1",
         "--port", str(port),
         "--gpu-memory-utilization", f"{gpu_memory_utilization:.4f}",
     ]
@@ -611,12 +624,18 @@ def _litellm_proxy_cmd(*, proxy_port: int) -> list[str]:
 
     Caller is responsible for having written the config file via
     :func:`_write_litellm_config` first.
+
+    Like vLLM (see :func:`_vllm_serve_cmd`), bind the proxy to
+    loopback only. LiteLLM defaults to ``0.0.0.0`` and would otherwise
+    accept inference requests from anywhere the host's public
+    interface is reachable.
     """
     return [
         "uv", "run",
         "--with", f"litellm[proxy]{_LITELLM_VERSION_SPEC}",
         "--", "litellm",
         "--config", str(state_mod.litellm_config_path()),
+        "--host", "127.0.0.1",
         "--port", str(proxy_port),
         "--num_workers", "1",
     ]

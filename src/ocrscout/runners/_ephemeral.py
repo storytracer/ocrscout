@@ -277,23 +277,51 @@ class EphemeralStack:
         # process does. Then re-raise the original handler if it was
         # a callable (Python's default SIGINT raises KeyboardInterrupt;
         # SIGTERM/SIGHUP default exits the process).
-        log.info("EphemeralStack: signal %d received; terminating stack",
-                 signum)
+        #
+        # Critically, do NOT use the ``logging`` module here. Python
+        # delivers signals on the main thread, possibly mid-``emit()``
+        # of another log record; a nested ``log.info(...)`` would
+        # re-enter the same non-reentrant ``BufferedWriter`` and raise
+        # ``RuntimeError: reentrant call inside <_io.BufferedWriter
+        # name='<stderr>'>``. Worse: ``Handler.handleError`` only
+        # catches ``OSError``, so the ``RuntimeError`` escapes the
+        # signal handler before ``terminate_all()`` ever runs, leaking
+        # the entire daemon stack until the user Ctrl-C's again
+        # (observed: 9-hour stall on a benchmark run; vLLM idle the
+        # whole time). Two defenses:
+        #   1. ``os.write(2, ...)`` bypasses the logging module *and*
+        #      the BufferedWriter — it's the lowest-level signal-safe
+        #      stderr we have.
+        #   2. ``terminate_all()`` runs inside ``try/except
+        #      BaseException`` so even a freak failure can't skip the
+        #      child cleanup.
         try:
             self.terminate_all()
-        finally:
-            prior = self._prior_handlers.get(signum)
-            if signum == signal.SIGINT:
-                # Surface Ctrl-C to the orchestrator as KeyboardInterrupt
-                # so its existing try/except/finally chain runs.
-                raise KeyboardInterrupt
-            if callable(prior) and prior not in (
-                signal.SIG_DFL, signal.SIG_IGN,
-            ):
-                try:
-                    prior(signum, frame)
-                    return
-                except Exception:  # noqa: BLE001
-                    pass
-            # Default for SIGTERM / SIGHUP: exit promptly.
-            sys.exit(128 + signum)
+        except BaseException:  # noqa: BLE001
+            # Last-resort: never let cleanup errors prevent the
+            # process from honoring the original signal disposition.
+            pass
+        try:
+            os.write(
+                2,
+                f"EphemeralStack: signal {signum} received; "
+                f"stack terminated\n".encode(),
+            )
+        except OSError:
+            pass
+
+        prior = self._prior_handlers.get(signum)
+        if signum == signal.SIGINT:
+            # Surface Ctrl-C to the orchestrator as KeyboardInterrupt
+            # so its existing try/except/finally chain runs.
+            raise KeyboardInterrupt
+        if callable(prior) and prior not in (
+            signal.SIG_DFL, signal.SIG_IGN,
+        ):
+            try:
+                prior(signum, frame)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        # Default for SIGTERM / SIGHUP: exit promptly.
+        sys.exit(128 + signum)
