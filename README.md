@@ -164,6 +164,8 @@ ocrscout → LiteLLM proxy (localhost:4000) → one vLLM per model (localhost:80
 
 The LiteLLM proxy is the unifying layer: it gives every model the same OpenAI-compatible URL, attributes per-request cost back to the calling page (via the success callback), and lets you mix locally-hosted vLLM models with hosted APIs (Gemini, Anthropic) in the same run. **You don't manage this stack by hand** — a `Runner` does it for you. Pick by where the compute lives:
 
+Both daemons are bound to `127.0.0.1` (loopback only). vLLM and LiteLLM default to `0.0.0.0`, which on a public-IP cloud GPU would let anyone in the world submit inference requests using your GPU — ocrscout forces loopback so the stack is unreachable from outside the host even when the box has a public IP. Per-call timeouts default to **300 s** with **2 retries** on retryable failures (rate limits / 5xx / timeouts); override either via `backend_args.request_timeout` / `backend_args.num_retries` in a profile YAML if your hardware or workload needs different bounds.
+
 ### "Just run it" — `ocrscout run`
 
 You point ocrscout at a folder, it spins up the local stack, runs the pages, and shuts down. By default the dispatch is **model-major**: one vLLM serve at a time — spawn → all pages → tear down → next model. Each model gets the full GPU (so the timing numbers are honest), and the GPU-memory preflight only needs to fit the **largest single model**, not the sum of all of them. That means a benchmark matrix of e.g. `dots-mocr` (3B) + `glm-ocr-layout` (0.9B) runs comfortably on a 16 GB GPU even though their combined working set wouldn't fit.
