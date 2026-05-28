@@ -564,10 +564,13 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         Both upstream tables ship duplicate keys: BHL's ``item.txt.gz``
         catalogs the same physical item under multiple ``TitleID``s for
         ~9K items, and ``page.txt.gz`` has ~5M duplicate ``PageID`` rows.
-        The first two CTEs dedup deterministically (one row per ItemID /
-        PageID) so the rank-and-cap stages downstream see unique keys —
-        without this guard, a single volume's pages can land in the
-        sample multiple times.
+        Dedup happens at two carefully placed points to keep memory
+        cheap on 64 GiB hosts: ``eligible`` is deduped by ItemID up front
+        (small table, ~311K rows), but PageID dedup is deferred until
+        ``capped`` (≤ volumes × pages_per_volume rows). Doing the PageID
+        dedup with a window function over the full 68M-row ``page.parquet``
+        instead would add ~15-25 GiB of transient state to the SQL and
+        OOM'd boxes with less headroom.
         """
         try:
             import duckdb
@@ -606,13 +609,6 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 ORDER BY TitleID NULLS LAST, BarCode NULLS LAST
             ) = 1
         ),
-        dedup_pages AS (
-            SELECT * FROM {page_sql}
-            QUALIFY ROW_NUMBER() OVER (
-                PARTITION BY PageID
-                ORDER BY ItemID NULLS LAST, SequenceOrder NULLS LAST
-            ) = 1
-        ),
         all_pages AS (
             SELECT
                 p.PageID,
@@ -633,7 +629,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 e.LicenseType,
                 e.RightsHolder,
                 e.ItemYear
-            FROM dedup_pages AS p
+            FROM {page_sql} AS p
             JOIN eligible e USING (ItemID)
         ),
         volume_pool AS (
@@ -665,6 +661,10 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         )
         SELECT *
         FROM capped
+        QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY PageID
+            ORDER BY vrank, prank
+        ) = 1
         ORDER BY vrank, prank
         LIMIT {sample_n};
         """
