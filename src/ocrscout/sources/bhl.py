@@ -28,7 +28,12 @@ import logging
 import re
 import shutil
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -286,21 +291,43 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         # dramatically faster than the sequential loop. Pages are yielded in
         # completion order — downstream OCR doesn't care about ordering.
         #
-        # Manual try/finally (not ``with``) so the early-close path can
-        # call ``shutdown(cancel_futures=True)``: by default the ``with``
-        # statement's __exit__ calls ``shutdown(wait=True)`` which blocks
-        # until every queued future runs. The orchestrator peeks the
-        # first page to detect an empty source, then continues — without
-        # cancel_futures, that peek would force all ``len(rows)`` S3
-        # fetches to drain before the generator could be GC'd.
+        # Sliding window of in-flight + completed-but-unyielded futures: at
+        # any moment ``pending`` holds at most ``workers * 2`` futures, each
+        # potentially carrying a decoded JP2 (~15 MB). Without this cap a
+        # naive ``[pool.submit(...) for row in rows]`` lets the executor run
+        # arbitrarily far ahead of the consumer — for a 2500-page sample
+        # that's ~37 GiB of resident PIL images by the time the OCR backend
+        # has chewed through the first hundred, OOM-killing the orchestrator.
+        # The "× 2" headroom keeps every worker busy across yields: by the
+        # time the consumer pulls one page, the next replacement future is
+        # already in-flight.
+        #
+        # Manual try/finally so the early-close path can call
+        # ``shutdown(cancel_futures=True)`` — by default ``with``-exit blocks
+        # on every queued future, which would force the empty-source probe
+        # in ``_execute`` to drain all S3 fetches before returning.
         workers = min(self.concurrent_fetches, len(rows))
         pool = ThreadPoolExecutor(max_workers=workers)
         try:
-            futures = [pool.submit(self._row_to_page, row) for row in rows]
-            for fut in as_completed(futures):
-                page = fut.result()
-                if page is not None:
-                    yield page
+            row_iter = iter(rows)
+            pending: set = set()
+            for _ in range(workers * 2):
+                try:
+                    row = next(row_iter)
+                except StopIteration:
+                    break
+                pending.add(pool.submit(self._row_to_page, row))
+            while pending:
+                done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    try:
+                        next_row = next(row_iter)
+                        pending.add(pool.submit(self._row_to_page, next_row))
+                    except StopIteration:
+                        pass
+                    page = fut.result()
+                    if page is not None:
+                        yield page
         finally:
             pool.shutdown(wait=False, cancel_futures=True)
 
