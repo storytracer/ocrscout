@@ -560,6 +560,14 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         ``volumes.parquet``, so this query reads one small parquet
         (~300K rows) for volume filtering plus the raw ``page.parquet``
         only to fetch page metadata for the surviving ItemIDs.
+
+        Both upstream tables ship duplicate keys: BHL's ``item.txt.gz``
+        catalogs the same physical item under multiple ``TitleID``s for
+        ~9K items, and ``page.txt.gz`` has ~5M duplicate ``PageID`` rows.
+        The first two CTEs dedup deterministically (one row per ItemID /
+        PageID) so the rank-and-cap stages downstream see unique keys —
+        without this guard, a single volume's pages can land in the
+        sample multiple times.
         """
         try:
             import duckdb
@@ -593,6 +601,17 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         WITH eligible AS (
             SELECT * FROM read_parquet('{volumes_parquet}')
             WHERE {where_sql}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY ItemID
+                ORDER BY TitleID NULLS LAST, BarCode NULLS LAST
+            ) = 1
+        ),
+        dedup_pages AS (
+            SELECT * FROM {page_sql}
+            QUALIFY ROW_NUMBER() OVER (
+                PARTITION BY PageID
+                ORDER BY ItemID NULLS LAST, SequenceOrder NULLS LAST
+            ) = 1
         ),
         all_pages AS (
             SELECT
@@ -614,7 +633,7 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 e.LicenseType,
                 e.RightsHolder,
                 e.ItemYear
-            FROM {page_sql} AS p
+            FROM dedup_pages AS p
             JOIN eligible e USING (ItemID)
         ),
         volume_pool AS (
@@ -1047,6 +1066,10 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             "[" + ", ".join(f"'{p}'" for p in rights_paths) + "]"
         )
 
+        # BHL's item.txt.gz catalogs ~9K physical items under multiple
+        # TitleIDs each, which would otherwise propagate into volumes.parquet
+        # as duplicate ItemID rows. Dedup deterministically at write time so
+        # the sampler always sees one row per volume.
         conn.execute(
             f"""
             COPY (
@@ -1070,6 +1093,10 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
                 JOIN read_parquet({rights_path_list}) AS c
                   ON {rights_join_sql}
                 WHERE c.parsing_success = TRUE
+                QUALIFY ROW_NUMBER() OVER (
+                    PARTITION BY i.ItemID
+                    ORDER BY i.TitleID NULLS LAST, i.BarCode NULLS LAST
+                ) = 1
             ) TO '{out_path}' (FORMAT PARQUET, COMPRESSION ZSTD)
             """
         )
