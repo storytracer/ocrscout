@@ -280,14 +280,18 @@ def _show_aggregate(rows: list[dict[str, Any]]) -> None:
     for model in sorted(by_model):
         model_rows = by_model[model]
 
-        # `run_seconds_total` is stamped uniformly per model by the
-        # dispatcher (see cli/run.py); pick the first row that has it.
+        # `run_seconds_total` is stamped cumulatively — each row carries
+        # the wall-clock elapsed at the moment THAT page finished (see
+        # cli/run.py:_process_one). The last page to finish carries the
+        # actual run total, so take the max across rows.
         run_seconds_total: float | None = None
         for r in model_rows:
             v = (r.get("metrics") or {}).get("run_seconds_total")
-            if v is not None:
-                run_seconds_total = float(v)
-                break
+            if v is None:
+                continue
+            v = float(v)
+            if run_seconds_total is None or v > run_seconds_total:
+                run_seconds_total = v
 
         failed = sum(1 for r in model_rows if r.get("error"))
         succeeded = len(model_rows) - failed
