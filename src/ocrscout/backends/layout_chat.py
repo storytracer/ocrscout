@@ -364,10 +364,26 @@ class LayoutChatBackend(ModelBackend):
         pages_dispatched_lock = threading.Lock()
         pages_dispatched = [0]
 
-        with concurrent.futures.ThreadPoolExecutor(
+        # Explicit lifecycle instead of ``with ThreadPoolExecutor(...) as
+        # executor``: the context manager calls ``shutdown(wait=True)``
+        # with the default ``cancel_futures=False``, which means a wedged
+        # main thread (e.g. one that's lost a signal-handler race and is
+        # blocked inside a corrupt BufferedWriter) can stall the exit
+        # path indefinitely while it waits for futures that nothing is
+        # consuming. We pair the executor with a try/finally that calls
+        # ``shutdown(wait=True, cancel_futures=True)`` instead: pending
+        # futures are dropped so abnormal termination is bounded by the
+        # longest in-flight HTTP timeout, and running futures still get
+        # awaited so we don't pull state out from under them. On normal
+        # completion there are no pending futures (the in-flight
+        # semaphore + per-page publish accounting guarantees all regions
+        # resolved before the yield loop exits), so this preserves the
+        # original wait-for-all-running semantics.
+        executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=region_concurrency,
             thread_name_prefix="layout_chat_region",
-        ) as executor:
+        )
+        try:
 
             def _mark_dispatched() -> None:
                 """Called at the head of ``_submit_state`` for every
@@ -495,15 +511,50 @@ class LayoutChatBackend(ModelBackend):
                     yield item.page, _assemble_raw(item, profile, prefix, total_pages)
                     yielded += 1
             finally:
-                # On normal completion this is a no-op; on early-exit
-                # (caller stopped iterating) it tells detector workers to
-                # drain and exit. Belt-and-braces sentinels guarantee no
-                # worker is left blocked on `pages_queue.get()`.
+                # Signal cancellation so detector workers blocked on
+                # ``pages_queue.get()`` wake up and exit at the top of
+                # their loop. Detector-thread join is deliberately
+                # deferred to the OUTER finally below — joining before
+                # the executor shuts down can deadlock when a worker is
+                # blocked on ``inflight_sem.acquire()`` and only a
+                # future completion would release the semaphore.
                 cancel_event.set()
                 for _ in range(n_workers):
                     pages_queue.put(_SENTINEL)
-                for t in detector_threads:
-                    t.join()
+        finally:
+            # Bound the executor shutdown so abnormal termination
+            # doesn't stall here forever. ``cancel_futures=True`` drops
+            # pending futures (the default ``False`` would wait on
+            # everything in the queue); ``wait=True`` still awaits
+            # running futures so they release ``inflight_sem`` and the
+            # cost recorder cleanly. Worst case is bounded by the
+            # request timeout (default 600s), not by the unconsumed
+            # backlog.
+            executor.shutdown(wait=True, cancel_futures=True)
+            # Cancelled futures never ran ``_work``'s finally, so they
+            # never released the in-flight semaphore. Any detector
+            # worker still blocked on ``inflight_sem.acquire()`` needs
+            # those permits to unstick; releasing ``n_workers`` permits
+            # is enough (each worker can be blocked on at most one
+            # acquire). ``BoundedSemaphore`` raises ``ValueError`` if
+            # we release past the initial count, which is fine — that
+            # just means nothing was blocked.
+            for _ in range(n_workers):
+                try:
+                    inflight_sem.release()
+                except ValueError:
+                    pass
+            # Bounded join: detector threads are daemon=True, so any
+            # that still fail to exit die with the process. Don't let
+            # one wedged worker hold the cleanup open indefinitely.
+            for t in detector_threads:
+                t.join(timeout=15.0)
+                if t.is_alive():
+                    log.warning(
+                        "%s detector thread %s did not exit within 15s; "
+                        "abandoning (daemon=True, dies with process)",
+                        prefix, t.name,
+                    )
 
         if worker_exc:
             if len(worker_exc) > 1:
