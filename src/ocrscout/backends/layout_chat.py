@@ -204,9 +204,7 @@ class LayoutChatBackend(ModelBackend):
     name = "layout_chat"
     requires_runner: ClassVar[bool] = True
 
-    def prepare(
-        self, profile: ModelProfile, pages: Sequence[PageImage]
-    ) -> BackendInvocation:
+    def prepare(self, profile: ModelProfile) -> BackendInvocation:
         if not profile.layout_detector:
             raise BackendError(
                 f"LayoutChatBackend: profile {profile.name!r} has no layout_detector"
@@ -275,20 +273,21 @@ class LayoutChatBackend(ModelBackend):
             kind="http",
             endpoint=proxy_url,
             profile=profile,
-            pages=[p.page_id for p in pages],
-            extra={
-                "pages_runtime": list(pages),
-                "detectors": detectors,
-            },
+            pages=[],
+            extra={"detectors": detectors},
         )
 
-    def run(self, invocation: BackendInvocation) -> Iterator[RawOutput]:
+    def run(
+        self,
+        invocation: BackendInvocation,
+        pages: Sequence[PageImage],
+    ) -> Iterator[tuple[PageImage, RawOutput]]:
         profile = invocation.profile
         proxy_url = invocation.endpoint or ""
         if not proxy_url:
             raise BackendError("LayoutChatBackend.run: missing proxy URL")
 
-        pages: list[PageImage] = list(invocation.extra.get("pages_runtime", []))
+        pages = list(pages)
         detectors: list[Any] = list(invocation.extra["detectors"])
         if not detectors:
             raise BackendError("LayoutChatBackend.run: empty detector pool")
@@ -479,7 +478,7 @@ class LayoutChatBackend(ModelBackend):
                         break
                     if item is _SENTINEL:
                         break
-                    yield _assemble_raw(item, profile, prefix, total_pages)
+                    yield item.page, _assemble_raw(item, profile, prefix, total_pages)
                     yielded += 1
             finally:
                 # On normal completion this is a no-op; on early-exit

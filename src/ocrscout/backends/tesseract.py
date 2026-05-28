@@ -15,10 +15,12 @@ from ocrscout.types import BackendInvocation, PageImage, RawOutput
 class TesseractBackend(ModelBackend):
     name = "tesseract"
 
-    def prepare(
-        self, profile: ModelProfile, pages: Sequence[PageImage]
-    ) -> BackendInvocation:
+    def prepare(self, profile: ModelProfile) -> BackendInvocation:
         raise NotImplementedError("TesseractBackend is not implemented in v0.")
 
-    def run(self, invocation: BackendInvocation) -> Iterator[RawOutput]:
+    def run(
+        self,
+        invocation: BackendInvocation,
+        pages: Sequence[PageImage],
+    ) -> Iterator[tuple[PageImage, RawOutput]]:
         raise NotImplementedError("TesseractBackend is not implemented in v0.")

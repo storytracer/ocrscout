@@ -725,16 +725,11 @@ def _execute(
         gpu_cfg.type, gpu_cfg.provider, gpu_cfg.cost_per_hour,
     )
 
-    pages_iter = source.iter_pages()
-    if cfg.sample is not None:
-        pages = list(itertools.islice(pages_iter, cfg.sample))
-    else:
-        pages = list(pages_iter)
     # Per-model resume done-set built once from the parquet shards already on
     # disk (the single source of truth — see done_pairs_from_parquet). Each
     # model gets its own done page_ids: a page completed for A but not B is
-    # still attempted for B. The filter is applied inside `_run` below so
-    # `_run_one_model` keeps a uniform `pages` argument.
+    # still attempted for B. The filter is applied as a streaming predicate
+    # inside ``_run`` so ``_run_one_model`` consumes pages lazily.
     done_pairs: dict[str, set[str]] = {}
     if resume:
         from ocrscout.exports.parquet import done_pairs_from_parquet
@@ -745,10 +740,26 @@ def _execute(
                 "Resume: %d (page, model) pairs already in %s — filtering per model",
                 total_done, cfg.output_dir,
             )
-    page_by_id = {p.page_id: p for p in pages}
+
     source_label = cfg.source.args.get("path") or cfg.source.name
-    log.info("Loaded %d page(s) from %r", len(pages), source_label)
-    if not pages:
+
+    def _fresh_pages_iter() -> "_PeekableIter":
+        """Return a fresh page iterator from the source, sample-limited
+        and resume-filter-able. Each model gets its own — for BHL the
+        DuckDB sample is cached on the adapter so only the S3 fetches
+        re-run, but pages stream lazily so resident PIL images stay
+        bounded at ~``concurrent_fetches`` per source-side worker pool
+        plus the backend's per-batch buffer."""
+        it = source.iter_pages()
+        if cfg.sample is not None:
+            it = itertools.islice(it, cfg.sample)
+        return _PeekableIter(it)
+
+    # Peek the first page once to surface an empty-source error before
+    # any backend setup happens. The peeked iterator is discarded; each
+    # model gets its own fresh stream below.
+    probe = _fresh_pages_iter()
+    if probe.peek() is None:
         log.error(
             "No images found from source %r (args=%s). For `hf_dataset` "
             "this means the `imagefolder` builder found no images and the "
@@ -757,6 +768,7 @@ def _execute(
             cfg.source.name, cfg.source.args,
         )
         raise typer.Exit(code=1)
+    del probe
 
     reference_adapter: ReferenceAdapter | None = None
     if cfg.reference is not None:
@@ -778,13 +790,16 @@ def _execute(
     exporter.open(cfg.export.args["dest"])
     # Volumes flow through the source's optional iter_volumes() — the run
     # loop materializes them up-front so the per-volume sidecar parquet
-    # exists even if a backend later fails on a particular page.
+    # exists even if a backend later fails on a particular page. Volume
+    # objects carry no images, so their list is cheap to hold.
     volume_count = 0
     for volume in source.iter_volumes():
         exporter.write_volume(volume)
         volume_count += 1
     if volume_count:
         log.info("Loaded %d volume(s) from source", volume_count)
+
+    log.info("Streaming pages from %r", source_label)
 
     metrics = MetricsCollector(pipeline_id=cfg.name)
     # results[model_name] -> ModelRunResult. Dict so the summary table can
@@ -793,20 +808,13 @@ def _execute(
 
     def _run(name: str) -> tuple[str, _ModelRunResult]:
         model_done = done_pairs.get(name, set())
+        pages_iter = _fresh_pages_iter()
         if model_done:
-            model_pages = [p for p in pages if p.page_id not in model_done]
-            skipped = len(pages) - len(model_pages)
-            if skipped:
-                log.info("[%s] resume: skipping %d of %d pages", name, skipped, len(pages))
-        else:
-            model_pages = pages
-        if not model_pages:
-            log.info("[%s] resume: nothing to do", name)
-            return name, _ModelRunResult(ok=0, failed=0, run_seconds=0.0)
+            log.info("[%s] resume: filtering pages already in parquet", name)
+            pages_iter = _filter_done(pages_iter, model_done)
         result = _run_one_model(
             model_name=name,
-            pages=model_pages,
-            page_by_id=page_by_id,
+            pages_iter=pages_iter,
             normalizer_overrides=cfg.normalizer_overrides,
             exporter=exporter,
             reference_adapter=reference_adapter,
@@ -837,6 +845,69 @@ def _execute(
     _print_summary(summary_rows, dest=cfg.export.args["dest"])
 
 
+class _PeekableIter:
+    """Single-item-lookahead wrapper around an iterator.
+
+    Used so ``_execute`` can detect an empty source before spinning up
+    any backend without consuming the iterator destructively when not
+    empty: ``peek()`` returns the next item (or ``None``) without
+    advancing the consumer's view; subsequent iteration sees the
+    peeked item first.
+    """
+
+    def __init__(self, it: "object") -> None:
+        self._it = iter(it)  # type: ignore[arg-type]
+        self._head: Any = _UNSET
+
+    def peek(self) -> Any:
+        if self._head is _UNSET:
+            try:
+                self._head = next(self._it)
+            except StopIteration:
+                return None
+        return self._head
+
+    def __iter__(self) -> "_PeekableIter":
+        return self
+
+    def __next__(self) -> Any:
+        if self._head is not _UNSET:
+            item = self._head
+            self._head = _UNSET
+            return item
+        return next(self._it)
+
+
+_UNSET: Any = object()
+
+
+def _filter_done(it, done_set):
+    """Drop pages whose page_id is already in ``done_set``."""
+    for page in it:
+        if page.page_id not in done_set:
+            yield page
+
+
+def _chunked(it, size: int):
+    """Yield successive lists of up to ``size`` items from ``it``.
+
+    Each chunk is materialised as a list so the backend can size its
+    internal thread pool exactly; between chunks the previous chunk's
+    PageImages (with their decoded PIL bytes) drop out of scope and
+    Python's refcount-GC reclaims the image memory before the next
+    chunk is decoded. Without this boundary, the source's
+    ThreadPoolExecutor would keep filling its as_completed queue with
+    finished PageImages while the backend processed earlier ones —
+    O(sample) PIL images resident at peak."""
+    if size <= 0:
+        raise ValueError(f"_chunked size must be positive, got {size}")
+    while True:
+        chunk = list(itertools.islice(it, size))
+        if not chunk:
+            return
+        yield chunk
+
+
 @dataclass
 class _ModelRunResult:
     ok: int
@@ -845,11 +916,43 @@ class _ModelRunResult:
     comparison_results: list[ComparisonResult] = dc_field(default_factory=list)
 
 
+_PAGE_CHUNK_BASELINE = 32
+"""Minimum chunk size when feeding pages into a backend's ``run()``. Picked
+large enough that even a cold model's per-batch overhead (cudagraph
+warmup, HTTP keep-alive setup) amortises, small enough that 32 PIL
+images (~500 MB on 2000x3000 BHL JP2s) sit comfortably in RAM."""
+
+_PAGE_CHUNK_CONCURRENCY_MULT = 2
+"""Multiplier on the backend's autoscaler-decided concurrency. Setting
+chunk = ``2 × concurrent_requests`` means while the backend is processing
+the back half of a chunk the front half's futures are already done — no
+idle workers between chunks — at the cost of ~2× the per-chunk memory
+footprint vs. chunk = concurrency. Empirically gives the same total
+throughput as the single-batch (pre-streaming) path."""
+
+
+def _resolve_chunk_size(record_concurrency: int | None,
+                        record_region_concurrency: int | None) -> int:
+    """Page chunk size for one backend.run() call.
+
+    Covers both whole-page backends (``concurrent_requests``) and the
+    region backend (``region_concurrency``) by taking the larger; falls
+    back to the baseline when both are unset (e.g. CPU / hosted profiles
+    that don't autoscale)."""
+    concurrency = max(
+        record_concurrency or 0,
+        record_region_concurrency or 0,
+    )
+    return max(
+        _PAGE_CHUNK_BASELINE,
+        _PAGE_CHUNK_CONCURRENCY_MULT * concurrency,
+    )
+
+
 def _run_one_model(
     *,
     model_name: str,
-    pages: list,
-    page_by_id: dict,
+    pages_iter,
     normalizer_overrides: dict,
     exporter,
     reference_adapter: ReferenceAdapter | None,
@@ -864,7 +967,7 @@ def _run_one_model(
         normalizer = registry.get("normalizers", normalizer_name)()
     except Exception as e:
         log.error("[%s] setup failed: %s", model_name, e)
-        return _ModelRunResult(ok=0, failed=len(pages), run_seconds=0.0)
+        return _ModelRunResult(ok=0, failed=0, run_seconds=0.0)
 
     # Resolve the autoscaler-decided concurrency / KV so each ExportRecord
     # carries the values that actually shaped the run (queryable per-row
@@ -873,143 +976,68 @@ def _run_one_model(
     record_concurrency, record_region_concurrency, record_kv = (
         _autoscale_values_for_profile(profile)
     )
+    chunk_size = _resolve_chunk_size(record_concurrency, record_region_concurrency)
 
     log.info(
-        "[%s] starting (backend=%s, runtime=%s, normalizer=%s)",
-        model_name, profile.backend, profile.runtime, normalizer_name,
+        "[%s] starting (backend=%s, runtime=%s, normalizer=%s, chunk_size=%d)",
+        model_name, profile.backend, profile.runtime, normalizer_name, chunk_size,
     )
 
     try:
         with metrics.stage(f"{model_name}.prepare"):
-            inv = backend.prepare(profile, pages)
-        with metrics.stage(f"{model_name}.run"):
-            raws = list(backend.run(inv))
+            inv = backend.prepare(profile)
     except BackendError as e:
-        log.error("[%s] backend failed: %s", model_name, e)
-        return _ModelRunResult(
-            ok=0,
-            failed=len(pages),
-            run_seconds=metrics.stage_seconds.get(f"{model_name}.run", 0.0),
-        )
+        log.error("[%s] prepare failed: %s", model_name, e)
+        return _ModelRunResult(ok=0, failed=0, run_seconds=0.0)
 
     prepare_seconds = metrics.stage_seconds.get(f"{model_name}.prepare", 0.0)
-    run_seconds_total = metrics.stage_seconds.get(f"{model_name}.run", 0.0)
-    pages_attempted = max(len(raws), 1)
-    run_seconds_per_page = run_seconds_total / pages_attempted
 
     ok = 0
     failed = 0
     accumulated_comparisons: list[ComparisonResult] = []
-    for raw in raws:
-        page = page_by_id.get(raw.page_id)
-        if page is None:
-            failed += 1
-            log.warning("model %s returned unknown page_id %r", model_name, raw.page_id)
-            continue
-        if raw.error:
-            failed += 1
-            log.warning("model %s page %s reported error: %s", model_name, page.file_id, raw.error)
-            continue
-        try:
-            t_norm0 = time.perf_counter()
-            with metrics.stage(f"{model_name}.normalize"):
-                doc = normalizer.normalize(raw, page, profile)
-            normalize_seconds = time.perf_counter() - t_norm0
-        except NormalizerError as e:
-            failed += 1
-            log.warning("normalizer failed for %s/%s: %s", model_name, page.file_id, e)
-            continue
+    t_run0 = time.perf_counter()
 
-        item_count, text_length, markdown, text = _doc_stats(doc)
-
-        reference = None
-        if reference_adapter is not None:
-            try:
-                reference = reference_adapter.get(page)
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "reference adapter failed for %s/%s: %s",
-                    model_name, page.file_id, e,
-                )
-
-        page_comparisons: dict[str, ComparisonResult] = {}
-        if reference is not None and comparisons:
-            view_pred = PredictionView(
-                page_id=page.page_id,
-                label=model_name,
-                text=text,
-                document=doc,
-            )
-            view_base = BaselineView(
-                page_id=page.page_id,
-                label=reference_adapter.name if reference_adapter else "reference",
-                text=reference.text,
-                document=reference.document,
-                provenance=reference.provenance,
-            )
-            for cmp in comparisons:
-                try:
-                    result = cmp.compare(view_pred, view_base)
-                except Exception as e:  # noqa: BLE001
-                    log.warning(
-                        "comparison %s failed for %s/%s: %s",
-                        cmp.name, model_name, page.file_id, e,
+    try:
+        with metrics.stage(f"{model_name}.run"):
+            for chunk in _chunked(pages_iter, chunk_size):
+                for page, raw in backend.run(inv, chunk):
+                    # ``run_seconds_total`` / ``..._per_page`` are stamped
+                    # with the cumulative wall-clock since prepare finished.
+                    # Early records get understated totals; the final record
+                    # has the accurate full-run number. Cumulative-and-rolling
+                    # is the streaming-friendly approximation of what used to
+                    # be a single post-hoc value applied to every row.
+                    elapsed_run = time.perf_counter() - t_run0
+                    handled = _process_one(
+                        model_name=model_name,
+                        page=page,
+                        raw=raw,
+                        profile=profile,
+                        normalizer=normalizer,
+                        exporter=exporter,
+                        reference_adapter=reference_adapter,
+                        comparisons=comparisons,
+                        metrics=metrics,
+                        gpu=gpu,
+                        prepare_seconds=prepare_seconds,
+                        run_seconds_so_far=elapsed_run,
+                        pages_attempted_so_far=ok + failed + 1,
+                        record_kv=record_kv,
+                        record_concurrency=record_concurrency,
+                        record_region_concurrency=record_region_concurrency,
+                        accumulated_comparisons=accumulated_comparisons,
                     )
-                    continue
-                if result is not None:
-                    page_comparisons[cmp.name] = result
-                    accumulated_comparisons.append(result)
-
-        # Close the cost recorder's page (if the backend opened one — only
-        # LiteLLM-routed backends do). Compute gpu_time_cost from elapsed
-        # and the active GpuConfig so the column is comparable across
-        # GPUs without re-deriving downstream.
-        cost_metrics = cost_recorder.close_page(page.page_id)
-        if cost_metrics is not None:
-            elapsed_s = cost_metrics.elapsed_seconds
-            gpu_time_cost = elapsed_s / 3600.0 * gpu.cost_per_hour
-            input_tokens = cost_metrics.input_tokens
-            output_tokens = cost_metrics.output_tokens
-            litellm_cost = cost_metrics.litellm_cost
-        else:
-            elapsed_s = None
-            gpu_time_cost = None
-            input_tokens = None
-            output_tokens = None
-            litellm_cost = None
-
-        record = ExportRecord(
-            page=page,
-            model=model_name,
-            document=doc,
-            raw=raw,
-            reference=reference,
-            markdown=markdown,
-            text=text,
-            metrics={
-                "prepare_seconds": round(prepare_seconds, 4),
-                "run_seconds_total": round(run_seconds_total, 4),
-                "run_seconds_per_page": round(run_seconds_per_page, 4),
-                "normalize_seconds": round(normalize_seconds, 4),
-                "tokens": raw.tokens,
-                "item_count": item_count,
-                "text_length": text_length,
-            },
-            comparisons=page_comparisons,
-            gpu_type=gpu.type,
-            provider=gpu.provider,
-            cost_per_hour=gpu.cost_per_hour,
-            elapsed_seconds=elapsed_s,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            litellm_cost=litellm_cost,
-            gpu_time_cost=gpu_time_cost,
-            kv_cache_memory_bytes=record_kv,
-            concurrent_requests=record_concurrency,
-            region_concurrency=record_region_concurrency,
-        )
-        exporter.write(record)
-        ok += 1
+                    if handled == "ok":
+                        ok += 1
+                    else:
+                        failed += 1
+                # Chunk goes out of scope here; refcount-GC reclaims the
+                # decoded PIL images before the next chunk's pages get
+                # pulled out of the source iterator.
+    except BackendError as e:
+        log.error("[%s] backend failed: %s", model_name, e)
+        run_seconds = metrics.stage_seconds.get(f"{model_name}.run", time.perf_counter() - t_run0)
+        return _ModelRunResult(ok=ok, failed=failed, run_seconds=run_seconds)
 
     metrics.add_pages(ok=ok, failed=failed)
     run_seconds = metrics.stage_seconds.get(f"{model_name}.run", 0.0)
@@ -1023,6 +1051,137 @@ def _run_one_model(
         run_seconds=run_seconds,
         comparison_results=accumulated_comparisons,
     )
+
+
+def _process_one(
+    *,
+    model_name: str,
+    page,
+    raw,
+    profile,
+    normalizer,
+    exporter,
+    reference_adapter: ReferenceAdapter | None,
+    comparisons: list[Comparison],
+    metrics: MetricsCollector,
+    gpu: GpuConfig,
+    prepare_seconds: float,
+    run_seconds_so_far: float,
+    pages_attempted_so_far: int,
+    record_kv: int | None,
+    record_concurrency: int | None,
+    record_region_concurrency: int | None,
+    accumulated_comparisons: list[ComparisonResult],
+) -> str:
+    """Normalize + compare + export one (page, raw). Returns 'ok' or 'failed'.
+
+    Split out of ``_run_one_model`` only so the streaming loop body stays
+    legible; no semantic change vs. the previous per-row block."""
+    if raw.error:
+        log.warning("model %s page %s reported error: %s", model_name, page.file_id, raw.error)
+        cost_recorder.close_page(page.page_id)
+        return "failed"
+    try:
+        t_norm0 = time.perf_counter()
+        with metrics.stage(f"{model_name}.normalize"):
+            doc = normalizer.normalize(raw, page, profile)
+        normalize_seconds = time.perf_counter() - t_norm0
+    except NormalizerError as e:
+        log.warning("normalizer failed for %s/%s: %s", model_name, page.file_id, e)
+        cost_recorder.close_page(page.page_id)
+        return "failed"
+
+    item_count, text_length, markdown, text = _doc_stats(doc)
+
+    reference = None
+    if reference_adapter is not None:
+        try:
+            reference = reference_adapter.get(page)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "reference adapter failed for %s/%s: %s",
+                model_name, page.file_id, e,
+            )
+
+    page_comparisons: dict[str, ComparisonResult] = {}
+    if reference is not None and comparisons:
+        view_pred = PredictionView(
+            page_id=page.page_id,
+            label=model_name,
+            text=text,
+            document=doc,
+        )
+        view_base = BaselineView(
+            page_id=page.page_id,
+            label=reference_adapter.name if reference_adapter else "reference",
+            text=reference.text,
+            document=reference.document,
+            provenance=reference.provenance,
+        )
+        for cmp in comparisons:
+            try:
+                result = cmp.compare(view_pred, view_base)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "comparison %s failed for %s/%s: %s",
+                    cmp.name, model_name, page.file_id, e,
+                )
+                continue
+            if result is not None:
+                page_comparisons[cmp.name] = result
+                accumulated_comparisons.append(result)
+
+    # Close the cost recorder's page (if the backend opened one — only
+    # LiteLLM-routed backends do). Compute gpu_time_cost from elapsed
+    # and the active GpuConfig so the column is comparable across
+    # GPUs without re-deriving downstream.
+    cost_metrics = cost_recorder.close_page(page.page_id)
+    if cost_metrics is not None:
+        elapsed_s = cost_metrics.elapsed_seconds
+        gpu_time_cost = elapsed_s / 3600.0 * gpu.cost_per_hour
+        input_tokens = cost_metrics.input_tokens
+        output_tokens = cost_metrics.output_tokens
+        litellm_cost = cost_metrics.litellm_cost
+    else:
+        elapsed_s = None
+        gpu_time_cost = None
+        input_tokens = None
+        output_tokens = None
+        litellm_cost = None
+
+    run_seconds_per_page = run_seconds_so_far / max(pages_attempted_so_far, 1)
+    record = ExportRecord(
+        page=page,
+        model=model_name,
+        document=doc,
+        raw=raw,
+        reference=reference,
+        markdown=markdown,
+        text=text,
+        metrics={
+            "prepare_seconds": round(prepare_seconds, 4),
+            "run_seconds_total": round(run_seconds_so_far, 4),
+            "run_seconds_per_page": round(run_seconds_per_page, 4),
+            "normalize_seconds": round(normalize_seconds, 4),
+            "tokens": raw.tokens,
+            "item_count": item_count,
+            "text_length": text_length,
+        },
+        comparisons=page_comparisons,
+        gpu_type=gpu.type,
+        provider=gpu.provider,
+        cost_per_hour=gpu.cost_per_hour,
+        elapsed_seconds=elapsed_s,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        litellm_cost=litellm_cost,
+        gpu_time_cost=gpu_time_cost,
+        kv_cache_memory_bytes=record_kv,
+        concurrent_requests=record_concurrency,
+        region_concurrency=record_region_concurrency,
+    )
+    exporter.write(record)
+    return "ok"
 
 
 def _parse_source_args(raw: list[str]) -> dict[str, Any]:

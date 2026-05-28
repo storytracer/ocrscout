@@ -285,13 +285,24 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         # _row_to_page is a network-bound S3 GET + JP2 decode; threading is
         # dramatically faster than the sequential loop. Pages are yielded in
         # completion order — downstream OCR doesn't care about ordering.
+        #
+        # Manual try/finally (not ``with``) so the early-close path can
+        # call ``shutdown(cancel_futures=True)``: by default the ``with``
+        # statement's __exit__ calls ``shutdown(wait=True)`` which blocks
+        # until every queued future runs. The orchestrator peeks the
+        # first page to detect an empty source, then continues — without
+        # cancel_futures, that peek would force all ``len(rows)`` S3
+        # fetches to drain before the generator could be GC'd.
         workers = min(self.concurrent_fetches, len(rows))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = [pool.submit(self._row_to_page, row) for row in rows]
             for fut in as_completed(futures):
                 page = fut.result()
                 if page is not None:
                     yield page
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def iter_volumes(self) -> Iterator[Volume]:
         self._ensure_query_run()

@@ -149,9 +149,7 @@ class LiteLLMBackend(ModelBackend):
     endpoint). LocalRunner uses this flag to know whether to spawn
     anything for this profile."""
 
-    def prepare(
-        self, profile: ModelProfile, pages: Sequence[PageImage]
-    ) -> BackendInvocation:
+    def prepare(self, profile: ModelProfile) -> BackendInvocation:
         proxy_url = _resolve_proxy_url(profile)
         prompt = _resolve_prompt_template(profile)
 
@@ -162,20 +160,23 @@ class LiteLLMBackend(ModelBackend):
             kind="http",
             endpoint=proxy_url,
             profile=profile,
-            pages=[p.page_id for p in pages],
-            extra={
-                "pages_runtime": list(pages),
-                "prompt": prompt,
-            },
+            pages=[],
+            extra={"prompt": prompt},
         )
 
-    def run(self, invocation: BackendInvocation) -> Iterator[RawOutput]:
+    def run(
+        self,
+        invocation: BackendInvocation,
+        pages: Sequence[PageImage],
+    ) -> Iterator[tuple[PageImage, RawOutput]]:
         profile = invocation.profile
         proxy_url = invocation.endpoint or ""
         if not proxy_url:
             raise BackendError("LiteLLMBackend.run: no proxy URL on invocation")
 
-        pages: list[PageImage] = list(invocation.extra.get("pages_runtime", []))
+        pages_list: list[PageImage] = list(pages)
+        if not pages_list:
+            return
         prompt: str = invocation.extra["prompt"]
         timeout = float(
             profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT)
@@ -185,16 +186,20 @@ class LiteLLMBackend(ModelBackend):
         )
         sampling = _split_sampling(profile.sampling_args or {})
         prefix = f"[{profile.name}]"
+        total = len(pages_list)
         log.info(
-            "%s starting %d page(s) against %s (%d-way concurrent)",
-            prefix, len(pages), proxy_url, concurrent_requests,
+            "%s batch of %d page(s) against %s (%d-way concurrent)",
+            prefix, total, proxy_url, concurrent_requests,
         )
 
-        results: dict[str, RawOutput] = {}
         completed = 0
-        total = len(pages)
         t0 = time.perf_counter()
 
+        # Yield in completion order: lets the orchestrator export and drop
+        # each PageImage as soon as its raw arrives instead of waiting for
+        # the whole batch. Page ordering across the run loses meaning here
+        # anyway — concurrent vLLM batching reshuffles work, and the parquet
+        # exporter keys by page_id.
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=concurrent_requests
         ) as ex:
@@ -208,7 +213,7 @@ class LiteLLMBackend(ModelBackend):
                     sampling=sampling,
                     timeout=timeout,
                 ): page
-                for page in pages
+                for page in pages_list
             }
             for fut in concurrent.futures.as_completed(futures):
                 page = futures[fut]
@@ -221,7 +226,6 @@ class LiteLLMBackend(ModelBackend):
                         payload="",
                         error=f"{type(e).__name__}: {e}",
                     )
-                results[page.page_id] = raw
                 completed += 1
                 if raw.error:
                     log.warning(
@@ -233,16 +237,12 @@ class LiteLLMBackend(ModelBackend):
                         "%s page %d/%d %s ok",
                         prefix, completed, total, page.file_id,
                     )
+                yield page, raw
 
         log.info(
-            "%s finished %d pages in %.1fs",
+            "%s batch of %d pages done in %.1fs",
             prefix, total, time.perf_counter() - t0,
         )
-
-        # Yield in input order so downstream record-writers see the same
-        # ordering they emitted source pages in.
-        for page in pages:
-            yield results[page.page_id]
 
 
 def _post_page(
