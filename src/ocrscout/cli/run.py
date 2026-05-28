@@ -889,65 +889,12 @@ def _filter_done(it, done_set):
             yield page
 
 
-def _chunked(it, size: int):
-    """Yield successive lists of up to ``size`` items from ``it``.
-
-    Each chunk is materialised as a list so the backend can size its
-    internal thread pool exactly; between chunks the previous chunk's
-    PageImages (with their decoded PIL bytes) drop out of scope and
-    Python's refcount-GC reclaims the image memory before the next
-    chunk is decoded. Without this boundary, the source's
-    ThreadPoolExecutor would keep filling its as_completed queue with
-    finished PageImages while the backend processed earlier ones —
-    O(sample) PIL images resident at peak."""
-    if size <= 0:
-        raise ValueError(f"_chunked size must be positive, got {size}")
-    while True:
-        chunk = list(itertools.islice(it, size))
-        if not chunk:
-            return
-        yield chunk
-
-
 @dataclass
 class _ModelRunResult:
     ok: int
     failed: int
     run_seconds: float
     comparison_results: list[ComparisonResult] = dc_field(default_factory=list)
-
-
-_PAGE_CHUNK_BASELINE = 32
-"""Minimum chunk size when feeding pages into a backend's ``run()``. Picked
-large enough that even a cold model's per-batch overhead (cudagraph
-warmup, HTTP keep-alive setup) amortises, small enough that 32 PIL
-images (~500 MB on 2000x3000 BHL JP2s) sit comfortably in RAM."""
-
-_PAGE_CHUNK_CONCURRENCY_MULT = 2
-"""Multiplier on the backend's autoscaler-decided concurrency. Setting
-chunk = ``2 × concurrent_requests`` means while the backend is processing
-the back half of a chunk the front half's futures are already done — no
-idle workers between chunks — at the cost of ~2× the per-chunk memory
-footprint vs. chunk = concurrency. Empirically gives the same total
-throughput as the single-batch (pre-streaming) path."""
-
-
-def _resolve_chunk_size(record_concurrency: int | None,
-                        record_region_concurrency: int | None) -> int:
-    """Page chunk size for one backend.run() call.
-
-    Covers both whole-page backends (``concurrent_requests``) and the
-    region backend (``region_concurrency``) by taking the larger; falls
-    back to the baseline when both are unset (e.g. CPU / hosted profiles
-    that don't autoscale)."""
-    concurrency = max(
-        record_concurrency or 0,
-        record_region_concurrency or 0,
-    )
-    return max(
-        _PAGE_CHUNK_BASELINE,
-        _PAGE_CHUNK_CONCURRENCY_MULT * concurrency,
-    )
 
 
 def _run_one_model(
@@ -977,11 +924,10 @@ def _run_one_model(
     record_concurrency, record_region_concurrency, record_kv = (
         _autoscale_values_for_profile(profile)
     )
-    chunk_size = _resolve_chunk_size(record_concurrency, record_region_concurrency)
 
     log.info(
-        "[%s] starting (backend=%s, runtime=%s, normalizer=%s, chunk_size=%d)",
-        model_name, profile.backend, profile.runtime, normalizer_name, chunk_size,
+        "[%s] starting (backend=%s, runtime=%s, normalizer=%s)",
+        model_name, profile.backend, profile.runtime, normalizer_name,
     )
 
     try:
@@ -998,43 +944,47 @@ def _run_one_model(
     accumulated_comparisons: list[ComparisonResult] = []
     t_run0 = time.perf_counter()
 
+    # Stream the full per-model page iterator straight into ``backend.run``.
+    # Chunking is unnecessary now that PageImages are lazy stubs and the
+    # backend's submit pump caps in-flight at ``concurrent_requests``: with
+    # no decoded PIL bytes resident on the chunk list and a sliding-window
+    # futures map inside the backend, the per-batch boundary added a sync
+    # point (worker pool drains at end of chunk, restarts at start of next)
+    # for no memory benefit. Backends materialize the iterator themselves
+    # if they need ``len()`` for progress logging.
     try:
         with metrics.stage(f"{model_name}.run"):
-            for chunk in _chunked(pages_iter, chunk_size):
-                for page, raw in backend.run(inv, chunk):
-                    # ``run_seconds_total`` / ``..._per_page`` are stamped
-                    # with the cumulative wall-clock since prepare finished.
-                    # Early records get understated totals; the final record
-                    # has the accurate full-run number. Cumulative-and-rolling
-                    # is the streaming-friendly approximation of what used to
-                    # be a single post-hoc value applied to every row.
-                    elapsed_run = time.perf_counter() - t_run0
-                    handled = _process_one(
-                        model_name=model_name,
-                        page=page,
-                        raw=raw,
-                        profile=profile,
-                        normalizer=normalizer,
-                        exporter=exporter,
-                        reference_adapter=reference_adapter,
-                        comparisons=comparisons,
-                        metrics=metrics,
-                        gpu=gpu,
-                        prepare_seconds=prepare_seconds,
-                        run_seconds_so_far=elapsed_run,
-                        pages_attempted_so_far=ok + failed + 1,
-                        record_kv=record_kv,
-                        record_concurrency=record_concurrency,
-                        record_region_concurrency=record_region_concurrency,
-                        accumulated_comparisons=accumulated_comparisons,
-                    )
-                    if handled == "ok":
-                        ok += 1
-                    else:
-                        failed += 1
-                # Chunk goes out of scope here; refcount-GC reclaims the
-                # decoded PIL images before the next chunk's pages get
-                # pulled out of the source iterator.
+            for page, raw in backend.run(inv, pages_iter):
+                # ``run_seconds_total`` / ``..._per_page`` are stamped
+                # with the cumulative wall-clock since prepare finished.
+                # Early records get understated totals; the final record
+                # has the accurate full-run number. Cumulative-and-rolling
+                # is the streaming-friendly approximation of what used to
+                # be a single post-hoc value applied to every row.
+                elapsed_run = time.perf_counter() - t_run0
+                handled = _process_one(
+                    model_name=model_name,
+                    page=page,
+                    raw=raw,
+                    profile=profile,
+                    normalizer=normalizer,
+                    exporter=exporter,
+                    reference_adapter=reference_adapter,
+                    comparisons=comparisons,
+                    metrics=metrics,
+                    gpu=gpu,
+                    prepare_seconds=prepare_seconds,
+                    run_seconds_so_far=elapsed_run,
+                    pages_attempted_so_far=ok + failed + 1,
+                    record_kv=record_kv,
+                    record_concurrency=record_concurrency,
+                    record_region_concurrency=record_region_concurrency,
+                    accumulated_comparisons=accumulated_comparisons,
+                )
+                if handled == "ok":
+                    ok += 1
+                else:
+                    failed += 1
     except BackendError as e:
         log.error("[%s] backend failed: %s", model_name, e)
         run_seconds = metrics.stage_seconds.get(f"{model_name}.run", time.perf_counter() - t_run0)
