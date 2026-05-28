@@ -44,6 +44,13 @@ dependencies = [
     # records per-page tokens/cost. The proxy binary (``litellm[proxy]``)
     # is shipped under the ``vllm`` extra for daemon spawns.
     "litellm>=1.50.0",
+    # litellm lazy-imports tenacity *only* when ``num_retries`` actually
+    # has to fire on a failed attempt — so a missing dep doesn't surface
+    # until the first retryable transient mid-run, then every retry path
+    # dies with ``tenacity import failed please run pip install tenacity``.
+    # We pass ``num_retries`` on every completion call, so tenacity is a
+    # hard requirement for us, not an optional litellm extra.
+    "tenacity>=8.0",
     # nvitop wraps libnvml.so via nvidia-ml-py; pure-Python install in seconds,
     # no GPU runtime deps. Used by managed-mode GPU budgeting/telemetry.
     # Gracefully returns no devices on CPU-only hosts.
