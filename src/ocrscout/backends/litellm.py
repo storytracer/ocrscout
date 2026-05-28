@@ -43,7 +43,19 @@ from ocrscout.types import BackendInvocation, PageImage, RawOutput
 
 log = logging.getLogger(__name__)
 
-_DEFAULT_REQUEST_TIMEOUT = 600.0
+_DEFAULT_REQUEST_TIMEOUT = 300.0
+"""Per-request timeout (seconds) passed to ``litellm.completion``. Five
+minutes is already 5–10× the steady-state per-page latency for every
+shipped VLM profile on every supported GPU; anything past that is dead
+weight, not slow. Combined with :data:`_DEFAULT_NUM_RETRIES`, worst-case
+wall-clock per page is roughly ``timeout * (1 + num_retries)``."""
+_DEFAULT_NUM_RETRIES = 2
+"""How many retries LiteLLM performs on retryable failures (rate limits,
+5xx, timeouts). LiteLLM classifies exceptions itself — it doesn't retry
+``ContextWindowExceededError`` / ``BadRequestError`` / auth errors,
+which would be deterministic re-failures. Two retries with exponential
+backoff covers transient vLLM overload + sporadic decode glitches
+without ballooning total wall-clock."""
 _DEFAULT_CONCURRENT_REQUESTS = 8
 """Fallback per-page client-side concurrency. The GPU-aware autoscaler in
 :mod:`ocrscout.runners._preflight` normally fills this in via
@@ -181,6 +193,9 @@ class LiteLLMBackend(ModelBackend):
         timeout = float(
             profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT)
         )
+        num_retries = int(
+            profile.backend_args.get("num_retries", _DEFAULT_NUM_RETRIES)
+        )
         concurrent_requests = max(
             1, _resolve_concurrent_requests(profile),
         )
@@ -227,6 +242,7 @@ class LiteLLMBackend(ModelBackend):
                 prompt=prompt,
                 sampling=sampling,
                 timeout=timeout,
+                num_retries=num_retries,
             )
             in_flight[fut] = p
             return True
@@ -284,6 +300,7 @@ def _post_page(
     prompt: str,
     sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
+    num_retries: int,
 ) -> RawOutput:
     """POST one page through LiteLLM and return ``RawOutput``.
 
@@ -294,6 +311,13 @@ def _post_page(
     base64-encode for the message body, POST, release. Memory ceiling is
     one decoded RGB + one JPEG-base64 string per concurrent worker, instead
     of the chunk-wide buffer the previous design held.
+
+    Retries are delegated to LiteLLM via ``num_retries`` — it classifies
+    retryable exceptions (rate limits, 5xx, timeouts) and applies its own
+    exponential backoff. We don't wrap with tenacity because doing so on
+    top of ``num_retries`` would multiply attempts (``tenacity × litellm``)
+    and we'd have to re-derive the "is this retryable" classification by
+    hand.
     """
     top_level, extra_body = sampling
     try:
@@ -327,6 +351,7 @@ def _post_page(
             api_key=os.environ.get("LITELLM_API_KEY", "ocrscout-dummy"),
             messages=messages,
             timeout=timeout,
+            num_retries=num_retries,
             metadata={"page_id": page.page_id, "model_name": profile.name},
             extra_body=extra_body or None,
             **top_level,
@@ -336,7 +361,10 @@ def _post_page(
             page_id=page.page_id,
             output_format=profile.output_format,
             payload="",
-            error=f"{type(e).__name__}: {e}",
+            error=(
+                f"{type(e).__name__}: {e} "
+                f"(after {num_retries} retr{'y' if num_retries == 1 else 'ies'})"
+            ),
         )
     finally:
         del messages

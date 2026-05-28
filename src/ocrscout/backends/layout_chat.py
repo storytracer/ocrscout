@@ -81,7 +81,17 @@ OCRSCOUT_DETECTOR_TORCH_THREADS_ENV = "OCRSCOUT_DETECTOR_TORCH_THREADS"
 """Runtime override for ``torch.set_num_threads(V)`` — PyTorch's intra-op
 parallelism per detector forward. Default is the leftover CPU budget split
 evenly across detector workers (floor 1)."""
-_DEFAULT_REQUEST_TIMEOUT = 600.0
+_DEFAULT_REQUEST_TIMEOUT = 300.0
+"""Per-region timeout (seconds) passed to ``litellm.completion``. Regions
+are smaller than whole pages, so 5 minutes is a generous ceiling — most
+finish in under 10s. Combined with :data:`_DEFAULT_NUM_RETRIES` and
+``region_concurrency`` workers running in parallel, the bound on per-page
+wall-clock for a typical layout-chat page is dominated by the slowest
+region, not the cumulative timeout."""
+_DEFAULT_NUM_RETRIES = 2
+"""How many retries LiteLLM performs per region on retryable failures.
+See :data:`ocrscout.backends.litellm._DEFAULT_NUM_RETRIES` for the
+rationale — same classification, same trade-off, applied per region."""
 _MODELS_PROBE_TIMEOUT = 15.0
 # ``elapsed`` above this in ``_assemble_raw`` indicates the page sat in
 # ``done_queue`` (or its regions sat in flight) far longer than any
@@ -89,10 +99,11 @@ _MODELS_PROBE_TIMEOUT = 15.0
 # stalled. Log the page at WARNING so the staleness is immediately
 # visible in `-q` runs and grep-friendly in CI output; the default INFO
 # "ok" line otherwise buries a 9-hour wait in plain text. The threshold
-# is set to twice the default request timeout — anything past 2× the
-# longest legitimate in-flight wait can't be explained by ordinary
-# slow-region cases.
-_STALL_WARN_ELAPSED_S = _DEFAULT_REQUEST_TIMEOUT * 2
+# accounts for the worst-case retry budget — a page with R regions where
+# each could spend ``timeout * (1 + num_retries)`` worst-case, run with
+# ``region_concurrency`` in flight, would still finish well under
+# ``timeout * (1 + num_retries) * 2`` unless something has gone wrong.
+_STALL_WARN_ELAPSED_S = _DEFAULT_REQUEST_TIMEOUT * (1 + _DEFAULT_NUM_RETRIES) * 2
 # Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
 # small same-row jitter without conflating rows on tightly-packed pages.
 _READING_ORDER_ROW_PX = 50
@@ -305,6 +316,9 @@ class LayoutChatBackend(ModelBackend):
         timeout = float(
             profile.backend_args.get("request_timeout", _DEFAULT_REQUEST_TIMEOUT)
         )
+        num_retries = int(
+            profile.backend_args.get("num_retries", _DEFAULT_NUM_RETRIES)
+        )
         region_concurrency = max(1, _resolve_region_concurrency(profile))
         torch_threads = _resolve_torch_threads_per_op(profile, n_workers)
         sampling = _split_sampling(profile.sampling_args or {})
@@ -452,6 +466,7 @@ class LayoutChatBackend(ModelBackend):
                         profile=profile,
                         sampling=sampling,
                         timeout=timeout,
+                        num_retries=num_retries,
                         log_prefix=prefix,
                         state_lock=state_lock,
                         inflight_sem=inflight_sem,
@@ -612,6 +627,7 @@ def _detector_worker_loop(
     profile: ModelProfile,
     sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
+    num_retries: int,
     log_prefix: str,
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
@@ -649,6 +665,7 @@ def _detector_worker_loop(
                 proxy_url=proxy_url,
                 sampling=sampling,
                 timeout=timeout,
+                num_retries=num_retries,
                 state_lock=state_lock,
                 inflight_sem=inflight_sem,
                 mark_dispatched=mark_dispatched,
@@ -771,6 +788,7 @@ def _submit_state(
     proxy_url: str,
     sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
+    num_retries: int,
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
     mark_dispatched: Callable[[], None],
@@ -829,6 +847,7 @@ def _submit_state(
                 proxy_url=proxy_url,
                 sampling=sampling,
                 timeout=timeout,
+                num_retries=num_retries,
                 state_lock=state_lock,
                 inflight_sem=inflight_sem,
                 publish_page=publish_page,
@@ -846,6 +865,7 @@ def _make_region_worker(
     proxy_url: str,
     sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
+    num_retries: int,
     state_lock: threading.Lock,
     inflight_sem: threading.BoundedSemaphore,
     publish_page: Callable[[_PageState], None],
@@ -866,6 +886,7 @@ def _make_region_worker(
                 proxy_url=proxy_url,
                 sampling=sampling,
                 timeout=timeout,
+                num_retries=num_retries,
             )
         except Exception as e:  # noqa: BLE001  defense-in-depth; _post_region catches its own
             block = _failed_block(region, error=f"{type(e).__name__}: {e}")
@@ -985,8 +1006,16 @@ def _post_region(
     proxy_url: str,
     sampling: tuple[dict[str, Any], dict[str, Any]],
     timeout: float,
+    num_retries: int,
 ) -> dict[str, Any]:
-    """POST one cropped region through LiteLLM; return a layout-JSON block dict."""
+    """POST one cropped region through LiteLLM; return a layout-JSON block dict.
+
+    Retries are delegated to LiteLLM via ``num_retries``. See
+    :func:`ocrscout.backends.litellm._post_page` for the rationale —
+    LiteLLM's own exception classification (RateLimitError /
+    ContextWindowExceededError / etc.) determines what's retryable, so
+    we don't second-guess it with an outer tenacity wrapper.
+    """
     if page.image is None:
         return _failed_block(region, error="page has no in-memory image")
 
@@ -1006,6 +1035,7 @@ def _post_region(
             api_key=os.environ.get("LITELLM_API_KEY", "ocrscout-dummy"),
             messages=messages,
             timeout=timeout,
+            num_retries=num_retries,
             metadata={
                 "page_id": page.page_id,
                 "region_id": region.id,
@@ -1015,7 +1045,13 @@ def _post_region(
             **top_level,
         )
     except Exception as e:  # noqa: BLE001
-        return _failed_block(region, error=f"{type(e).__name__}: {e}")
+        return _failed_block(
+            region,
+            error=(
+                f"{type(e).__name__}: {e} "
+                f"(after {num_retries} retr{'y' if num_retries == 1 else 'ies'})"
+            ),
+        )
 
     text = _extract_text(resp)
     return _ok_block(region, text=text)
