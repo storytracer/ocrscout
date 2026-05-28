@@ -388,7 +388,21 @@ class LayoutChatBackend(ModelBackend):
                 publishers strictly serialize: state_N goes in before
                 state_N+1, and ``_SENTINEL`` lands after the final state.
                 ``Queue.put`` doesn't block on an unbounded queue, so
-                holding the lock is fine."""
+                holding the lock is fine.
+
+                Releases the pinned decoded image *before* taking the
+                publish lock — once the last region resolved, no other
+                thread will read ``state.page.image`` again, and freeing
+                it here drops the largest single allocation per page
+                before the consumer-side flow (normalizer + exporter)
+                even sees the state."""
+                img = state.page.image
+                if img is not None:
+                    try:
+                        img.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    state.page.image = None
                 with pages_completed_lock:
                     pages_completed[0] += 1
                     is_last = pages_completed[0] >= total_pages
@@ -610,8 +624,43 @@ def _detect_one_page(
     ``_PageState`` — either with ``ordered`` populated (success), or
     with ``detector_error`` set (per-page detector exception), or with
     ``total_regions == 0`` (empty detection). Never raises; per-page
-    failures are kept local so sibling pages still progress."""
+    failures are kept local so sibling pages still progress.
+
+    Pins the decoded PIL image onto ``page.image`` for the lifetime of
+    this page's region fan-out. The detector reads from ``page.image``
+    and the region workers crop from it concurrently; ``_publish_page``
+    closes + clears it when the last region resolves (or immediately, on
+    a detector-error / empty-detection path)."""
     t_start = time.perf_counter()
+
+    if page.image is None and page.image_loader is not None:
+        try:
+            page.image = page.image_loader()
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "%s page %d/%d %s image load FAIL: %s",
+                log_prefix, page_idx, total_pages, page.file_id, e,
+            )
+            return _PageState(
+                page=page,
+                page_idx=page_idx,
+                ordered=[],
+                total_regions=0,
+                remaining=0,
+                t_start=t_start,
+                detector_error=f"image load failed: {type(e).__name__}: {e}",
+            )
+
+    # Backfill page dims now that the image is in hand — the detector and
+    # downstream layout_json normalizer both read ``page.{width,height}``.
+    if page.image is not None and (page.width <= 0 or page.height <= 0):
+        try:
+            w, h = page.image.size
+            page.width = int(w)
+            page.height = int(h)
+        except (TypeError, ValueError):
+            pass
+
     try:
         regions = detector.detect(page)
     except Exception as e:  # noqa: BLE001

@@ -6,9 +6,10 @@ flow between them.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -21,8 +22,14 @@ if TYPE_CHECKING:
 class PageImage(BaseModel):
     """A single page image flowing through the pipeline.
 
-    ``image`` is the live PIL.Image and is intentionally not serialized — it is
-    runtime state. Use ``source_uri`` to recover the source if needed.
+    Image lifecycle: sources install ``image_loader`` (a zero-arg callable
+    that returns a fresh PIL.Image) instead of decoding eagerly; consumers
+    enter ``with page.open_image() as img:`` to load + close in a bounded
+    scope. ``image`` exists as an optional eager slot (defaults to ``None``)
+    that backends can pin for the lifetime of multi-step operations — e.g.
+    layout-aware OCR loads once, then fans out concurrent region crops
+    against the same decoded buffer before clearing it. Both fields are
+    runtime-only and excluded from serialization.
 
     ``page_id`` is the source-side raw identifier (BHL's PageID, an HF row id,
     a filename stem) used as the join key by the run loop, backends, and
@@ -40,14 +47,66 @@ class PageImage(BaseModel):
 
     page_id: str
     file_id: str
-    image: Any  # PIL.Image.Image at runtime
-    width: int
-    height: int
+    image: Any = Field(default=None, exclude=True, repr=False)
+    image_loader: Any = Field(default=None, exclude=True, repr=False)
+    width: int = 0
+    height: int = 0
     dpi: int | None = None
     source_uri: str | None = None
     barcode: str | None = None
     sequence: int | None = None
     extra: dict[str, Any] = Field(default_factory=dict)
+
+    @contextmanager
+    def open_image(self) -> Iterator[Any]:
+        """Yield a PIL Image scoped to this with-block.
+
+        If ``image`` is already set (a backend pinned it for cross-step
+        sharing), yield it untouched — whoever pinned it owns the close.
+        Otherwise call ``image_loader()``, yield the fresh image, and
+        close it on exit so the decoded RGB buffer is freed immediately.
+
+        Backfills ``width`` / ``height`` on first load so downstream
+        consumers (prompt substitution, normalizer page-size hints) see
+        real dimensions even when the source didn't decode upfront.
+
+        Raises ``RuntimeError`` if neither ``image`` nor ``image_loader``
+        is set — that's a contract violation by the source adapter.
+        Loader exceptions propagate; backends are expected to catch and
+        record them as per-page failures.
+        """
+        eager = self.image
+        if eager is not None:
+            self._backfill_dims(eager)
+            yield eager
+            return
+        loader = self.image_loader
+        if loader is None:
+            raise RuntimeError(
+                f"PageImage {self.page_id!r} has neither image nor image_loader"
+            )
+        img = loader()
+        try:
+            self._backfill_dims(img)
+            yield img
+        finally:
+            try:
+                img.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _backfill_dims(self, img: Any) -> None:
+        if self.width > 0 and self.height > 0:
+            return
+        size = getattr(img, "size", None)
+        if not size:
+            return
+        try:
+            w, h = size
+            self.width = int(w)
+            self.height = int(h)
+        except (TypeError, ValueError):
+            pass
 
 
 class Volume(BaseModel):

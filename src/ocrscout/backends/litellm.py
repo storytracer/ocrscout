@@ -195,49 +195,80 @@ class LiteLLMBackend(ModelBackend):
         completed = 0
         t0 = time.perf_counter()
 
-        # Yield in completion order: lets the orchestrator export and drop
-        # each PageImage as soon as its raw arrives instead of waiting for
-        # the whole batch. Page ordering across the run loses meaning here
-        # anyway — concurrent vLLM batching reshuffles work, and the parquet
-        # exporter keys by page_id.
+        # Streaming submit pump: keep at most ``concurrent_requests``
+        # futures in flight at any moment, refill on completion. Replaces
+        # the previous "submit-all-up-front" pattern that pinned every
+        # batch page in a futures dict for the lifetime of the slowest
+        # request — that pattern held the per-batch PageImage list resident
+        # alongside the in-flight base64 message bodies, and at concurrency
+        # 40 over an 80-page chunk it doubled the high-water mark for no
+        # throughput benefit (vLLM's continuous batching schedules
+        # whichever requests are POSTed, regardless of futures-dict size).
+        #
+        # Pages yield in completion order, so the orchestrator can export
+        # and drop each one as its raw arrives. ``pages_list`` references
+        # drain naturally as ``in_flight.pop`` returns each page; the only
+        # live PIL bytes are those inside the ``concurrent_requests``
+        # workers currently inside ``with page.open_image()`` in
+        # ``_post_page`` — a tight, predictable ceiling.
+        page_iter = iter(pages_list)
+        in_flight: dict[concurrent.futures.Future, PageImage] = {}
+
+        def _submit_one(ex: concurrent.futures.ThreadPoolExecutor) -> bool:
+            try:
+                p = next(page_iter)
+            except StopIteration:
+                return False
+            fut = ex.submit(
+                _post_page,
+                page=p,
+                profile=profile,
+                proxy_url=proxy_url,
+                prompt=prompt,
+                sampling=sampling,
+                timeout=timeout,
+            )
+            in_flight[fut] = p
+            return True
+
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=concurrent_requests
         ) as ex:
-            futures = {
-                ex.submit(
-                    _post_page,
-                    page=page,
-                    profile=profile,
-                    proxy_url=proxy_url,
-                    prompt=prompt,
-                    sampling=sampling,
-                    timeout=timeout,
-                ): page
-                for page in pages_list
-            }
-            for fut in concurrent.futures.as_completed(futures):
-                page = futures[fut]
-                try:
-                    raw = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    raw = RawOutput(
-                        page_id=page.page_id,
-                        output_format=profile.output_format,
-                        payload="",
-                        error=f"{type(e).__name__}: {e}",
-                    )
-                completed += 1
-                if raw.error:
-                    log.warning(
-                        "%s page %d/%d %s FAIL: %s",
-                        prefix, completed, total, page.file_id, raw.error,
-                    )
-                else:
-                    log.info(
-                        "%s page %d/%d %s ok",
-                        prefix, completed, total, page.file_id,
-                    )
-                yield page, raw
+            for _ in range(concurrent_requests):
+                if not _submit_one(ex):
+                    break
+            while in_flight:
+                done, _pending = concurrent.futures.wait(
+                    in_flight, return_when=concurrent.futures.FIRST_COMPLETED,
+                )
+                for fut in done:
+                    page = in_flight.pop(fut)
+                    try:
+                        raw = fut.result()
+                    except Exception as e:  # noqa: BLE001
+                        raw = RawOutput(
+                            page_id=page.page_id,
+                            output_format=profile.output_format,
+                            payload="",
+                            error=f"{type(e).__name__}: {e}",
+                        )
+                    completed += 1
+                    if raw.error:
+                        log.warning(
+                            "%s page %d/%d %s FAIL: %s",
+                            prefix, completed, total, page.file_id, raw.error,
+                        )
+                    else:
+                        log.info(
+                            "%s page %d/%d %s ok",
+                            prefix, completed, total, page.file_id,
+                        )
+                    # Backfill the freed slot before yielding so the next
+                    # POST starts encoding while the orchestrator processes
+                    # this one — keeps the GPU saturated across the
+                    # normalize + export tail of each page.
+                    _submit_one(ex)
+                    yield page, raw
 
         log.info(
             "%s batch of %d pages done in %.1fs",
@@ -258,17 +289,31 @@ def _post_page(
 
     Cost / tokens / elapsed flow into ``cost.recorder`` via the registered
     success_callback — keyed by the ``page_id`` we stamp into ``metadata``.
+
+    The decoded PIL image lives only inside ``page.open_image()`` — load,
+    base64-encode for the message body, POST, release. Memory ceiling is
+    one decoded RGB + one JPEG-base64 string per concurrent worker, instead
+    of the chunk-wide buffer the previous design held.
     """
-    if page.image is None:
+    top_level, extra_body = sampling
+    try:
+        with page.open_image() as img:
+            page_prompt = _per_page_prompt(prompt, page)
+            messages = _build_messages(img, page_prompt)
+    except FileNotFoundError as e:
         return RawOutput(
             page_id=page.page_id,
             output_format=profile.output_format,
             payload="",
-            error="page has no in-memory image",
+            error=f"image not found: {e}",
         )
-    top_level, extra_body = sampling
-    page_prompt = _per_page_prompt(prompt, page)
-    messages = _build_messages(page.image, page_prompt)
+    except Exception as e:  # noqa: BLE001
+        return RawOutput(
+            page_id=page.page_id,
+            output_format=profile.output_format,
+            payload="",
+            error=f"image load failed: {type(e).__name__}: {e}",
+        )
 
     cost_mod.recorder.open_page(page.page_id, profile.name)
 
@@ -293,6 +338,8 @@ def _post_page(
             payload="",
             error=f"{type(e).__name__}: {e}",
         )
+    finally:
+        del messages
 
     text, tokens = _extract_completion(resp)
     return RawOutput(
@@ -343,10 +390,18 @@ def _per_page_prompt(template: str, page: PageImage) -> str:
 
 
 def _build_messages(image: PILImage, prompt: str) -> list[dict[str, Any]]:
-    """OpenAI-format chat message with a base64-encoded image."""
+    """OpenAI-format chat message with a base64-encoded image.
+
+    JPEG q80 instead of PNG: an archival scan re-encoded as PNG is 10–30 MB
+    on a 3000×4000 page; JPEG q80 of the same content is ~0.5 MB, with no
+    measurable accuracy delta on the OCR VLMs ocrscout drives. The smaller
+    body shrinks both this process's in-flight footprint and the litellm
+    proxy's per-request retention, both of which OOM-killed the orchestrator
+    at concurrency=40 before this change.
+    """
     buf = io.BytesIO()
-    image.convert("RGB").save(buf, format="PNG")
-    data_uri = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+    image.convert("RGB").save(buf, format="JPEG", quality=80, optimize=False)
+    data_uri = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
     return [
         {
             "role": "user",

@@ -746,10 +746,11 @@ def _execute(
     def _fresh_pages_iter() -> "_PeekableIter":
         """Return a fresh page iterator from the source, sample-limited
         and resume-filter-able. Each model gets its own — for BHL the
-        DuckDB sample is cached on the adapter so only the S3 fetches
-        re-run, but pages stream lazily so resident PIL images stay
-        bounded at ~``concurrent_fetches`` per source-side worker pool
-        plus the backend's per-batch buffer."""
+        DuckDB sample is cached on the adapter so only the lazy
+        ``image_loader`` closures re-issue when consumed. PageImages now
+        carry no decoded bytes until a backend enters
+        ``page.open_image()``; resident PIL images are bounded by the
+        backend's in-flight concurrency, not the source feed rate."""
         it = source.iter_pages()
         if cfg.sample is not None:
             it = itertools.islice(it, cfg.sample)
@@ -1076,112 +1077,131 @@ def _process_one(
     """Normalize + compare + export one (page, raw). Returns 'ok' or 'failed'.
 
     Split out of ``_run_one_model`` only so the streaming loop body stays
-    legible; no semantic change vs. the previous per-row block."""
-    if raw.error:
-        log.warning("model %s page %s reported error: %s", model_name, page.file_id, raw.error)
-        cost_recorder.close_page(page.page_id)
-        return "failed"
+    legible; no semantic change vs. the previous per-row block.
+
+    Defensive teardown in the ``finally`` block: with the lazy
+    ``PageImage`` contract introduced alongside this code, backends
+    close + clear ``page.image`` themselves the moment they're done
+    (whole-page litellm inside ``with page.open_image()``, layout_chat
+    inside ``_publish_page`` after the last region resolves). The
+    teardown here is the catch-all for any future normalizer that pins
+    ``page.image`` mid-pipeline — it guarantees the exporter buffer
+    never inherits a decoded RGB buffer even if a new code path forgets
+    to drop one."""
     try:
-        t_norm0 = time.perf_counter()
-        with metrics.stage(f"{model_name}.normalize"):
-            doc = normalizer.normalize(raw, page, profile)
-        normalize_seconds = time.perf_counter() - t_norm0
-    except NormalizerError as e:
-        log.warning("normalizer failed for %s/%s: %s", model_name, page.file_id, e)
-        cost_recorder.close_page(page.page_id)
-        return "failed"
-
-    item_count, text_length, markdown, text = _doc_stats(doc)
-
-    reference = None
-    if reference_adapter is not None:
+        if raw.error:
+            log.warning("model %s page %s reported error: %s", model_name, page.file_id, raw.error)
+            cost_recorder.close_page(page.page_id)
+            return "failed"
         try:
-            reference = reference_adapter.get(page)
-        except Exception as e:  # noqa: BLE001
-            log.warning(
-                "reference adapter failed for %s/%s: %s",
-                model_name, page.file_id, e,
-            )
+            t_norm0 = time.perf_counter()
+            with metrics.stage(f"{model_name}.normalize"):
+                doc = normalizer.normalize(raw, page, profile)
+            normalize_seconds = time.perf_counter() - t_norm0
+        except NormalizerError as e:
+            log.warning("normalizer failed for %s/%s: %s", model_name, page.file_id, e)
+            cost_recorder.close_page(page.page_id)
+            return "failed"
 
-    page_comparisons: dict[str, ComparisonResult] = {}
-    if reference is not None and comparisons:
-        view_pred = PredictionView(
-            page_id=page.page_id,
-            label=model_name,
-            text=text,
-            document=doc,
-        )
-        view_base = BaselineView(
-            page_id=page.page_id,
-            label=reference_adapter.name if reference_adapter else "reference",
-            text=reference.text,
-            document=reference.document,
-            provenance=reference.provenance,
-        )
-        for cmp in comparisons:
+        item_count, text_length, markdown, text = _doc_stats(doc)
+
+        reference = None
+        if reference_adapter is not None:
             try:
-                result = cmp.compare(view_pred, view_base)
+                reference = reference_adapter.get(page)
             except Exception as e:  # noqa: BLE001
                 log.warning(
-                    "comparison %s failed for %s/%s: %s",
-                    cmp.name, model_name, page.file_id, e,
+                    "reference adapter failed for %s/%s: %s",
+                    model_name, page.file_id, e,
                 )
-                continue
-            if result is not None:
-                page_comparisons[cmp.name] = result
-                accumulated_comparisons.append(result)
 
-    # Close the cost recorder's page (if the backend opened one — only
-    # LiteLLM-routed backends do). Compute gpu_time_cost from elapsed
-    # and the active GpuConfig so the column is comparable across
-    # GPUs without re-deriving downstream.
-    cost_metrics = cost_recorder.close_page(page.page_id)
-    if cost_metrics is not None:
-        elapsed_s = cost_metrics.elapsed_seconds
-        gpu_time_cost = elapsed_s / 3600.0 * gpu.cost_per_hour
-        input_tokens = cost_metrics.input_tokens
-        output_tokens = cost_metrics.output_tokens
-        litellm_cost = cost_metrics.litellm_cost
-    else:
-        elapsed_s = None
-        gpu_time_cost = None
-        input_tokens = None
-        output_tokens = None
-        litellm_cost = None
+        page_comparisons: dict[str, ComparisonResult] = {}
+        if reference is not None and comparisons:
+            view_pred = PredictionView(
+                page_id=page.page_id,
+                label=model_name,
+                text=text,
+                document=doc,
+            )
+            view_base = BaselineView(
+                page_id=page.page_id,
+                label=reference_adapter.name if reference_adapter else "reference",
+                text=reference.text,
+                document=reference.document,
+                provenance=reference.provenance,
+            )
+            for cmp in comparisons:
+                try:
+                    result = cmp.compare(view_pred, view_base)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(
+                        "comparison %s failed for %s/%s: %s",
+                        cmp.name, model_name, page.file_id, e,
+                    )
+                    continue
+                if result is not None:
+                    page_comparisons[cmp.name] = result
+                    accumulated_comparisons.append(result)
 
-    run_seconds_per_page = run_seconds_so_far / max(pages_attempted_so_far, 1)
-    record = ExportRecord(
-        page=page,
-        model=model_name,
-        document=doc,
-        raw=raw,
-        reference=reference,
-        markdown=markdown,
-        text=text,
-        metrics={
-            "prepare_seconds": round(prepare_seconds, 4),
-            "run_seconds_total": round(run_seconds_so_far, 4),
-            "run_seconds_per_page": round(run_seconds_per_page, 4),
-            "normalize_seconds": round(normalize_seconds, 4),
-            "tokens": raw.tokens,
-            "item_count": item_count,
-            "text_length": text_length,
-        },
-        comparisons=page_comparisons,
-        gpu_type=gpu.type,
-        provider=gpu.provider,
-        cost_per_hour=gpu.cost_per_hour,
-        elapsed_seconds=elapsed_s,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        litellm_cost=litellm_cost,
-        gpu_time_cost=gpu_time_cost,
-        kv_cache_memory_bytes=record_kv,
-        concurrent_requests=record_concurrency,
-        region_concurrency=record_region_concurrency,
-    )
-    exporter.write(record)
-    return "ok"
+        # Close the cost recorder's page (if the backend opened one — only
+        # LiteLLM-routed backends do). Compute gpu_time_cost from elapsed
+        # and the active GpuConfig so the column is comparable across
+        # GPUs without re-deriving downstream.
+        cost_metrics = cost_recorder.close_page(page.page_id)
+        if cost_metrics is not None:
+            elapsed_s = cost_metrics.elapsed_seconds
+            gpu_time_cost = elapsed_s / 3600.0 * gpu.cost_per_hour
+            input_tokens = cost_metrics.input_tokens
+            output_tokens = cost_metrics.output_tokens
+            litellm_cost = cost_metrics.litellm_cost
+        else:
+            elapsed_s = None
+            gpu_time_cost = None
+            input_tokens = None
+            output_tokens = None
+            litellm_cost = None
+
+        run_seconds_per_page = run_seconds_so_far / max(pages_attempted_so_far, 1)
+        record = ExportRecord(
+            page=page,
+            model=model_name,
+            document=doc,
+            raw=raw,
+            reference=reference,
+            markdown=markdown,
+            text=text,
+            metrics={
+                "prepare_seconds": round(prepare_seconds, 4),
+                "run_seconds_total": round(run_seconds_so_far, 4),
+                "run_seconds_per_page": round(run_seconds_per_page, 4),
+                "normalize_seconds": round(normalize_seconds, 4),
+                "tokens": raw.tokens,
+                "item_count": item_count,
+                "text_length": text_length,
+            },
+            comparisons=page_comparisons,
+            gpu_type=gpu.type,
+            provider=gpu.provider,
+            cost_per_hour=gpu.cost_per_hour,
+            elapsed_seconds=elapsed_s,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            litellm_cost=litellm_cost,
+            gpu_time_cost=gpu_time_cost,
+            kv_cache_memory_bytes=record_kv,
+            concurrent_requests=record_concurrency,
+            region_concurrency=record_region_concurrency,
+        )
+        exporter.write(record)
+        return "ok"
+    finally:
+        img = getattr(page, "image", None)
+        if img is not None:
+            try:
+                img.close()
+            except Exception:  # noqa: BLE001
+                pass
+            page.image = None
 
 
 def _parse_source_args(raw: list[str]) -> dict[str, Any]:

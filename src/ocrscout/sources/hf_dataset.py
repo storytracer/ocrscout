@@ -113,47 +113,44 @@ class HfDatasetSourceAdapter(SourceAdapter, BaseModel):
     # --- ABC contract ---
 
     def iter_pages(self) -> Iterator[PageImage]:
+        """Yield lazy ``PageImage``s for every row of the HF dataset.
+
+        We cast the image column to undecoded so we get the raw bytes (or
+        a path to them) without datasets eagerly decoding the entire
+        prefix into PIL Images. The decode itself is deferred into the
+        installed ``image_loader`` closure — backends invoke it via
+        ``page.open_image()`` and drop the bytes when the with-block
+        exits. Width / height are unknown at iter time; backends that
+        need them after open_image() see the backfilled values.
+        """
         ds = self._build()
         image_col = self.image_column or self._detect_image_column(ds.features)
         id_col = self.id_column or self._detect_id_column(
             ds.features, exclude=image_col
         )
 
-        # Cast image column to undecoded so we get {'bytes', 'path'} dicts —
-        # we want the path for stable page_id/source_uri, and we control
-        # PIL decoding ourselves to avoid datasets' image autocrop.
         from datasets import Image as HfImage
 
         ds = ds.cast_column(image_col, HfImage(decode=False))
+        storage_options = dict(self.storage_options) if self.storage_options else {}
 
         for idx, row in enumerate(ds):
             record = row[image_col]
             raw_path = record.get("path") if isinstance(record, dict) else None
             raw_bytes = record.get("bytes") if isinstance(record, dict) else None
-            if raw_bytes is None and raw_path:
-                raw_bytes = read_path_or_url(raw_path, self.storage_options)
-            if not raw_bytes:
+            if raw_bytes is None and raw_path is None:
                 log.warning(
-                    "hf_dataset: row %d has no image bytes (path=%r); skipping",
-                    idx, raw_path,
+                    "hf_dataset: row %d has neither bytes nor path; skipping",
+                    idx,
                 )
                 continue
-
-            with Image.open(io.BytesIO(raw_bytes)) as img:
-                img.load()
-                page_image = img.copy()
-                w, h = page_image.size
-                dpi = self._dpi(img)
 
             page_id = self._page_id(row, id_col, raw_path, idx)
             file_id = self._file_id(raw_path, page_id)
             yield PageImage(
                 page_id=page_id,
                 file_id=file_id,
-                image=page_image,
-                width=w,
-                height=h,
-                dpi=dpi,
+                image_loader=_make_hf_loader(raw_bytes, raw_path, storage_options),
                 source_uri=raw_path,
             )
 
@@ -381,6 +378,58 @@ class HfDatasetSourceAdapter(SourceAdapter, BaseModel):
 
     # --- no source-specific admin verbs ---
     actions: ClassVar[list[type[SourceAction]]] = []
+
+
+def _make_hf_loader(
+    raw_bytes: bytes | None,
+    raw_path: str | None,
+    storage_options: dict[str, Any],
+):
+    """Build the image_loader closure for one HF dataset row.
+
+    Two cases by data shape:
+    - Local imagefolder rows have a ``path`` — the closure re-reads from
+      disk each call, so the orchestrator never holds raw bytes between
+      iter time and load time. Cheap; the OS page cache absorbs the
+      re-read.
+    - Streaming rows (and rows where datasets inlined the bytes for some
+      other reason) have bytes only. The closure has no choice but to
+      capture them; lazy loading still avoids the decoded-RGB resident
+      cost, which is the larger share for most formats.
+    """
+    if raw_path is not None and "://" not in raw_path:
+        local_path = raw_path
+
+        def _from_path() -> Image.Image:
+            with Image.open(local_path) as src:
+                src.load()
+                img = src.copy()
+            return img.convert("RGB") if img.mode != "RGB" else img
+
+        return _from_path
+
+    if raw_path is not None:
+        remote_path = raw_path
+        opts = storage_options
+
+        def _from_url() -> Image.Image:
+            data = read_path_or_url(remote_path, opts)
+            with Image.open(io.BytesIO(data)) as src:
+                src.load()
+                img = src.copy()
+            return img.convert("RGB") if img.mode != "RGB" else img
+
+        return _from_url
+
+    captured = raw_bytes
+
+    def _from_bytes() -> Image.Image:
+        with Image.open(io.BytesIO(captured)) as src:
+            src.load()
+            img = src.copy()
+        return img.convert("RGB") if img.mode != "RGB" else img
+
+    return _from_bytes
 
 
 def read_path_or_url(

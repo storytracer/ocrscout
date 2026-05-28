@@ -28,12 +28,6 @@ import logging
 import re
 import shutil
 from collections.abc import Iterator
-from concurrent.futures import (
-    FIRST_COMPLETED,
-    ThreadPoolExecutor,
-    as_completed,
-    wait,
-)
 from datetime import datetime
 from pathlib import Path
 from typing import Any, ClassVar, Literal
@@ -191,7 +185,6 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
     year_range: tuple[int, int] | None = None
     pages_per_volume: int = Field(default=8, gt=0)
     volumes: int | None = Field(default=None, gt=0)
-    concurrent_fetches: int = Field(default=16, gt=0)
     cache_dir: Path | None = None
     storage_options: dict[str, Any] = Field(default_factory=lambda: {"anon": True})
     copyright_dataset: str | None = None
@@ -274,6 +267,15 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
     # --- ABC contract ---
 
     def iter_pages(self) -> Iterator[PageImage]:
+        """Yield PageImage metadata for the sampled rows.
+
+        Pages are returned *without* decoded bytes: each carries an
+        ``image_loader`` closure that the consumer invokes (via
+        ``page.open_image()``) when it actually needs the image, then
+        drops on scope exit. No prefetch / sliding window — the backend's
+        own worker pool determines parallelism for both fetch and POST,
+        keeping memory tied to in-flight concurrency instead of feed-rate.
+        """
         self._ensure_query_run()
         assert self._sample_rows is not None
         rows = self._sample_rows
@@ -281,55 +283,10 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             lo = self.start_idx if self.start_idx is not None else 0
             hi = self.end_idx if self.end_idx is not None else len(rows)
             rows = rows[lo:hi]
-        if self.concurrent_fetches == 1 or len(rows) <= 1:
-            for row in rows:
-                page = self._row_to_page(row)
-                if page is not None:
-                    yield page
-            return
-        # _row_to_page is a network-bound S3 GET + JP2 decode; threading is
-        # dramatically faster than the sequential loop. Pages are yielded in
-        # completion order — downstream OCR doesn't care about ordering.
-        #
-        # Sliding window of in-flight + completed-but-unyielded futures: at
-        # any moment ``pending`` holds at most ``workers * 2`` futures, each
-        # potentially carrying a decoded JP2 (~15 MB). Without this cap a
-        # naive ``[pool.submit(...) for row in rows]`` lets the executor run
-        # arbitrarily far ahead of the consumer — for a 2500-page sample
-        # that's ~37 GiB of resident PIL images by the time the OCR backend
-        # has chewed through the first hundred, OOM-killing the orchestrator.
-        # The "× 2" headroom keeps every worker busy across yields: by the
-        # time the consumer pulls one page, the next replacement future is
-        # already in-flight.
-        #
-        # Manual try/finally so the early-close path can call
-        # ``shutdown(cancel_futures=True)`` — by default ``with``-exit blocks
-        # on every queued future, which would force the empty-source probe
-        # in ``_execute`` to drain all S3 fetches before returning.
-        workers = min(self.concurrent_fetches, len(rows))
-        pool = ThreadPoolExecutor(max_workers=workers)
-        try:
-            row_iter = iter(rows)
-            pending: set = set()
-            for _ in range(workers * 2):
-                try:
-                    row = next(row_iter)
-                except StopIteration:
-                    break
-                pending.add(pool.submit(self._row_to_page, row))
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    try:
-                        next_row = next(row_iter)
-                        pending.add(pool.submit(self._row_to_page, next_row))
-                    except StopIteration:
-                        pass
-                    page = fut.result()
-                    if page is not None:
-                        yield page
-        finally:
-            pool.shutdown(wait=False, cancel_futures=True)
+        for row in rows:
+            page = self._row_to_page(row)
+            if page is not None:
+                yield page
 
     def iter_volumes(self) -> Iterator[Volume]:
         self._ensure_query_run()
@@ -445,6 +402,15 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
         )
 
     def _row_to_page(self, row: dict[str, Any]) -> PageImage | None:
+        """Build a lazy ``PageImage`` for one catalog row.
+
+        No S3 fetch and no JP2 decode here — both happen inside the
+        installed ``image_loader`` closure when the consumer enters
+        ``page.open_image()``. The closure captures the URL and a snapshot
+        of ``storage_options`` so concurrent loads don't trip over a
+        mutated adapter field. Per-page width / height / dpi are not known
+        until first load; ``PageImage.open_image()`` backfills them.
+        """
         item_id = row.get("ItemID")
         page_id = row.get("PageID")
         bar_code = row.get("BarCode")
@@ -459,28 +425,18 @@ class BhlSourceAdapter(SourceAdapter, BaseModel):
             return None
         bar_code_s = str(bar_code)
         url = f"{self.IMAGES_PREFIX}/{bar_code_s}/{bar_code_s}_{sequence:04d}.jp2"
-        try:
-            image, dpi = self._fetch_and_decode_jp2(url, self.storage_options)
-        except FileNotFoundError:
-            log.warning(
-                "BHL image %s not found (PageID=%s, SO=%d); skipping. "
-                "Likely a phantom catalog entry (foldout/insert without "
-                "scan) or a legacy 0-indexed item.",
-                url, page_id, sequence,
-            )
-            return None
-        except Exception as e:  # noqa: BLE001
-            log.warning("BHL image fetch/decode failed for %s: %s", url, e)
-            return None
-        width, height = image.size
         filename = f"{bar_code_s}_{sequence:04d}.jp2"
+        storage_options = dict(self.storage_options)
+        fetch_and_decode = type(self)._fetch_and_decode_jp2
+
+        def _loader() -> Any:
+            image, _dpi = fetch_and_decode(url, storage_options)
+            return image
+
         return PageImage(
             page_id=str(page_id),
             file_id=f"{bar_code_s}/{filename}",
-            image=image,
-            width=width,
-            height=height,
-            dpi=dpi,
+            image_loader=_loader,
             source_uri=url,
             barcode=bar_code_s,
             sequence=sequence,

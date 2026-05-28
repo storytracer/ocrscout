@@ -24,10 +24,26 @@ class DocTagsNormalizer(Normalizer):
             )
         # Build a single-page DocTagsDocument, then hand it to docling-core to
         # convert into the rich DoclingDocument representation.
+        #
+        # Some doctag profiles (dots-mocr, …) embed bbox coordinates relative
+        # to the page image; passing the image lets docling-core resolve
+        # those into geometry the DoclingDocument exposes. Re-load via
+        # ``open_image()`` so the decoded buffer is freed when this returns
+        # — the backend already closed its copy by the time the normalizer
+        # runs.
         try:
+            if page.image is not None or page.image_loader is not None:
+                with page.open_image() as img:
+                    dtd = DocTagsDocument.from_doctags_and_image_pairs(
+                        doctags=[raw.payload],
+                        images=[img],
+                    )
+                    return DoclingDocument.load_from_doctags(
+                        dtd, document_name=page.page_id
+                    )
             dtd = DocTagsDocument.from_doctags_and_image_pairs(
                 doctags=[raw.payload],
-                images=[page.image] if page.image is not None else None,
+                images=None,
             )
             return DoclingDocument.load_from_doctags(dtd, document_name=page.page_id)
         except Exception as e:  # noqa: BLE001
