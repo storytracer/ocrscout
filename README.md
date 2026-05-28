@@ -38,7 +38,7 @@ Behind the scenes:
 - **Normalises every output.** One model returns Markdown, another HTML, another its own custom token stream. ocrscout converts every result into a common document model so you can compare apples to apples.
 - **Writes one HuggingFace-shaped dataset.** One row per `(page, model)` in `data/train-*.parquet` — incrementally flushed during the run, so a partial run is always readable and `--resume` picks up where it left off (per-model: a page already done for model A is still attempted for model B if B hadn't processed it yet — the parquet shards themselves are the resume cursor). Each row carries timings, success/failure, the normalised document, a pre-rendered Markdown rendering, plus per-page cost / token / GPU-context columns (`litellm_cost`, `input_tokens`, `output_tokens`, `elapsed_seconds`, `gpu_type`, `cost_per_hour`, `gpu_time_cost`) populated automatically by the unified LiteLLM proxy that fronts every model call.
 - **Has a browser viewer.** Flip through pages, switch between models, see bounding boxes overlaid on the source image, compare two artifacts word-by-word, place the page's reference baseline alongside any model output for direct comparison.
-- **Scores predictions against any baseline.** Drop in a reference adapter (plain-text files, BHL legacy OCR, future ALTO/hOCR) and ocrscout runs a configurable suite of comparisons per page — text similarity always, character/word error rates with the `[eval]` extra, structural and layout deltas when both sides carry the relevant data. Reference is *not* assumed to be ground truth: provenance (`method`, `engine`, `confidence`) is captured so you can interpret the numbers as accuracy-vs-truth or agreement-vs-incumbent depending on the source.
+- **Scores predictions against any baseline.** Drop in a reference adapter (plain-text files, BHL legacy OCR, future ALTO/hOCR) and ocrscout runs a configurable suite of comparisons per page — text similarity, character/word error rates (CER/WER via `jiwer`), structural and layout deltas when both sides carry the relevant data. Reference is *not* assumed to be ground truth: provenance (`method`, `engine`, `confidence`) is captured so you can interpret the numbers as accuracy-vs-truth or agreement-vs-incumbent depending on the source.
 - **Scales from one machine to a cloud pool.** One Runner abstraction (`local`, `skypilot`, `hf`) drives every deployment. Start with `ocrscout run` on your workstation, scale to an OVHcloud / AWS / GCP Kubernetes pool via `--runner skypilot --gpu L4 --workers 3`, or hand off to HuggingFace-sponsored compute via `--runner hf`. Same command shape, same Parquet output, same cost columns.
 
 It's a *scout*, not a production system — the goal is to help you decide which model is worth using, or whether re-running your existing corpus through a newer one is worth the GPU-hours. Once you've picked a model, [Docling](https://github.com/docling-project/docling) is the toolchain for running it at scale.
@@ -53,33 +53,14 @@ It's a *scout*, not a production system — the goal is to help you decide which
 ## Install
 
 ```bash
-uv add 'ocrscout[all]'
+uv add ocrscout
 ```
 
-That gets you everything — every input format, every backend, the browser viewer. If you want a smaller install:
+That's it — one flat dependency list. PDF input, ALTO/hOCR parsing, cloud filesystems, the BHL adapter, the layout detector, vLLM serving, the LiteLLM proxy binary, the Gradio viewer, SkyPilot orchestration, jiwer for CER/WER — all installed by default. No `[extra]` flags to remember, no "I forgot --all-extras and now my run can't find vLLM" foot-guns.
 
-```bash
-uv add ocrscout                              # core only
-uv add 'ocrscout[viewer,layout]'             # just what you need
-```
+The trade-off: a fresh install pulls in ~2–3 GB of wheels (most of it `torch` + `vllm`) regardless of whether you actually exercise the GPU paths. On a CPU-only host that's mostly wasted disk; on a host where you'll run inference anyway, it's the wheels you wanted plus some you didn't but can ignore. The flat-deps decision is consciously trading install size for setup simplicity — if the disk cost matters more than the cognitive cost, splitting back into extras is straightforward.
 
-The core install has **zero GPU or AI dependencies** and finishes in seconds on a CPU-only laptop. All the heavy stuff (PyTorch, vLLM, Transformers) is opt-in via the extras below — and even then, the actual model inference runs in isolated subprocesses or remote servers, never bloating your main Python environment.
-
-| Extra | What it gives you | Add it when… |
-| --- | --- | --- |
-| `pdf` | Read PDF documents directly | Your source documents are PDFs (otherwise you need to convert them to images first) |
-| `alto` | Parse ALTO/hOCR reference files | You have existing OCR transcriptions in ALTO/hOCR format and want to compare against them |
-| `iiif` | Read images from a IIIF-compliant server | Your documents live in a digital library / archive that exposes IIIF |
-| `cloud` | Read images from cloud storage | Your documents live on S3 (`s3://...`) or Google Cloud Storage (`gs://...`) |
-| `bhl` | Sample images and OCR from the [Biodiversity Heritage Library](https://registry.opendata.aws/bhl-open-data/) S3 bucket | You want to scout OCR models against BHL's 305K-volume / 67M-page open-data corpus (DuckDB-driven catalog sampling, anonymous S3, JP2 decode via `imagecodecs`) |
-| `eval` | Add character/word error rates to text comparisons | You want CER/WER (industry-standard OCR metrics from `jiwer`) on top of the always-on word-level similarity score |
-| `docling` | Add the [Docling](https://github.com/docling-project/docling) backend | You also want to test classical OCR (Tesseract, EasyOCR) alongside the AI models |
-| `serve` | The LiteLLM proxy binary that `LocalRunner` spawns to front your vLLMs | You're running ocrscout against vLLM-served models locally (the `LocalRunner` daemon stack) |
-| `viewer` | A browser-based inspector for your results | You want to flip through pages and compare models visually instead of reading raw output |
-| `layout` | The PP-DocLayoutV3 layout detector | You want to use single-task models (GLM-OCR, PaddleOCR-VL) on pages that mix text, tables, and formulas — see "Layout-aware models" below |
-| `skypilot` | Remote orchestration via [SkyPilot](https://skypilot.readthedocs.io/) on Kubernetes (OVHcloud / AWS / GCP / on-prem K8s) | You're driving cloud GPU pools from a laptop, or running benchmarks/re-OCR jobs at scale |
-| `hf` | The HuggingFace Jobs API runner | You're using HuggingFace-sponsored compute (the BHL / FineBooks pilot pattern) |
-| `all` | All of the above | Recommended unless you really need a slim footprint |
+> **DGX-class hardware (ARM64 + CUDA)** needs a `torch` wheel from Nvidia's index that isn't on pypi. The `torch` requirement here is intentionally unpinned to a specific source so you can pre-install the right wheel from `https://pypi.nvidia.com/` (or wherever) and `uv sync` will respect it.
 
 ## Quick start
 
@@ -100,7 +81,7 @@ Here's what happens, in plain terms:
    - `pipeline.yaml` — the resolved configuration ocrscout actually ran (source, models, normalizer overrides, sample/seed), so the run is reproducible.
 6. A summary table is printed: how many pages each model handled, how often it failed, mean seconds per page, total output tokens.
 
-**Got reference transcriptions or legacy OCR?** Point ocrscout at a reference adapter — plain-text files matched by page-id, or one of the corpus-specific adapters like `bhl_ocr` — and ocrscout runs every applicable comparison per (page, model). The text comparison's word-level similarity is always present; CER/WER are added if you install the `[eval]` extra; document and layout comparisons fire when both sides supply the relevant data.
+**Got reference transcriptions or legacy OCR?** Point ocrscout at a reference adapter — plain-text files matched by page-id, or one of the corpus-specific adapters like `bhl_ocr` — and ocrscout runs every applicable comparison per (page, model). Word-level text similarity and CER/WER are always present; document and layout comparisons fire when both sides supply the relevant data.
 
 ```bash
 # Plain-text references on disk
@@ -204,7 +185,7 @@ uv run ocrscout down
 
 ### "Scale to a cluster" — `--runner skypilot`
 
-The same Runner ABC drives [SkyPilot](https://skypilot.readthedocs.io/) on any Kubernetes context — OVHcloud Managed Kubernetes, AWS EKS, GCP GKE, on-prem. Workers install `ocrscout[vllm]` via `uv`, start the same LiteLLM + vLLM stack locally on each pod, and write Parquet directly to your S3 / GCS / `hf://` output:
+The same Runner ABC drives [SkyPilot](https://skypilot.readthedocs.io/) on any Kubernetes context — OVHcloud Managed Kubernetes, AWS EKS, GCP GKE, on-prem. Workers install `ocrscout` via `uv`, start the same LiteLLM + vLLM stack locally on each pod, and write Parquet directly to your S3 / GCS / `hf://` output:
 
 ```bash
 uv run ocrscout launch --runner skypilot --gpu L4 --workers 3 \
@@ -298,7 +279,7 @@ Add `--html` to a `--compare` invocation and ocrscout serves a one-shot HTML pag
 
 ### `ocrscout viewer <out>` — browser
 
-A long-lived web app for visual comparison (needs the `viewer` extra). Three view modes:
+A long-lived web app for visual comparison. Three view modes:
 
 - **Single** — one artifact at a time (any model output, or the page's reference), full text, with the source page on the left and bounding boxes overlaid showing which regions the model detected.
 - **Side-by-side** — two or more artifacts in parallel columns. Pick any combination of models — and the run's `reference` baseline if one is configured — to see where they agree and disagree at a glance.

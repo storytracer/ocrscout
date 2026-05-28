@@ -24,7 +24,17 @@ classifiers = [
     "Topic :: Scientific/Engineering",
     "Topic :: Text Processing",
 ]
+# Single flat runtime dependency list. Everything ocrscout might need at
+# runtime is mandatory — no extras. Trade-off: a fresh install pulls in
+# ~2-3 GB of wheels (torch, vllm, transformers, gradio, …) regardless of
+# whether the user actually exercises those code paths, and the
+# previous "zero GPU deps in core" rule no longer holds. The win is that
+# `uv sync` / `uv run` / `pip install ocrscout` all do the same thing
+# with no flag dance — no more "I forgot --all-extras and now my run
+# uninstalled vLLM" surprises. Dev tooling (ruff/mypy/playwright) stays
+# in [dependency-groups] dev where it doesn't ship to end users.
 dependencies = [
+    # --- core runtime ---
     "docling-core>=2.50.0",
     "huggingface-hub>=0.25.0",
     "datasets>=3.0.0",
@@ -34,129 +44,68 @@ dependencies = [
     "pyyaml>=6.0",
     "typer>=0.12.0",
     "rich>=13.0.0",
-    # Used by sources/references that talk to fsspec backends, IIIF, etc.
-    # Pulls into core because the BHL adapter (and any future adapter that
-    # touches HTTP) wants connection pooling without a separate dep gate.
+    # HTTP for sources/references hitting fsspec backends, IIIF, etc.
     "requests>=2.31.0",
-    # litellm is the universal OpenAI-compatible client. Both LiteLLMBackend
-    # (one POST per page) and LayoutChatBackend (one POST per region) call
-    # ``litellm.completion``; the success_callback in ``ocrscout.cost``
-    # records per-page tokens/cost. The proxy binary (``litellm[proxy]``)
-    # is shipped under the ``vllm`` extra for daemon spawns.
-    "litellm>=1.50.0",
-    # litellm lazy-imports tenacity *only* when ``num_retries`` actually
-    # has to fire on a failed attempt — so a missing dep doesn't surface
-    # until the first retryable transient mid-run, then every retry path
-    # dies with ``tenacity import failed please run pip install tenacity``.
-    # We pass ``num_retries`` on every completion call, so tenacity is a
-    # hard requirement for us, not an optional litellm extra.
+    "httpx>=0.27.0",
+    # --- LiteLLM stack ---
+    # Both LiteLLMBackend and LayoutChatBackend call `litellm.completion`;
+    # the success_callback in `ocrscout.cost` records per-page tokens/cost.
+    # `[proxy]` ships the proxy binary that LocalRunner spawns (previously
+    # in the `serve` extra; now folded in so `ocrscout launch` works on
+    # every install without an extra-flag dance).
+    "litellm[proxy]>=1.50.0",
+    # litellm lazy-imports tenacity *only* when `num_retries` actually has
+    # to fire on a failed attempt — so a missing dep doesn't surface
+    # until the first retryable transient mid-run. Hard dep here.
     "tenacity>=8.0",
-    # nvitop wraps libnvml.so via nvidia-ml-py; pure-Python install in seconds,
-    # no GPU runtime deps. Used by managed-mode GPU budgeting/telemetry.
-    # Gracefully returns no devices on CPU-only hosts.
+    # --- GPU telemetry / autoscaler ---
+    # nvitop wraps libnvml.so via nvidia-ml-py; pure-Python install in
+    # seconds. Gracefully returns no devices on CPU-only hosts.
     "nvitop>=1.3.0",
-    # GPU spec database (memory bandwidth, VRAM, etc.) consumed by the
-    # autoscaler at launch time to derive per-GPU concurrency caps from
-    # memory bandwidth rather than a hardcoded constant. Pure data + tiny
-    # API. ``thefuzz`` is required by dbgpu's name-matching ``search`` for
-    # NVIDIA's varied product strings (e.g. nvidia-smi "H100 PCIe" vs
-    # dbgpu "H100 PCIe 80 GB"); pure Python, no compiled deps.
+    # GPU spec database consumed by the autoscaler at launch time.
+    # `thefuzz` is required by dbgpu's name-matching `search`.
     "dbgpu>=2025.0",
     "thefuzz>=0.22.0",
-]
-
-[project.optional-dependencies]
-pdf = ["ocrmypdf>=16.0.0", "pikepdf>=9.0.0"]
-alto = ["lxml>=5.0.0"]
-iiif = ["httpx>=0.27.0"]
-# Cloud filesystems for the hf_dataset source adapter. `datasets` is in
-# core deps; the fsspec backends below are only pulled in when you point
-# --source at the matching URL scheme.
-cloud = [
-    "s3fs>=2024.0.0",
-    "gcsfs>=2024.0.0",
-]
-serve = ["litellm[proxy]>=1.50.0"]
-viewer = [
-    # gradio 6+ moved css/head from the Blocks constructor onto Blocks.launch,
-    # which is the API our viewer / Space app target. Older gradio also fails
-    # to import against huggingface_hub>=1.0 (removed `HfFolder`). 6.13 is
-    # the current stable.
-    "gradio>=6.13.0",
-    # Custom component for the source-page bbox overlay. gr.AnnotatedImage
-    # wrote one full-resolution PNG mask per bbox per page render and
-    # blocked the viewer; this one ships boxes as plain dicts and renders
-    # them on a canvas, so cost is O(1) regardless of bbox count.
-    # Using seanpedrick-case's fork because the upstream
-    # `gradio_image_annotation` 0.5.0 wheel is incomplete (its bundle
-    # references svelte_runtime_entry.js but doesn't include it). The
-    # fork is properly packaged for gradio 6.x.
-    "gradio_image_annotation_redaction>=0.5.5",
-]
-# Layout-aware OCR pipeline (ocrscout.backends.layout_chat + the
-# pp-doclayout-v3 detector). Uses the official Hugging Face Transformers
-# integration of PP-DocLayoutV3 — pulls in transformers + torch (CPU-only
-# wheels by default; users with CUDA can install the GPU torch wheels
-# themselves). ~600 MB extra; the alternative was ~200 LOC of fragile
-# hand-maintained ONNX preprocessing/decoding.
-#
-# transformers>=4.59.0 is the first release that ships
-# PPDocLayoutV3ForObjectDetection / PPDocLayoutV3ImageProcessor.
-# opencv-python-headless is a hard runtime requirement of
-# PPDocLayoutV3ImageProcessor (preprocess uses cv2.resize/warpAffine);
-# headless avoids pulling in Qt/GTK on server hosts.
-layout = [
+    # --- vLLM serving stack ---
+    # The torch version is deliberately left unpinned — DGX-class
+    # hardware (ARM64 + CUDA) needs a torch wheel from Nvidia's index
+    # that isn't on pypi, so a strict pin would lock those users out.
+    "vllm>=0.11.0",
     "transformers>=4.59.0",
     "torch>=2.0.0",
-    "opencv-python-headless>=4.8.0",
-]
-# Biodiversity Heritage Library source + OCR reference adapter.
-# DuckDB drives the TSV→parquet catalog conversion (refresh) and the
-# parquet-backed sampling query (iter_pages) on the resulting
-# `catalog/{item,page,title}.parquet` files; s3fs provides anonymous S3
-# access for both the catalog files and the JP2/OCR sidecars;
-# imagecodecs ships its own OpenJPEG decoder so JP2 decoding doesn't
-# depend on a system libopenjp2.
-bhl = [
-    "duckdb>=1.1.0",
-    "s3fs>=2024.0.0",
-    "imagecodecs>=2024.0.0",
-]
-# GPU stack for the in-process rights classifier (BHL refresh --runner
-# local) and any future local vLLM workloads. The torch version is
-# deliberately left to the user's existing environment — DGX-class
-# hardware (ARM64 + CUDA) needs a torch wheel from Nvidia's index that
-# isn't on pypi, so locking torch here would lock those users out. If
-# torch isn't present, `classify_parquet` raises with the install hint.
-vllm = [
-    "vllm>=0.11.0",
-    "transformers>=4.53.0",
     "pyarrow>=14.0",
-]
-# Optional metrics for the comparisons subsystem. The TextComparison core
-# always returns a SequenceMatcher word-level similarity score; jiwer adds
-# CER and WER (the OCR/ASR community lingua franca). Pure-Python install,
-# no GPU footprint.
-eval = [
+    # opencv-python-headless is a hard runtime requirement of
+    # PPDocLayoutV3ImageProcessor (preprocess uses cv2.resize/warpAffine);
+    # headless avoids pulling in Qt/GTK on server hosts.
+    "opencv-python-headless>=4.8.0",
+    # --- PDF / ALTO inputs ---
+    "ocrmypdf>=16.0.0",
+    "pikepdf>=9.0.0",
+    "lxml>=5.0.0",
+    # --- Cloud / fsspec backends ---
+    "s3fs>=2024.0.0",
+    "gcsfs>=2024.0.0",
+    # --- BHL source ---
+    # DuckDB drives the TSV→parquet catalog conversion + parquet-backed
+    # sampling query. imagecodecs ships its own OpenJPEG decoder so JP2
+    # decoding doesn't depend on a system libopenjp2.
+    "duckdb>=1.1.0",
+    "imagecodecs>=2024.0.0",
+    # --- Comparisons / evaluation metrics ---
+    # jiwer adds CER and WER on top of TextComparison's SequenceMatcher
+    # word-level similarity (the OCR/ASR community lingua franca).
     "jiwer>=3.0.0",
-]
-# Remote orchestration via SkyPilot on Kubernetes. Lazy-imported by
-# SkyPilotRunner so installing this is only required on the
-# orchestrating machine, not on every K8s worker (workers install
-# ocrscout[vllm] in their pool/job setup script).
-skypilot = [
+    # --- Viewer ---
+    # gradio 6+ moved css/head onto Blocks.launch, which is the API our
+    # viewer targets. 6.13 is the current stable. The
+    # `gradio_image_annotation_redaction` fork is properly packaged for
+    # gradio 6.x (upstream 0.5.0 wheel is incomplete).
+    "gradio>=6.13.0",
+    "gradio_image_annotation_redaction>=0.5.5",
+    # --- Remote runners ---
+    # SkyPilot for K8s pools; HF Jobs uses huggingface-hub (already in
+    # core). Both are lazy-imported inside their respective runner.
     "skypilot-nightly[kubernetes]>=0.7.0",
-]
-# HuggingFace Jobs API runner. Same lazy-import pattern.
-hf = [
-    "huggingface-hub>=0.25.0",
-]
-all = [
-    "ocrscout[pdf,alto,iiif,cloud,serve,viewer,layout,bhl,eval,skypilot,hf]",
-]
-dev = [
-    "ruff>=0.6.0",
-    "mypy>=1.10.0",
 ]
 
 [project.scripts]
@@ -202,6 +151,12 @@ strict_optional = true
 warn_unused_ignores = true
 
 [dependency-groups]
+# Dev-only tooling. uv installs the `dev` group by default on `uv sync`
+# / `uv run`, so no flag dance is needed — but these don't ship with
+# `pip install ocrscout` to end users, which is the right scope for
+# linters/formatters/test fixtures.
 dev = [
+    "ruff>=0.6.0",
+    "mypy>=1.10.0",
     "playwright",
 ]
