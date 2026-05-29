@@ -8,7 +8,7 @@
 
 A wave of vision-language OCR models has reset the bar set by [Tesseract](https://github.com/tesseract-ocr/tesseract) — dots-OCR, GLM-OCR, LightOnOCR, PaddleOCR-VL, RolmOCR, and a new one every few weeks. Which works best *depends on your documents*: a model that aces modern PDFs may stumble on a Victorian novel or German blackletter. Public benchmarks don't tell you what works on **your** corpus, and finding out by hand — install, configure vLLM, write glue, parse each model's custom output, time it — costs hours per model.
 
-ocrscout turns "compare these models on my documents" into one command. It's a *scout*, not a production system: it helps you pick a model. Once you have, [Docling](https://github.com/docling-project/docling) runs it at scale.
+ocrscout turns "compare these models on my documents" into one command. It's a *scout*, not a production system: it helps you pick a model.
 
 ## Install
 
@@ -28,7 +28,7 @@ uv run ocrscout run --source ./images/ --models dots-mocr,glm-ocr-layout --sampl
 
 ocrscout loads each model onto your GPU, runs every page through it, normalises whatever it emits (markdown, HTML, custom token streams) into one common document model, and shuts down cleanly. Results land in `./data/results/` (the default `--output-dir`):
 
-- `data/train-*.parquet` — one row per `(page, model)` with timings, token counts, success/failure, the normalized document, a pre-rendered `markdown` column, and per-page cost columns. Laid out like a HuggingFace dataset, so `datasets.load_dataset("./data/results", split="train")` works directly.
+- `data/train-*.parquet` — one row per `(page, model)` with timings, token counts, success/failure, the normalized document, and a pre-rendered `markdown` column. Laid out like a HuggingFace dataset, so `datasets.load_dataset("./data/results", split="train")` works directly.
 - `pipeline.yaml` — the resolved config, so the run reproduces via `ocrscout apply pipeline.yaml`.
 
 Shards flush incrementally during the run, so a partial run is always readable and `--resume` picks up where it left off (per-model: a page done for model A is still attempted for model B).
@@ -73,7 +73,7 @@ ocrscout ships eight curated profiles. Modern OCR models split into **layout-awa
 
 ## Running models
 
-Every deployment runs the same stack — `ocrscout → LiteLLM proxy → one vLLM per model` — managed for you by a `Runner`. The LiteLLM proxy gives every model the same OpenAI-compatible URL, attributes per-request cost back to the page, and lets you mix local vLLM and hosted APIs (Gemini, Anthropic) in one run. Both daemons bind to `127.0.0.1` only, so the stack stays unreachable on a public-IP cloud GPU.
+Every deployment runs the same stack — `ocrscout → LiteLLM proxy → one vLLM per model` — managed for you by a `Runner`. The LiteLLM proxy gives every model the same OpenAI-compatible URL and lets you mix local vLLM and hosted APIs (Gemini, Anthropic) in one run. Both daemons bind to `127.0.0.1` only, so the stack stays unreachable on a public-IP cloud GPU.
 
 ```bash
 # Just run it — local stack up, pages run, stack down. Model-major by
@@ -105,15 +105,6 @@ OCRSCOUT_VLLM_URL=http://my-proxy:4000/v1 uv run ocrscout run \
 ```
 
 The autoscaler sizes the vLLM KV-cache, region concurrency, and CPU detector pool from the detected GPU at launch, so layout-aware throughput scales across hardware without per-host tuning (e.g. `glm-ocr-layout` on a 240-page BHL sample: **0.50 s/page** on an H100, **2.18** on an L4). Override via `--gpu-budget`, `--batch-concurrency`, `--detector-workers`. Full sizing rules, daemon lifecycle, and Runner internals are in [CLAUDE.md](CLAUDE.md).
-
-## Cost tracking
-
-Every call goes through LiteLLM, whose success callback accumulates per-page tokens, elapsed seconds, and dollar cost into flat Parquet columns: `gpu_type`, `provider`, `cost_per_hour` (from `~/.ocrscout/config.yaml` or `OCRSCOUT_*` env vars), `elapsed_seconds`, `input_tokens`, `output_tokens`, `litellm_cost` (token-based, via `litellm.completion_cost()`), and `gpu_time_cost` (`elapsed / 3600 × cost_per_hour`). Aggregate across runs with DuckDB:
-
-```bash
-ocrscout costs --output ./out/ --by model
-ocrscout costs --output s3://bucket/benchmark/ --by model,gpu_type
-```
 
 ## Looking at results
 
