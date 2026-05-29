@@ -16,8 +16,6 @@ ocrscout turns "compare these models on my documents" into one command. It's a *
 uv add ocrscout
 ```
 
-One flat dependency list — PDF input, ALTO/hOCR parsing, cloud filesystems, the BHL adapter, the layout detector, vLLM, the LiteLLM proxy, the Gradio viewer, SkyPilot, jiwer — all installed by default, no `[extra]` flags. The trade-off is a ~2–3 GB install (mostly `torch` + `vllm`).
-
 > **DGX-class hardware (ARM64 + CUDA)** needs a `torch` wheel from Nvidia's index that isn't on pypi. The `torch` requirement is intentionally unpinned to a source, so you can pre-install the right wheel and `uv sync` will respect it.
 
 ## Quick start
