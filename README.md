@@ -10,7 +10,7 @@ You have a stack of documents you wish were searchable text. Letters from grandp
 
 For most of the last twenty years OCR meant [Tesseract](https://github.com/tesseract-ocr/tesseract). It's still fine on clean modern print but chokes on anything awkward — smudged pages, multi-column newspapers, mixed languages, tables, old typewriter fonts, handwriting.
 
-In the last two years a wave of vision-language models has reset the bar. They follow reading order across complicated layouts, recover tables, recognise mathematical formulas, and handle handwriting that classical OCR gave up on. Dozens are now public — dots-OCR, GLM-OCR, LightOnOCR, SmolDocling, PaddleOCR-VL — and a new one ships every few weeks.
+In the last two years a wave of vision-language models has reset the bar. They follow reading order across complicated layouts, recover tables, recognise mathematical formulas, and handle handwriting that classical OCR gave up on. Dozens are now public — dots-OCR, GLM-OCR, LightOnOCR, PaddleOCR-VL, RolmOCR — and a new one ships every few weeks.
 
 So which one should you use? *It depends on your documents.* A model that wins on modern PDFs may stumble on a Victorian novel. One that handles English newspapers beautifully may butcher a 1900 birth record in German blackletter. One that aces tables in scientific papers may scramble the columns of your grandmother's recipe cards. Public benchmarks don't tell you what works on **your** corpus.
 
@@ -48,7 +48,7 @@ It's a *scout*, not a production system — the goal is to help you decide which
 - Not a production OCR pipeline — that's [Docling](https://github.com/docling-project/docling).
 - Not a benchmark dataset — that's [MDPBench](https://huggingface.co/datasets/Delores-Lin/MDPBench) (which ocrscout can score against).
 - Not a model repository — that's the HuggingFace Hub.
-- Not a re-implementation of the [`uv-scripts/ocr`](https://huggingface.co/datasets/uv-scripts/ocr) collection — those scripts are reference material; ocrscout drives vLLM and Docling directly through curated per-model profiles.
+- Not a re-implementation of the [`uv-scripts/ocr`](https://huggingface.co/datasets/uv-scripts/ocr) collection — those scripts are reference material; ocrscout drives vLLM and hosted LLM APIs through a single LiteLLM proxy via curated per-model profiles.
 
 ## Install
 
@@ -67,7 +67,7 @@ The trade-off: a fresh install pulls in ~2–3 GB of wheels (most of it `torch` 
 Point ocrscout at a folder of images and a comma-separated list of models you want to test:
 
 ```bash
-uv run ocrscout run --source ./images/ --models dots-mocr,smoldocling --sample 20
+uv run ocrscout run --source ./images/ --models dots-mocr,glm-ocr-layout --sample 20
 ```
 
 Here's what happens, in plain terms:
@@ -87,7 +87,7 @@ Here's what happens, in plain terms:
 # Plain-text references on disk
 uv run ocrscout run --source ./images/ \
                     --reference plain_text --reference-path ./txt/ \
-                    --models dots-mocr,smoldocling
+                    --models dots-mocr,glm-ocr-layout
 
 # BHL legacy OCR as reference, sampled directly from the open-data S3 bucket
 uv run ocrscout run --source-name bhl --sample 20 \
@@ -112,11 +112,11 @@ uv run ocrscout viewer ./data/results/
 
 ## Bundled models
 
-ocrscout ships ready-to-use recipes ("profiles") for nine models out of the box. Before reading the table, two distinctions matter:
+ocrscout ships ready-to-use recipes ("profiles") for eight models out of the box. Before reading the table, two distinctions matter:
 
 **Layout-aware vs. single-task.** Modern OCR models split into two camps:
 
-- **Layout-aware** models segment the page first — finding the headings, paragraphs, tables, and figures — and OCR each region with the right strategy. They handle mixed content (text + tables + formulas on one page) in a single call. *Examples: dots-ocr, smoldocling.*
+- **Layout-aware** models segment the page first — finding the headings, paragraphs, tables, and figures — and OCR each region with the right strategy. They handle mixed content (text + tables + formulas on one page) in a single call. *Examples: dots-ocr, dots-mocr.*
 - **Single-task** models do exactly one thing per call. You ask them to read text and they return text; you ask them to read tables and they return tables. They tend to be much smaller and faster, but on a mixed page their text mode flattens tables into prose. *Examples: GLM-OCR, PaddleOCR-VL.*
 
 To get the best of both worlds with single-task models, ocrscout pairs them with an **external layout detector** ([PP-DocLayoutV3](https://huggingface.co/PaddlePaddle/PP-DocLayoutV3_safetensors)) that finds regions on the page first, then dispatches each region to the right task mode. Profiles ending in `-layout` use this orchestration.
@@ -124,14 +124,13 @@ To get the best of both worlds with single-task models, ocrscout pairs them with
 | Profile | Best for | Why |
 | --- | --- | --- |
 | `dots-ocr` | Mixed pages (text + tables + figures) | Compact (1.7B), layout-aware, structured output with bounding boxes |
-| `dots-mocr` | Same as above, more structured output | DocTags-format output (closer to docling's native model) |
-| `smoldocling` | Tiny GPUs / CPU-only hosts | 256M parameter model; runs on hardware too small for the others |
-| `lighton-ocr2` | Mixed pages, prefer Markdown | Mid-size; emits HTML tables inline in markdown text |
+| `dots-mocr` | Same as above, more structured output | 3B, layout-aware; DocTags-format output (closer to docling's native model) |
+| `lighton-ocr2` | Mixed pages, prefer Markdown | 1B; emits HTML tables inline in markdown text |
 | `glm-ocr` | Plain text pages, fast inference | 0.9B; you pick text/table/formula mode per run |
 | `glm-ocr-layout` | Mixed pages on a small GPU | GLM-OCR + layout detector; recovers structured tables that plain `glm-ocr` would flatten |
 | `paddleocr-vl` | Plain text pages, fastest in the zoo | 0.9B; ~5 s/page on a single GPU |
 | `paddleocr-vl-layout` | Pages with charts, formulas, and tables | Same model + layout detector; the only profile that can recognize charts |
-| `rolm-ocr` | Plain text alternative | Reducto's RolmOCR — different training corpus, sometimes better on receipts/invoices |
+| `rolm-ocr` | Plain text alternative | 7B; Reducto's RolmOCR — different training corpus, sometimes better on receipts/invoices |
 
 **Adding a new model.** Drop a YAML file into `src/ocrscout/profiles/` describing the model's identity, prompt template, and tuning settings. `uv run ocrscout introspect <name>` jump-starts this by drafting a YAML from the matching reference script in the [`uv-scripts/ocr`](https://huggingface.co/datasets/uv-scripts/ocr) collection on Hugging Face — you fill in the gaps. Or ship profiles from your own package via Python entry points; nothing in ocrscout has to be edited.
 
@@ -295,7 +294,7 @@ The extension points (each is a Python Abstract Base Class):
 
 - **`SourceAdapter`** — yields page images from somewhere. Built-in supports local folders, S3/GCS buckets, HuggingFace datasets, and the Biodiversity Heritage Library (`bhl`). Add one for IIIF, PDF rasterization at scale, your in-house DAM, etc. Sources may optionally yield typed `Volume` metadata for catalog-driven corpora.
 - **`ReferenceAdapter`** — supplies a reference (text or `DoclingDocument`, with typed provenance) for a page. Built-in supports plain `.txt` files and BHL legacy OCR; add ALTO, hOCR, page XML, human transcription archives, etc.
-- **`ModelBackend`** — runs an OCR model and returns raw output. Built-in: `litellm` (every OpenAI-compatible call — vLLM-served VLMs *and* hosted APIs like Gemini), `layout_chat` (per-region OCR over the same proxy), `docling`, `tesseract`. Add new backends for inference runtimes that don't fit the LiteLLM-proxied path.
+- **`ModelBackend`** — runs an OCR model and returns raw output. Built-in: `litellm` (every OpenAI-compatible call — vLLM-served VLMs *and* hosted APIs like Gemini), `layout_chat` (per-region OCR over the same proxy), `tesseract`. Add new backends for inference runtimes that don't fit the LiteLLM-proxied path.
 - **`Runner`** — orchestrates the compute stack (LiteLLM proxy + N vLLM backends) for OCR workloads. Built-in: `local` (daemonised processes on this machine), `skypilot` (Kubernetes pool via SkyPilot), `hf` (HuggingFace Jobs API). Add new runners for AI Factory, Slurm, your in-house scheduler, etc.
 - **`LayoutDetector`** — finds typed regions on a page image. Used by layout-aware backends. Built-in: PP-DocLayoutV3.
 - **`Normalizer`** — converts a model's raw output into ocrscout's common document format. Add one when a new model emits a custom output dialect.
