@@ -70,7 +70,7 @@ dependencies = [
     # The torch version is deliberately left unpinned — DGX-class
     # hardware (ARM64 + CUDA) needs a torch wheel from Nvidia's index
     # that isn't on pypi, so a strict pin would lock those users out.
-    "vllm>=0.11.0",
+    "vllm>=0.11.0; sys_platform == 'linux'",
     "transformers>=4.59.0",
     "torch>=2.0.0",
     "pyarrow>=14.0",
