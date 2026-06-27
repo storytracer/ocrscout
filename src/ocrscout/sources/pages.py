@@ -61,7 +61,7 @@ class PagesSourceAdapter(SourceAdapter, BaseModel):
     end_idx: int | None = Field(default=None, ge=0)
 
     def iter_pages(self) -> Iterator[PageImage]:
-        from ocrscout.exports.stages import read_stage_rows, resolve_stage_files
+        from ocrscout.io.source_parquet import read_stage_rows, resolve_stage_files
 
         files = resolve_stage_files(self.path)
         if not files:

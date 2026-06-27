@@ -95,14 +95,22 @@ def run(
 
 
 def _print_summary(result: PipelineResult, *, dest: str) -> None:
-    table = Table(title="ocrscout run", show_lines=False)
-    table.add_column("stage")
-    table.add_column("written", justify="right")
-    table.add_column("skipped", justify="right")
-    table.add_column("failed", justify="right")
-    table.add_column("seconds", justify="right")
+    stages = Table(title="ocrscout run — stages", show_lines=False)
+    for col, just in [("stage", "left"), ("written", "right"), ("skipped", "right"),
+                      ("failed", "right"), ("seconds", "right")]:
+        stages.add_column(col, justify=just)
     for s in result.stages:
-        table.add_row(s.stage, str(s.rows_written), str(s.rows_skipped),
-                      str(s.rows_failed), f"{s.seconds:.1f}")
-    rprint(table)
+        stages.add_row(s.stage, str(s.rows_written), str(s.rows_skipped),
+                       str(s.rows_failed), f"{s.seconds:.1f}")
+    rprint(stages)
+
+    # Per-model breakdown from the most downstream stage that tallied models.
+    by_model = next((s.by_model for s in reversed(result.stages) if s.by_model), {})
+    if by_model:
+        models = Table(title="per model", show_lines=False)
+        for col, just in [("model", "left"), ("ok", "right"), ("failed", "right")]:
+            models.add_column(col, justify=just)
+        for name, tally in by_model.items():
+            models.add_row(name, str(tally.written), str(tally.failed))
+        rprint(models)
     rprint(f"[dim]Output: {dest}[/dim]")

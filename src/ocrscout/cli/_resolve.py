@@ -63,7 +63,7 @@ def is_stage_parquet(source: str | None) -> bool:
     if p.is_file():
         return p.suffix == ".parquet"
     if p.is_dir():
-        from ocrscout.exports.stages import resolve_stage_files
+        from ocrscout.io.source_parquet import resolve_stage_files
 
         return bool(resolve_stage_files(p))
     return False

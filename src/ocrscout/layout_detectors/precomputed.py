@@ -38,7 +38,7 @@ class PrecomputedLayoutDetector(LayoutDetector):
     def warm_up(self) -> None:
         if self._by_page is not None:
             return
-        from ocrscout.exports.stages import resolve_stage_files
+        from ocrscout.io.source_parquet import resolve_stage_files
 
         files = resolve_stage_files(self.path)
         if not files:
