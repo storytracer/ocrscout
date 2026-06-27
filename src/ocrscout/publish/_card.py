@@ -102,13 +102,22 @@ def _dataset_info_block(
     """Build the ``dataset_info`` YAML block from RESULTS_FEATURES, in the
     same shape ``Dataset.push_to_hub`` writes — so the Hub viewer (and any
     Croissant consumer) can read schema + sizes without downloading the
-    parquet."""
-    features: list[dict[str, Any]] = [
-        {"name": name, "dtype": _feature_dtype_yaml(feat)}
-        for name, feat in RESULTS_FEATURES.items()
-    ]
+    parquet.
+
+    The features list is serialized via ``Features._to_yaml_list()`` rather
+    than hand-built: a hand-rolled ``{"_type": "Image"}`` dtype does NOT
+    round-trip through ``datasets``' YAML parser (it expects ``dtype: image``)
+    and makes the Hub dataset-viewer's ``config_names`` job fail with
+    ``TypeError: 'str' object is not a mapping``.
+    """
+    from datasets import Features, Image
+
+    feats = dict(RESULTS_FEATURES)
     if has_image_column:
-        features.insert(2, {"name": "image", "dtype": {"_type": "Image"}})
+        # `_attach_image_column` appends the image column at the end of the
+        # pushed parquet, so mirror that order here.
+        feats["image"] = Image()
+    features: list[dict[str, Any]] = Features(feats)._to_yaml_list()
     splits: list[dict[str, Any]] = [{"name": SPLIT, "num_examples": n_rows}]
     if dataset_size_bytes is not None:
         splits[0]["num_bytes"] = int(dataset_size_bytes)
@@ -117,15 +126,6 @@ def _dataset_info_block(
         info["download_size"] = int(dataset_size_bytes)
         info["dataset_size"] = int(dataset_size_bytes)
     return info
-
-
-def _feature_dtype_yaml(feature: Any) -> Any:
-    """``Value("string")`` → ``"string"``; complex features fall back to a
-    ``{"_type": ...}`` mapping that mirrors what ``datasets`` writes."""
-    cls = type(feature).__name__
-    if cls == "Value":
-        return getattr(feature, "dtype", "string")
-    return {"_type": cls}
 
 
 def _render_dataset_body(

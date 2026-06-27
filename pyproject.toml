@@ -129,10 +129,10 @@ Issues = "https://github.com/storytracer/ocrscout/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/ocrscout"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/ocrscout/profiles" = "ocrscout/profiles"
-"src/ocrscout/viewer/static" = "ocrscout/viewer/static"
+# profiles/*.yaml and viewer/static/* live under the package tree and are
+# bundled by `packages` above. A force-include of those same paths maps each
+# file a second time and hatchling aborts the build with "A second file is
+# being added to the wheel archive at the same path" — so don't re-add them.
 
 [tool.hatch.build.targets.sdist]
 include = ["src/ocrscout", "README.md", "CLAUDE.md", "LICENSE"]
