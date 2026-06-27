@@ -52,6 +52,7 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
         "sources": {
             "hf_dataset": "ocrscout.sources.hf_dataset:HfDatasetSourceAdapter",
             "bhl": "ocrscout.sources.bhl:BhlSourceAdapter",
+            "pages": "ocrscout.sources.pages:PagesSourceAdapter",
         },
         "references": {
             "plain_text": "ocrscout.references.plain_text:PlainTextReferenceAdapter",
@@ -86,6 +87,7 @@ def _builtin_specs() -> dict[EntryGroup, dict[str, str]]:
         },
         "layout_detectors": {
             "pp-doclayout-v3": "ocrscout.layout_detectors.pp_doclayout_v3:PpDocLayoutV3Detector",
+            "precomputed": "ocrscout.layout_detectors.precomputed:PrecomputedLayoutDetector",
         },
         # Built-in Runners. Third-party runners (AI Factory, Slurm, …)
         # attach via the ``ocrscout.runners`` entry-point group declared

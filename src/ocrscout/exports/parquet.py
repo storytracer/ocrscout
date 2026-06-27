@@ -41,6 +41,7 @@ from ocrscout.exports.layout import (
     SPLIT,
     VOLUMES_PREFIX,
     find_parquet_files,
+    find_stage_files,
 )
 from ocrscout.exports.schema import RESULTS_FEATURES, VOLUMES_FEATURES
 from ocrscout.interfaces.export import ExportAdapter
@@ -158,11 +159,22 @@ def done_pairs_from_parquet(output_dir: Path) -> dict[str, set[str]]:
     Column projection means only those two columns hit disk; for BHL-scale
     runs (8K pages × N models) this completes in well under a second.
     """
+    return _done_pairs_from_files(find_parquet_files(output_dir))
+
+
+def done_pairs_from_raw(output_dir: Path) -> dict[str, set[str]]:
+    """Per-model done-set from ``data/raw-*.parquet`` — the ``ocrscout ocr``
+    stage's resume cursor (same ``(page_id, model)`` semantics as
+    :func:`done_pairs_from_parquet`, just over the raw shards)."""
+    return _done_pairs_from_files(find_stage_files(output_dir, "raw"))
+
+
+def _done_pairs_from_files(files: list[Path]) -> dict[str, set[str]]:
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     done: dict[str, set[str]] = {}
-    for path in find_parquet_files(output_dir):
+    for path in files:
         try:
             table = pq.read_table(str(path), columns=["page_id", "model"])
         except (OSError, pa.ArrowInvalid):
@@ -176,6 +188,29 @@ def done_pairs_from_parquet(output_dir: Path) -> dict[str, set[str]]:
             if pid is None or model is None:
                 continue
             done.setdefault(str(model), set()).add(str(pid))
+    return done
+
+
+def done_page_ids(output_dir: Path, prefix: str) -> set[str]:
+    """Set of ``page_id``s already present in ``data/<prefix>-*.parquet``.
+
+    The single-stage resume cursor for ``sample`` / ``layout`` / ``ocr``
+    (the latter additionally uses :func:`done_pairs_from_parquet` for its
+    per-``(page_id, model)`` multi-model semantics). Projects only the
+    ``page_id`` column so resume stays cheap.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    done: set[str] = set()
+    for path in find_stage_files(output_dir, prefix):
+        try:
+            table = pq.read_table(str(path), columns=["page_id"])
+        except (OSError, pa.ArrowInvalid):
+            continue
+        for pid in table.column("page_id").to_pylist():
+            if pid is not None:
+                done.add(str(pid))
     return done
 
 

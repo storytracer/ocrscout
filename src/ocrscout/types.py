@@ -353,6 +353,10 @@ class PipelineConfig(BaseModel):
     comparisons: list[str] | None = None
     models: list[str]
     normalizer_overrides: dict[str, str] = Field(default_factory=dict)
+    # When set, ``backend: layout_chat`` profiles use this detector (typically
+    # the ``precomputed`` detector reading a layout-*.parquet) instead of the
+    # one named in their profile YAML. Whole-page profiles ignore it.
+    layout: AdapterRef | None = None
     export: AdapterRef
     reporter: AdapterRef | None = None
     sample: int | None = None

@@ -61,7 +61,6 @@ from ocrscout.runners import _ephemeral, _ports
 from ocrscout.runners._daemon import (
     daemonize_subprocess,
     pid_alive,
-    read_pid,
     terminate,
     uptime_seconds,
 )

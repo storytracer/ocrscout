@@ -25,7 +25,7 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from types import UnionType
-from typing import Annotated, Any, Literal, Union, get_args, get_origin
+from typing import Any, Literal, Union, get_args, get_origin
 
 import typer
 from pydantic import BaseModel

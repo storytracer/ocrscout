@@ -34,6 +34,7 @@ from ocrscout.errors import (
 )
 from ocrscout.interfaces.source import SourceAdapter
 from ocrscout.exports.layout import parquet_dest
+from ocrscout.exports.stages import RAW_COST_KEYS
 from ocrscout.interfaces.comparison import (
     BaselineView,
     Comparison,
@@ -80,6 +81,12 @@ def run(
     ),
     models: str = typer.Option(
         ..., "--models", "-m", help="Comma-separated profile names."
+    ),
+    layout: str | None = typer.Option(
+        None, "--layout",
+        help="A layout-*.parquet (or dir) of precomputed regions. layout_chat "
+             "profiles OCR against these instead of running detection; "
+             "whole-page profiles ignore it.",
     ),
     reference: str | None = typer.Option(
         None, "--reference", help="Reference adapter name (e.g. plain_text, bhl_ocr)."
@@ -200,7 +207,16 @@ def run(
         )
 
     source_args: dict[str, Any] = _parse_source_args(source_arg or [])
-    if source_name == "hf_dataset":
+    from ocrscout.cli._resolve import is_stage_parquet
+    if source_name == "hf_dataset" and is_stage_parquet(source):
+        # A stage parquet (sample/layout/ocr output) is consumed by the
+        # `pages` adapter, which reconstructs lazy PageImages from the
+        # recorded source_uri. Lets `run --source out/` chain off a prior
+        # `ocrscout sample` without re-listing the original corpus.
+        source_name = "pages"
+        source_args["path"] = source
+        log.info("--source is a stage parquet; using the `pages` source adapter")
+    elif source_name == "hf_dataset":
         # Only the default fsspec/HF-Hub adapter consumes `--source` as a
         # path; corpus-bound adapters like `bhl` ignore it (warned below).
         source_args["path"] = source
@@ -233,6 +249,10 @@ def run(
         ),
         comparisons=comparison_names,
         models=[m.strip() for m in models.split(",") if m.strip()],
+        layout=(
+            AdapterRef(name="precomputed", args={"path": layout})
+            if layout else None
+        ),
         export=AdapterRef(name=export, args={"dest": str(parquet_dest(output_dir))}),
         sample=sample,
         output_dir=output_dir,
@@ -494,8 +514,15 @@ def run_pipeline(
     keep_up: bool = False,
     resume: bool = False,
     batch_concurrency: int | None = None,
+    ocr_only: bool = False,
 ) -> None:
     """Launch the required runner (if any), run the pipeline, tear down.
+
+    ``ocr_only=True`` is the ``ocrscout ocr`` stage: each (page, raw) is
+    written to ``data/raw-*.parquet`` (RawOutput + cost columns) instead of
+    being normalized/compared/exported to ``train-*.parquet``. Everything else
+    (runner launch, autoscaler, model-major chunking, cost recording) is
+    identical, so the stage shares all of this orchestration.
 
     Shared by ``ocrscout run`` and ``ocrscout apply``. Auto-launches a
     ``LocalRunner`` for any profile with ``runtime != cpu``.
@@ -533,7 +560,8 @@ def run_pipeline(
 
     if not vllm_profiles and not hosted_profiles:
         log.info("All profiles are runtime=cpu; running CPU-side backends in-process.")
-        _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
+        _execute(cfg, source=source, parallel_models=parallel_models,
+                 resume=resume, ocr_only=ocr_only)
         return
 
     runner = LocalRunner()
@@ -569,7 +597,8 @@ def run_pipeline(
             raise typer.Exit(code=1) from e
 
         try:
-            _execute(cfg, source=source, parallel_models=parallel_models, resume=resume)
+            _execute(cfg, source=source, parallel_models=parallel_models,
+                     resume=resume, ocr_only=ocr_only)
         finally:
             _publish_backend_overrides({})
             if not keep_up and not reused_existing:
@@ -627,6 +656,7 @@ def run_pipeline(
                 source=source,
                 parallel_models=len(chunk_models),
                 resume=resume,
+                ocr_only=ocr_only,
             )
         finally:
             _publish_backend_overrides({})
@@ -657,6 +687,7 @@ def run_pipeline(
                 source=source,
                 parallel_models=min(parallel_models, len(hosted_names)),
                 resume=resume,
+                ocr_only=ocr_only,
             )
         finally:
             _publish_backend_overrides({})
@@ -673,6 +704,7 @@ def run_pipeline(
             source=source,
             parallel_models=min(parallel_models, len(cpu_names)),
             resume=resume,
+            ocr_only=ocr_only,
         )
 
 
@@ -713,6 +745,7 @@ def _execute(
     source: SourceAdapter,
     parallel_models: int = 1,
     resume: bool = False,
+    ocr_only: bool = False,
 ) -> None:
     # Resolve the active GPU context once and stamp it onto every row of
     # this run. Env-var overrides (set by SkyPilot/HF job YAMLs) take
@@ -732,8 +765,14 @@ def _execute(
     # inside ``_run`` so ``_run_one_model`` consumes pages lazily.
     done_pairs: dict[str, set[str]] = {}
     if resume:
-        from ocrscout.exports.parquet import done_pairs_from_parquet
-        done_pairs = done_pairs_from_parquet(cfg.output_dir)
+        from ocrscout.exports.parquet import (
+            done_pairs_from_parquet,
+            done_pairs_from_raw,
+        )
+        done_pairs = (
+            done_pairs_from_raw(cfg.output_dir) if ocr_only
+            else done_pairs_from_parquet(cfg.output_dir)
+        )
         total_done = sum(len(s) for s in done_pairs.values())
         if total_done:
             log.info(
@@ -771,34 +810,45 @@ def _execute(
         raise typer.Exit(code=1)
     del probe
 
+    # The OCR stage writes raw model output (no normalize / compare /
+    # reference). The normalize stage and the fused `run` do the full
+    # ExportRecord path. Build only what the active mode needs.
     reference_adapter: ReferenceAdapter | None = None
-    if cfg.reference is not None:
-        ref_cls = registry.get("references", cfg.reference.name)
-        reference_adapter = ref_cls(**cfg.reference.args)
-        log.info("Reference adapter: %s", cfg.reference.name)
+    active_comparisons: list[Comparison] = []
+    exporter = None
+    raw_writer = None
+    if ocr_only:
+        from ocrscout.exports.schema import RAW_FEATURES
+        from ocrscout.exports.stages import StageWriter
+        raw_writer = StageWriter(cfg.output_dir, RAW_FEATURES, "raw")
+    else:
+        if cfg.reference is not None:
+            ref_cls = registry.get("references", cfg.reference.name)
+            reference_adapter = ref_cls(**cfg.reference.args)
+            log.info("Reference adapter: %s", cfg.reference.name)
 
-    active_comparisons = _resolve_comparisons(
-        cfg.comparisons, has_reference=reference_adapter is not None,
-    )
-    if active_comparisons:
-        log.info(
-            "Comparisons: %s",
-            ", ".join(c.name for c in active_comparisons),
+        active_comparisons = _resolve_comparisons(
+            cfg.comparisons, has_reference=reference_adapter is not None,
         )
+        if active_comparisons:
+            log.info(
+                "Comparisons: %s",
+                ", ".join(c.name for c in active_comparisons),
+            )
 
-    exporter_cls = registry.get("exports", cfg.export.name)
-    exporter = exporter_cls()
-    exporter.open(cfg.export.args["dest"])
-    # Volumes flow through the source's optional iter_volumes() — the run
-    # loop materializes them up-front so the per-volume sidecar parquet
-    # exists even if a backend later fails on a particular page. Volume
-    # objects carry no images, so their list is cheap to hold.
-    volume_count = 0
-    for volume in source.iter_volumes():
-        exporter.write_volume(volume)
-        volume_count += 1
-    if volume_count:
-        log.info("Loaded %d volume(s) from source", volume_count)
+        exporter_cls = registry.get("exports", cfg.export.name)
+        exporter = exporter_cls()
+        exporter.open(cfg.export.args["dest"])
+        # Volumes flow through the source's optional iter_volumes() — the run
+        # loop materializes them up-front so the per-volume sidecar parquet
+        # exists even if a backend later fails on a particular page. Volume
+        # objects carry no images, so their list is cheap to hold.
+        volume_count = 0
+        for volume in source.iter_volumes():
+            exporter.write_volume(volume)
+            volume_count += 1
+        if volume_count:
+            log.info("Loaded %d volume(s) from source", volume_count)
 
     log.info("Streaming pages from %r", source_label)
 
@@ -822,6 +872,8 @@ def _execute(
             comparisons=active_comparisons,
             metrics=metrics,
             gpu=gpu_cfg,
+            raw_writer=raw_writer,
+            layout_override=cfg.layout,
         )
         return name, result
 
@@ -837,13 +889,20 @@ def _execute(
                     name, run_result = fut.result()
                     results[name] = run_result
     finally:
-        exporter.close()
+        if exporter is not None:
+            exporter.close()
+        if raw_writer is not None:
+            raw_writer.close()
         metrics.finish()
 
     summary_rows = [
         (m, results[m]) for m in cfg.models if m in results
     ]
-    _print_summary(summary_rows, dest=cfg.export.args["dest"])
+    dest = (
+        str(cfg.output_dir / "data") if ocr_only
+        else cfg.export.args["dest"]
+    )
+    _print_summary(summary_rows, dest=dest)
 
 
 class _PeekableIter:
@@ -907,12 +966,33 @@ def _run_one_model(
     comparisons: list[Comparison],
     metrics: MetricsCollector,
     gpu: GpuConfig,
+    raw_writer=None,
+    layout_override: AdapterRef | None = None,
 ) -> _ModelRunResult:
+    ocr_only = raw_writer is not None
     try:
         profile = resolve(model_name)
+        if layout_override is not None:
+            if profile.backend == "layout_chat":
+                profile = profile.model_copy(update={
+                    "layout_detector": layout_override.name,
+                    "layout_detector_args": dict(layout_override.args),
+                })
+                log.info(
+                    "[%s] layout override: detector=%s args=%s",
+                    model_name, layout_override.name, layout_override.args,
+                )
+            else:
+                log.info(
+                    "[%s] --layout ignored (backend=%s is whole-page)",
+                    model_name, profile.backend,
+                )
         backend = registry.get("backends", profile.backend)()
-        normalizer_name = normalizer_overrides.get(model_name, profile.normalizer)
-        normalizer = registry.get("normalizers", normalizer_name)()
+        if ocr_only:
+            normalizer = None
+        else:
+            normalizer_name = normalizer_overrides.get(model_name, profile.normalizer)
+            normalizer = registry.get("normalizers", normalizer_name)()
     except Exception as e:
         log.error("[%s] setup failed: %s", model_name, e)
         return _ModelRunResult(ok=0, failed=0, run_seconds=0.0)
@@ -962,25 +1042,37 @@ def _run_one_model(
                 # is the streaming-friendly approximation of what used to
                 # be a single post-hoc value applied to every row.
                 elapsed_run = time.perf_counter() - t_run0
-                handled = _process_one(
-                    model_name=model_name,
-                    page=page,
-                    raw=raw,
-                    profile=profile,
-                    normalizer=normalizer,
-                    exporter=exporter,
-                    reference_adapter=reference_adapter,
-                    comparisons=comparisons,
-                    metrics=metrics,
-                    gpu=gpu,
-                    prepare_seconds=prepare_seconds,
-                    run_seconds_so_far=elapsed_run,
-                    pages_attempted_so_far=ok + failed + 1,
-                    record_kv=record_kv,
-                    record_concurrency=record_concurrency,
-                    record_region_concurrency=record_region_concurrency,
-                    accumulated_comparisons=accumulated_comparisons,
-                )
+                if ocr_only:
+                    handled = _process_one_ocr(
+                        model_name=model_name,
+                        page=page,
+                        raw=raw,
+                        gpu=gpu,
+                        record_kv=record_kv,
+                        record_concurrency=record_concurrency,
+                        record_region_concurrency=record_region_concurrency,
+                        raw_writer=raw_writer,
+                    )
+                else:
+                    handled = _process_one(
+                        model_name=model_name,
+                        page=page,
+                        raw=raw,
+                        profile=profile,
+                        normalizer=normalizer,
+                        exporter=exporter,
+                        reference_adapter=reference_adapter,
+                        comparisons=comparisons,
+                        metrics=metrics,
+                        gpu=gpu,
+                        prepare_seconds=prepare_seconds,
+                        run_seconds_so_far=elapsed_run,
+                        pages_attempted_so_far=ok + failed + 1,
+                        record_kv=record_kv,
+                        record_concurrency=record_concurrency,
+                        record_region_concurrency=record_region_concurrency,
+                        accumulated_comparisons=accumulated_comparisons,
+                    )
                 if handled == "ok":
                     ok += 1
                 else:
@@ -1002,6 +1094,193 @@ def _run_one_model(
         run_seconds=run_seconds,
         comparison_results=accumulated_comparisons,
     )
+
+
+def finalize_cost_ctx(
+    page_id: str,
+    *,
+    gpu: GpuConfig,
+    record_kv: int | None,
+    record_concurrency: int | None,
+    record_region_concurrency: int | None,
+) -> dict[str, Any]:
+    """Close the cost recorder's page and project the cost/autoscaler columns.
+
+    ``gpu_type`` / ``provider`` / ``cost_per_hour`` are stamped unconditionally
+    from the active ``GpuConfig``; the per-page token / dollar fields come from
+    the LiteLLM callback when a backend opened a page (only LiteLLM-routed ones
+    do), else null. The returned dict's keys are exactly ``RAW_COST_KEYS`` so it
+    round-trips verbatim from the OCR stage's ``raw-*.parquet`` through to the
+    final ``train-*.parquet`` without recomputation.
+    """
+    cost_metrics = cost_recorder.close_page(page_id)
+    ctx: dict[str, Any] = {
+        "gpu_type": gpu.type,
+        "provider": gpu.provider,
+        "cost_per_hour": gpu.cost_per_hour,
+        "elapsed_seconds": None,
+        "input_tokens": None,
+        "output_tokens": None,
+        "litellm_cost": None,
+        "gpu_time_cost": None,
+        "kv_cache_memory_bytes": record_kv,
+        "concurrent_requests": record_concurrency,
+        "region_concurrency": record_region_concurrency,
+    }
+    if cost_metrics is not None:
+        elapsed_s = cost_metrics.elapsed_seconds
+        ctx.update(
+            elapsed_seconds=elapsed_s,
+            input_tokens=cost_metrics.input_tokens,
+            output_tokens=cost_metrics.output_tokens,
+            litellm_cost=cost_metrics.litellm_cost,
+            gpu_time_cost=elapsed_s / 3600.0 * gpu.cost_per_hour,
+        )
+    return ctx
+
+
+def normalize_compare_to_record(
+    *,
+    page,
+    raw,
+    model_name: str,
+    profile,
+    normalizer,
+    reference_adapter: ReferenceAdapter | None,
+    comparisons: list[Comparison],
+    cost_ctx: dict[str, Any],
+    base_metrics: dict[str, Any] | None = None,
+    accumulated_comparisons: list[ComparisonResult] | None = None,
+    metrics: MetricsCollector | None = None,
+) -> ExportRecord | None:
+    """Normalize + compare one (page, raw) into an ``ExportRecord``.
+
+    Shared by the fused ``run`` loop and the standalone ``ocrscout normalize``
+    stage. Returns ``None`` (caller counts a failure) when the normalizer
+    raises. Callers must handle ``raw.error`` before calling — error pages
+    never reach here. ``cost_ctx`` supplies the cost/autoscaler columns
+    (from the live recorder in ``run``; from the raw parquet row in
+    ``normalize``).
+    """
+    try:
+        t_norm0 = time.perf_counter()
+        if metrics is not None:
+            with metrics.stage(f"{model_name}.normalize"):
+                doc = normalizer.normalize(raw, page, profile)
+        else:
+            doc = normalizer.normalize(raw, page, profile)
+        normalize_seconds = time.perf_counter() - t_norm0
+    except NormalizerError as e:
+        log.warning("normalizer failed for %s/%s: %s", model_name, page.file_id, e)
+        return None
+
+    item_count, text_length, markdown, text = _doc_stats(doc)
+
+    reference = None
+    if reference_adapter is not None:
+        try:
+            reference = reference_adapter.get(page)
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "reference adapter failed for %s/%s: %s",
+                model_name, page.file_id, e,
+            )
+
+    page_comparisons: dict[str, ComparisonResult] = {}
+    if reference is not None and comparisons:
+        view_pred = PredictionView(
+            page_id=page.page_id,
+            label=model_name,
+            text=text,
+            document=doc,
+        )
+        view_base = BaselineView(
+            page_id=page.page_id,
+            label=reference_adapter.name if reference_adapter else "reference",
+            text=reference.text,
+            document=reference.document,
+            provenance=reference.provenance,
+        )
+        for cmp in comparisons:
+            try:
+                result = cmp.compare(view_pred, view_base)
+            except Exception as e:  # noqa: BLE001
+                log.warning(
+                    "comparison %s failed for %s/%s: %s",
+                    cmp.name, model_name, page.file_id, e,
+                )
+                continue
+            if result is not None:
+                page_comparisons[cmp.name] = result
+                if accumulated_comparisons is not None:
+                    accumulated_comparisons.append(result)
+
+    metrics_dict = dict(base_metrics or {})
+    metrics_dict.update(
+        normalize_seconds=round(normalize_seconds, 4),
+        tokens=raw.tokens,
+        item_count=item_count,
+        text_length=text_length,
+    )
+    return ExportRecord(
+        page=page,
+        model=model_name,
+        document=doc,
+        raw=raw,
+        reference=reference,
+        markdown=markdown,
+        text=text,
+        metrics=metrics_dict,
+        comparisons=page_comparisons,
+        **{k: cost_ctx.get(k) for k in RAW_COST_KEYS},
+    )
+
+
+def _process_one_ocr(
+    *,
+    model_name: str,
+    page,
+    raw,
+    gpu: GpuConfig,
+    record_kv: int | None,
+    record_concurrency: int | None,
+    record_region_concurrency: int | None,
+    raw_writer,
+) -> str:
+    """OCR-stage per-page sink: write a ``raw-*.parquet`` row, no normalize.
+
+    Error pages are still written (with ``error`` set) so resume skips them
+    and ``ocrscout normalize`` / inspection can see the failure — but they're
+    counted as failures here, matching the fused run's ok/failed tally. The
+    cost columns come from the live recorder via ``finalize_cost_ctx`` and
+    ride along to ``train-*.parquet`` through ``normalize``.
+    """
+    from ocrscout.exports.stages import raw_row
+
+    try:
+        cost_ctx = finalize_cost_ctx(
+            page.page_id,
+            gpu=gpu,
+            record_kv=record_kv,
+            record_concurrency=record_concurrency,
+            record_region_concurrency=record_region_concurrency,
+        )
+        raw_writer.write(raw_row(page, model_name, raw, cost_ctx))
+        if raw.error:
+            log.warning(
+                "model %s page %s reported error: %s",
+                model_name, page.file_id, raw.error,
+            )
+            return "failed"
+        return "ok"
+    finally:
+        img = getattr(page, "image", None)
+        if img is not None:
+            try:
+                img.close()
+            except Exception:  # noqa: BLE001
+                pass
+            page.image = None
 
 
 def _process_one(
@@ -1027,121 +1306,48 @@ def _process_one(
     """Normalize + compare + export one (page, raw). Returns 'ok' or 'failed'.
 
     Split out of ``_run_one_model`` only so the streaming loop body stays
-    legible; no semantic change vs. the previous per-row block.
+    legible; the normalize/compare/build is shared with ``ocrscout normalize``
+    via ``normalize_compare_to_record``.
 
     Defensive teardown in the ``finally`` block: with the lazy
-    ``PageImage`` contract introduced alongside this code, backends
-    close + clear ``page.image`` themselves the moment they're done
-    (whole-page litellm inside ``with page.open_image()``, layout_chat
-    inside ``_publish_page`` after the last region resolves). The
-    teardown here is the catch-all for any future normalizer that pins
-    ``page.image`` mid-pipeline — it guarantees the exporter buffer
-    never inherits a decoded RGB buffer even if a new code path forgets
-    to drop one."""
+    ``PageImage`` contract, backends close + clear ``page.image`` themselves
+    the moment they're done (whole-page litellm inside ``with
+    page.open_image()``, layout_chat inside ``_publish_page`` after the last
+    region resolves). The teardown here is the catch-all for any future
+    normalizer that pins ``page.image`` mid-pipeline."""
     try:
         if raw.error:
             log.warning("model %s page %s reported error: %s", model_name, page.file_id, raw.error)
             cost_recorder.close_page(page.page_id)
             return "failed"
-        try:
-            t_norm0 = time.perf_counter()
-            with metrics.stage(f"{model_name}.normalize"):
-                doc = normalizer.normalize(raw, page, profile)
-            normalize_seconds = time.perf_counter() - t_norm0
-        except NormalizerError as e:
-            log.warning("normalizer failed for %s/%s: %s", model_name, page.file_id, e)
-            cost_recorder.close_page(page.page_id)
-            return "failed"
 
-        item_count, text_length, markdown, text = _doc_stats(doc)
-
-        reference = None
-        if reference_adapter is not None:
-            try:
-                reference = reference_adapter.get(page)
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "reference adapter failed for %s/%s: %s",
-                    model_name, page.file_id, e,
-                )
-
-        page_comparisons: dict[str, ComparisonResult] = {}
-        if reference is not None and comparisons:
-            view_pred = PredictionView(
-                page_id=page.page_id,
-                label=model_name,
-                text=text,
-                document=doc,
-            )
-            view_base = BaselineView(
-                page_id=page.page_id,
-                label=reference_adapter.name if reference_adapter else "reference",
-                text=reference.text,
-                document=reference.document,
-                provenance=reference.provenance,
-            )
-            for cmp in comparisons:
-                try:
-                    result = cmp.compare(view_pred, view_base)
-                except Exception as e:  # noqa: BLE001
-                    log.warning(
-                        "comparison %s failed for %s/%s: %s",
-                        cmp.name, model_name, page.file_id, e,
-                    )
-                    continue
-                if result is not None:
-                    page_comparisons[cmp.name] = result
-                    accumulated_comparisons.append(result)
-
-        # Close the cost recorder's page (if the backend opened one — only
-        # LiteLLM-routed backends do). Compute gpu_time_cost from elapsed
-        # and the active GpuConfig so the column is comparable across
-        # GPUs without re-deriving downstream.
-        cost_metrics = cost_recorder.close_page(page.page_id)
-        if cost_metrics is not None:
-            elapsed_s = cost_metrics.elapsed_seconds
-            gpu_time_cost = elapsed_s / 3600.0 * gpu.cost_per_hour
-            input_tokens = cost_metrics.input_tokens
-            output_tokens = cost_metrics.output_tokens
-            litellm_cost = cost_metrics.litellm_cost
-        else:
-            elapsed_s = None
-            gpu_time_cost = None
-            input_tokens = None
-            output_tokens = None
-            litellm_cost = None
-
+        cost_ctx = finalize_cost_ctx(
+            page.page_id,
+            gpu=gpu,
+            record_kv=record_kv,
+            record_concurrency=record_concurrency,
+            record_region_concurrency=record_region_concurrency,
+        )
         run_seconds_per_page = run_seconds_so_far / max(pages_attempted_so_far, 1)
-        record = ExportRecord(
+        record = normalize_compare_to_record(
             page=page,
-            model=model_name,
-            document=doc,
             raw=raw,
-            reference=reference,
-            markdown=markdown,
-            text=text,
-            metrics={
+            model_name=model_name,
+            profile=profile,
+            normalizer=normalizer,
+            reference_adapter=reference_adapter,
+            comparisons=comparisons,
+            cost_ctx=cost_ctx,
+            base_metrics={
                 "prepare_seconds": round(prepare_seconds, 4),
                 "run_seconds_total": round(run_seconds_so_far, 4),
                 "run_seconds_per_page": round(run_seconds_per_page, 4),
-                "normalize_seconds": round(normalize_seconds, 4),
-                "tokens": raw.tokens,
-                "item_count": item_count,
-                "text_length": text_length,
             },
-            comparisons=page_comparisons,
-            gpu_type=gpu.type,
-            provider=gpu.provider,
-            cost_per_hour=gpu.cost_per_hour,
-            elapsed_seconds=elapsed_s,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            litellm_cost=litellm_cost,
-            gpu_time_cost=gpu_time_cost,
-            kv_cache_memory_bytes=record_kv,
-            concurrent_requests=record_concurrency,
-            region_concurrency=record_region_concurrency,
+            accumulated_comparisons=accumulated_comparisons,
+            metrics=metrics,
         )
+        if record is None:
+            return "failed"
         exporter.write(record)
         return "ok"
     finally:

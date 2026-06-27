@@ -47,6 +47,14 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 from ocrscout import cost as cost_mod
+from ocrscout.backends._detector_pool import (
+    _resolve_detector_workers,
+    _resolve_torch_threads_per_op,
+    _set_torch_intraop_threads,
+)
+from ocrscout.backends._detector_pool import (
+    sort_reading_order as _sort_reading_order,
+)
 from ocrscout.backends.litellm import (
     _build_messages,
     _split_sampling,
@@ -65,22 +73,6 @@ _DEFAULT_REGION_CONCURRENCY = 8
 autoscaler via ``backend_args.region_concurrency`` (or the runner's
 state file for submit-time workers); only applies when both lookups
 return nothing."""
-_DEFAULT_RESERVED_CPUS = 2
-"""CPUs withheld from the detector pool's autosize: one for the main /
-yield thread, one for litellm + HTTP work. Region executor threads are
-I/O-bound (HTTP wait on vLLM), so they don't compete for CPU
-meaningfully. The auto-derived pool fills the rest, scaling linearly
-with ``sched_getaffinity``; no hard cap. Override via
-``backend_args.detector_workers``, ``--detector-workers``, or
-``OCRSCOUT_DETECTOR_WORKERS`` if a profile-specific value is needed."""
-OCRSCOUT_DETECTOR_WORKERS_ENV = "OCRSCOUT_DETECTOR_WORKERS"
-"""Runtime override for detector worker count. Same precedence story as
-``region_concurrency``: explicit profile > state-file override (set by
-the runner) > env > auto."""
-OCRSCOUT_DETECTOR_TORCH_THREADS_ENV = "OCRSCOUT_DETECTOR_TORCH_THREADS"
-"""Runtime override for ``torch.set_num_threads(V)`` — PyTorch's intra-op
-parallelism per detector forward. Default is the leftover CPU budget split
-evenly across detector workers (floor 1)."""
 _DEFAULT_REQUEST_TIMEOUT = 300.0
 """Per-region timeout (seconds) passed to ``litellm.completion``. Regions
 are smaller than whole pages, so 5 minutes is a generous ceiling — most
@@ -104,9 +96,6 @@ _MODELS_PROBE_TIMEOUT = 15.0
 # ``region_concurrency`` in flight, would still finish well under
 # ``timeout * (1 + num_retries) * 2`` unless something has gone wrong.
 _STALL_WARN_ELAPSED_S = _DEFAULT_REQUEST_TIMEOUT * (1 + _DEFAULT_NUM_RETRIES) * 2
-# Vertical bucketing for top-then-left reading-order sort. 50 px tolerates
-# small same-row jitter without conflating rows on tightly-packed pages.
-_READING_ORDER_ROW_PX = 50
 
 _SENTINEL: Any = object()
 """Marker pushed onto ``done_queue`` by the producer's ``finally`` so the
@@ -149,74 +138,6 @@ def _resolve_region_concurrency(profile: ModelProfile) -> int:
     if override is not None:
         return override
     return _DEFAULT_REGION_CONCURRENCY
-
-
-def _available_cpus() -> int:
-    """CPUs visible to this process. ``sched_getaffinity`` respects cgroup
-    and ``taskset`` masks (which a generic ``os.cpu_count()`` does not);
-    falls back to ``cpu_count`` on platforms without the affinity API
-    (macOS)."""
-    try:
-        return max(1, len(os.sched_getaffinity(0)))
-    except (AttributeError, OSError):
-        return max(1, os.cpu_count() or 1)
-
-
-def _resolve_detector_workers(profile: ModelProfile) -> int:
-    """Precedence: explicit profile value > state-file override > env > auto.
-
-    Auto: ``max(1, (available_cpus - reserved) // 2)`` — half the
-    available CPUs go to detector workers, the other half become
-    ``torch.set_num_threads(V)`` budget so each forward pass gets some
-    intra-op parallelism. Together that's ``N × V ≈ available -
-    reserved`` cores in flight (e.g. 24-core → N=11, V=2; 8-core →
-    N=3, V=2). No hard cap — the ``reserved`` constant is the safety
-    buffer. Pathologically large boxes (128+ cores) can pin via the
-    env / profile overrides if 60+ detector instances is too much
-    resident weight.
-    """
-    explicit = (profile.backend_args or {}).get("detector_workers")
-    if explicit is not None:
-        return max(1, int(explicit))
-    override = _state_override(profile.name, "detector_workers")
-    if override is not None:
-        return max(1, override)
-    raw_env = os.environ.get(OCRSCOUT_DETECTOR_WORKERS_ENV)
-    if raw_env:
-        try:
-            return max(1, int(raw_env))
-        except ValueError:
-            log.warning(
-                "%s=%r is not an int; ignoring",
-                OCRSCOUT_DETECTOR_WORKERS_ENV, raw_env,
-            )
-    available = _available_cpus()
-    budget = max(1, available - _DEFAULT_RESERVED_CPUS)
-    return max(1, budget // 2 or 1)
-
-
-def _resolve_torch_threads_per_op(profile: ModelProfile, n_workers: int) -> int:
-    """``torch.set_num_threads(V)`` value. Profile override → env → auto.
-
-    Auto: leftover CPU budget after the detector workers' own threads,
-    split per worker. The product ``n_workers × V`` should land near the
-    available core count to avoid oversubscription.
-    """
-    explicit = (profile.backend_args or {}).get("detector_torch_threads")
-    if explicit is not None:
-        return max(1, int(explicit))
-    raw_env = os.environ.get(OCRSCOUT_DETECTOR_TORCH_THREADS_ENV)
-    if raw_env:
-        try:
-            return max(1, int(raw_env))
-        except ValueError:
-            log.warning(
-                "%s=%r is not an int; ignoring",
-                OCRSCOUT_DETECTOR_TORCH_THREADS_ENV, raw_env,
-            )
-    available = _available_cpus()
-    budget = max(1, available - _DEFAULT_RESERVED_CPUS)
-    return max(1, budget // max(1, n_workers))
 
 
 class LayoutChatBackend(ModelBackend):
@@ -597,23 +518,6 @@ class LayoutChatBackend(ModelBackend):
             "%s layout-chat finished %d pages in %.1fs",
             prefix, total_pages, time.perf_counter() - t_total,
         )
-
-
-def _set_torch_intraop_threads(n: int) -> None:
-    """Idempotent ``torch.set_num_threads(n)``. Best-effort: if torch
-    isn't yet importable (e.g. the ``[layout]`` extra isn't installed
-    despite a layout_chat profile somehow making it this far), log and
-    move on — the first detector worker's ``_ensure_loaded`` will then
-    raise the real ImportError."""
-    try:
-        import torch  # type: ignore[import-not-found]
-    except ImportError:
-        log.debug("torch not importable; skipping set_num_threads(%d)", n)
-        return
-    try:
-        torch.set_num_threads(max(1, int(n)))
-    except Exception as e:  # noqa: BLE001
-        log.warning("torch.set_num_threads(%d) failed: %s", n, e)
 
 
 def _detector_worker_loop(
@@ -1116,25 +1020,6 @@ def _substitute_region_dims(template: str, crop: Any) -> str:
         return template
     w, h = crop.size  # PIL .size is (width, height)
     return template.replace("{width}", str(w)).replace("{height}", str(h))
-
-
-def _sort_reading_order(regions: list[LayoutRegion]) -> list[LayoutRegion]:
-    """Order regions for downstream document body assembly.
-
-    If every region carries a non-None ``reading_order`` (the detector
-    predicted it — e.g. PP-DocLayoutV3 emits results in reading order), use
-    that. Otherwise fall back to a top-then-left bucketed sort that
-    tolerates small same-row jitter on tightly-packed pages.
-    """
-    if regions and all(r.reading_order is not None for r in regions):
-        return sorted(regions, key=lambda r: (r.reading_order or 0, r.bbox[1], r.bbox[0]))
-
-    def heuristic_key(r: LayoutRegion) -> tuple[int, float]:
-        top = r.bbox[1]
-        left = r.bbox[0]
-        return (int(round(top / _READING_ORDER_ROW_PX)) * _READING_ORDER_ROW_PX, left)
-
-    return sorted(regions, key=heuristic_key)
 
 
 def _list_proxy_models(proxy_url: str, *, timeout: float) -> set[str]:

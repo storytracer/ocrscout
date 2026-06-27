@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import fcntl
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import yaml

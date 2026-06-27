@@ -25,6 +25,27 @@ VOLUMES_PREFIX = "volumes"
 DEFAULT_VOLUMES_BASENAME = f"{VOLUMES_PREFIX}-00000-of-00001.parquet"
 VOLUMES_GLOB = f"{DATA_DIR}/{VOLUMES_PREFIX}-*.parquet"
 
+# Decoupled-stage intermediate artifacts. Each lives under the same ``data/``
+# directory as the final ``train-*.parquet`` so a single output dir can hold
+# every stage's output side by side, discoverable with parallel globs.
+PAGES_PREFIX = "pages"
+LAYOUT_PREFIX = "layout"
+RAW_PREFIX = "raw"
+STAGE_PREFIXES: tuple[str, ...] = (PAGES_PREFIX, LAYOUT_PREFIX, RAW_PREFIX)
+
+
+def stage_glob(prefix: str) -> str:
+    """Glob (relative to output_dir) for a stage's parquet shards."""
+    return f"{DATA_DIR}/{prefix}-*.parquet"
+
+
+def find_stage_files(output_dir: Path, prefix: str) -> list[Path]:
+    """All ``<prefix>-*.parquet`` shards under ``output_dir/data/``, sorted."""
+    data_dir = output_dir / DATA_DIR
+    if not data_dir.is_dir():
+        return []
+    return sorted(data_dir.glob(f"{prefix}-*.parquet"))
+
 
 def parquet_dest(output_dir: Path) -> Path:
     """Path the writer should create."""
