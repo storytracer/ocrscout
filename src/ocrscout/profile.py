@@ -30,6 +30,16 @@ BackendName = str
 # branches on this field re-checks against the constrained Literal here.
 Runtime = Literal["vllm", "hosted", "cpu"]
 OutputFormat = Literal["markdown", "doctags", "layout_json"]
+BBoxCoordinateSpace = Literal["original", "smart_resize"]
+
+# Qwen2-VL / DotsVLProcessor smart_resize defaults (patch_size 14 × merge_size
+# 2 = factor 28). Used to map a whole-page VLM's resized-space bboxes back to
+# original image pixels when ``bbox_coordinate_space == "smart_resize"``.
+DEFAULT_SMART_RESIZE_ARGS: dict[str, int] = {
+    "factor": 28,
+    "min_pixels": 3136,
+    "max_pixels": 11289600,
+}
 
 DEFAULT_VLLM_ENGINE_ARGS: dict[str, Any] = {
     # Trim CUDA graph capture sizes — vLLM's default is [1..512], but most
@@ -116,6 +126,28 @@ class ModelProfile(BaseModel):
     has_bboxes: bool = False
     has_layout: bool = False
     category_mapping: dict[str, str] = Field(default_factory=dict)
+
+    bbox_coordinate_space: BBoxCoordinateSpace = "original"
+    """Coordinate space the model's layout-output bboxes live in.
+
+    ``original`` (default): bboxes are already in original image pixels —
+    true for ``layout_chat`` (the detector scales back to page size) and for
+    any model that emits native-resolution coords.
+
+    ``smart_resize``: bboxes are in the *resized* image space the model's
+    vision processor produced (Qwen2-VL ``smart_resize``), NOT original
+    pixels. Whole-page VLMs like ``dots.mocr`` / ``dots.ocr`` behave this
+    way. The ``layout_json`` normalizer maps these back to original
+    dimensions; without it, boxes render shrunk toward the top-left on
+    high-resolution pages (the larger the page, the larger the mismatch).
+    """
+    smart_resize_args: dict[str, int] = Field(default_factory=dict)
+    """Overrides for the ``smart_resize`` rescale (``factor`` / ``min_pixels``
+    / ``max_pixels``). Only consulted when
+    ``bbox_coordinate_space == "smart_resize"``. Keys left unset fall back to
+    ``vllm_engine_args.mm_processor_kwargs`` (so capping input resolution via
+    ``mm_processor_kwargs.max_pixels`` keeps the rescale correct) and then to
+    ``DEFAULT_SMART_RESIZE_ARGS``."""
 
     # Prompting
     prompt_templates: dict[str, str] = Field(default_factory=dict)
@@ -213,7 +245,38 @@ class ModelProfile(BaseModel):
                     f"flags. Move provider-specific tuning into backend_args."
                 )
 
+        # smart_resize rescale only happens inside the layout_json normalizer.
+        if self.bbox_coordinate_space == "smart_resize" and (
+            self.output_format != "layout_json"
+        ):
+            raise ValueError(
+                "bbox_coordinate_space='smart_resize' is only meaningful with "
+                f"output_format='layout_json' (got {self.output_format!r}); the "
+                "rescale to original pixels happens in the layout_json normalizer."
+            )
+
         return self
+
+    def effective_smart_resize_args(self) -> dict[str, int]:
+        """Resolve ``factor`` / ``min_pixels`` / ``max_pixels`` for the
+        ``smart_resize`` bbox rescale.
+
+        Precedence: explicit ``smart_resize_args`` → the vision-processor
+        overrides in ``vllm_engine_args.mm_processor_kwargs`` (so capping input
+        resolution via ``max_pixels`` keeps the bbox rescale aligned with what
+        vLLM actually fed the model) → ``DEFAULT_SMART_RESIZE_ARGS``.
+        """
+        resolved = dict(DEFAULT_SMART_RESIZE_ARGS)
+        mm_kwargs = (self.vllm_engine_args or {}).get("mm_processor_kwargs")
+        if isinstance(mm_kwargs, dict):
+            for key in ("min_pixels", "max_pixels"):
+                val = mm_kwargs.get(key)
+                if isinstance(val, int) and val > 0:
+                    resolved[key] = val
+        for key, val in (self.smart_resize_args or {}).items():
+            if isinstance(val, int) and val > 0:
+                resolved[key] = val
+        return resolved
 
 
 def load_profile(path: str | Path) -> ModelProfile:

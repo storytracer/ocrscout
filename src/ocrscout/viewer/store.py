@@ -71,6 +71,10 @@ class ModelRow:
     text: str = ""
     bboxes: list[BBoxItem] = field(default_factory=list)
     items: list[TextItem] = field(default_factory=list)
+    # The (width, height) coordinate space the ``bboxes`` live in — the
+    # DoclingDocument's page size. Used to scale the overlay onto whatever
+    # resolution the displayed source image happens to be.
+    page_size: tuple[float, float] | None = None
     # Per-comparison-name typed result loaded from the parquet's
     # ``comparisons_json`` envelope. Keys are comparison names; values are
     # ``ComparisonResult`` subclass instances.
@@ -236,6 +240,7 @@ class ViewerStore:
             text=raw.get("text") or "",
             bboxes=bboxes,
             items=items,
+            page_size=self._page_size_for(raw),
             comparisons=self._comparisons_for(raw),
         )
 
@@ -339,16 +344,28 @@ class ViewerStore:
         row = self.get(file_id, model)
         if row is None or img is None:
             return img, []
+        # Bboxes are in the DoclingDocument's page-coordinate space. The
+        # displayed image may be a different resolution (a downscaled WebP
+        # derivative, a thumbnail, a re-encoded source), so scale the boxes
+        # to the image's actual pixels. Only PIL images expose dimensions
+        # cheaply; for URL sources we assume parity (the BHL WebP is
+        # published at JP2 dimensions) and skip the scale.
+        sx, sy = 1.0, 1.0
+        if isinstance(img, Image.Image) and row.page_size:
+            pw, ph = row.page_size
+            iw, ih = img.size
+            if pw > 0 and ph > 0 and (iw, ih) != (pw, ph):
+                sx, sy = iw / pw, ih / ph
         annotations: list[tuple[tuple[int, int, int, int], str]] = []
         for item in row.bboxes:
             left, top, right, bottom = item.bbox
             annotations.append(
                 (
                     (
-                        int(round(left)),
-                        int(round(top)),
-                        int(round(right)),
-                        int(round(bottom)),
+                        int(round(left * sx)),
+                        int(round(top * sy)),
+                        int(round(right * sx)),
+                        int(round(bottom * sy)),
                     ),
                     item.label,
                 )
@@ -580,6 +597,28 @@ class ViewerStore:
             TextItem(label=label, text=text, item_idx=idx, html=html)
             for _item, idx, label, text, html in self._iter_doc_items(row)
         ]
+
+    def _page_size_for(self, row: dict[str, Any]) -> tuple[float, float] | None:
+        """The DoclingDocument's first-page ``(width, height)`` — the
+        coordinate space its provenance bboxes live in. ``None`` when the
+        doc is missing/unparseable or carries no page size."""
+        doc_json = row.get("document_json")
+        if not doc_json:
+            return None
+        try:
+            from docling_core.types.doc import DoclingDocument
+
+            doc = DoclingDocument.model_validate_json(doc_json)
+        except Exception:  # noqa: BLE001
+            return None
+        for page in doc.pages.values():
+            size = getattr(page, "size", None)
+            if size is None:
+                continue
+            w, h = getattr(size, "width", 0), getattr(size, "height", 0)
+            if w and h:
+                return float(w), float(h)
+        return None
 
     def _bboxes_for(self, row: dict[str, Any]) -> list[BBoxItem]:
         """Pull ``ProvenanceItem.bbox`` off every text/picture/table item."""

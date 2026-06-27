@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from typing import Any
 
 from docling_core.types.doc import DoclingDocument
@@ -73,9 +74,17 @@ class LayoutJsonNormalizer(Normalizer):
         page_no = 1
         doc.add_page(page_no=page_no, size=Size(width=page.width, height=page.height))
 
+        # Whole-page VLMs (dots.mocr / dots.ocr) emit bboxes in the resized
+        # coordinate space their vision processor produced, not original
+        # pixels. Map them back so the viewer overlay aligns with the
+        # full-resolution source image.
+        scale = _smart_resize_scale(page, profile)
+
         for block in blocks:
             try:
-                self._add_block(doc, block, page_no=page_no, profile=profile)
+                self._add_block(
+                    doc, block, page_no=page_no, profile=profile, scale=scale
+                )
             except Exception as e:  # noqa: BLE001
                 # Per-block resilience: log and continue. The doc is still
                 # returned with all successful items.
@@ -91,6 +100,7 @@ class LayoutJsonNormalizer(Normalizer):
         *,
         page_no: int,
         profile: ModelProfile,
+        scale: tuple[float, float] | None,
     ) -> None:
         if not isinstance(block, dict):
             raise NormalizerError(f"block must be a mapping, got {type(block).__name__}")
@@ -99,7 +109,9 @@ class LayoutJsonNormalizer(Normalizer):
         kind = profile.category_mapping.get(category_raw, str(category_raw).lower())
         text = (block.get("text") or "").strip()
         bbox_raw = block.get("bbox")
-        prov = _build_prov(bbox_raw, page_no=page_no, charspan=(0, len(text)))
+        prov = _build_prov(
+            bbox_raw, page_no=page_no, charspan=(0, len(text)), scale=scale
+        )
 
         if kind == "title":
             doc.add_title(text=text or "", prov=prov)
@@ -110,12 +122,16 @@ class LayoutJsonNormalizer(Normalizer):
             doc.add_heading(text=text or "", level=level, prov=prov)
             return
         if kind == "picture":
-            picture_prov = _build_prov(bbox_raw, page_no=page_no, charspan=(0, 0))
+            picture_prov = _build_prov(
+                bbox_raw, page_no=page_no, charspan=(0, 0), scale=scale
+            )
             doc.add_picture(prov=picture_prov)
             return
         if kind == "table":
             data = parse_table_payload(text)
-            table_prov = _build_prov(bbox_raw, page_no=page_no, charspan=(0, 0))
+            table_prov = _build_prov(
+                bbox_raw, page_no=page_no, charspan=(0, 0), scale=scale
+            )
             doc.add_table(data=data, prov=table_prov)
             return
 
@@ -124,7 +140,11 @@ class LayoutJsonNormalizer(Normalizer):
 
 
 def _build_prov(
-    bbox_raw: Any, *, page_no: int, charspan: tuple[int, int]
+    bbox_raw: Any,
+    *,
+    page_no: int,
+    charspan: tuple[int, int],
+    scale: tuple[float, float] | None = None,
 ) -> ProvenanceItem | None:
     if bbox_raw is None:
         return None
@@ -132,5 +152,64 @@ def _build_prov(
         raise NormalizerError(
             f"bbox must be a 4-tuple [l,t,r,b], got {bbox_raw!r}"
         )
-    bbox = BoundingBox.from_tuple(tuple(float(v) for v in bbox_raw), origin=CoordOrigin.TOPLEFT)
+    left, top, right, bottom = (float(v) for v in bbox_raw)
+    if scale is not None:
+        sx, sy = scale
+        left, top, right, bottom = left * sx, top * sy, right * sx, bottom * sy
+    bbox = BoundingBox.from_tuple(
+        (left, top, right, bottom), origin=CoordOrigin.TOPLEFT
+    )
     return ProvenanceItem(page_no=page_no, bbox=bbox, charspan=charspan)
+
+
+def _smart_resize_scale(
+    page: PageImage, profile: ModelProfile
+) -> tuple[float, float] | None:
+    """Return ``(scale_x, scale_y)`` mapping resized-space bboxes back to
+    original pixels, or ``None`` when no rescale applies.
+
+    The model perceived the page at ``smart_resize(height, width)``; its
+    bboxes live in that space. Multiplying by ``original / resized`` lifts
+    them back to the full-resolution image the viewer displays.
+    """
+    if profile.bbox_coordinate_space != "smart_resize":
+        return None
+    if page.width <= 0 or page.height <= 0:
+        return None
+    args = profile.effective_smart_resize_args()
+    resized_h, resized_w = _smart_resize(
+        page.height,
+        page.width,
+        factor=args["factor"],
+        min_pixels=args["min_pixels"],
+        max_pixels=args["max_pixels"],
+    )
+    if resized_w <= 0 or resized_h <= 0:
+        return None
+    scale = (page.width / resized_w, page.height / resized_h)
+    # Near-identity (page already within the processor's pixel budget): skip
+    # the no-op multiply so coords stay byte-identical to the model output.
+    if abs(scale[0] - 1.0) < 1e-6 and abs(scale[1] - 1.0) < 1e-6:
+        return None
+    return scale
+
+
+def _smart_resize(
+    height: int, width: int, *, factor: int, min_pixels: int, max_pixels: int
+) -> tuple[int, int]:
+    """Qwen2-VL / DotsVLProcessor ``smart_resize`` — rescale to a multiple of
+    ``factor`` while keeping the pixel count within ``[min_pixels,
+    max_pixels]`` and preserving aspect ratio. Mirrors the upstream
+    implementation so our bbox rescale matches what the model saw.
+    """
+    h_bar = max(factor, round(height / factor) * factor)
+    w_bar = max(factor, round(width / factor) * factor)
+    if h_bar * w_bar > max_pixels:
+        beta = math.sqrt((height * width) / max_pixels)
+        h_bar = math.floor(height / beta / factor) * factor
+        w_bar = math.floor(width / beta / factor) * factor
+    elif h_bar * w_bar < min_pixels:
+        beta = math.sqrt(min_pixels / (height * width))
+        h_bar = math.ceil(height * beta / factor) * factor
+        w_bar = math.ceil(width * beta / factor) * factor
+    return h_bar, w_bar

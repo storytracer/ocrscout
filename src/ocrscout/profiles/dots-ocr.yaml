@@ -9,6 +9,11 @@ output_format: layout_json
 normalizer: layout_json
 has_bboxes: true
 has_layout: true
+# dots.ocr emits layout-all/layout-only bboxes in the resized image space its
+# DotsVLProcessor produces (Qwen2-VL smart_resize: factor 28, max_pixels
+# 11289600), NOT original pixels. The layout_json normalizer maps them back
+# so the viewer overlay aligns on high-resolution scans.
+bbox_coordinate_space: smart_resize
 category_mapping:
   Title: title
   Section-header: section_header
