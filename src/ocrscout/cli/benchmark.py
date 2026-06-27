@@ -153,9 +153,9 @@ def benchmark(
         raise typer.Exit(code=1) from e
 
     try:
-        from ocrscout.cli.run import _execute
+        from ocrscout.pipeline.engine import PipelineEngine
 
-        _execute(cfg, parallel_models=1)
+        PipelineEngine().execute_on_proxy(cfg, proxy_url=handle.proxy_url)
     finally:
         try:
             runner.down()

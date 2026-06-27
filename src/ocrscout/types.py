@@ -55,6 +55,10 @@ class PageImage(BaseModel):
     source_uri: str | None = None
     barcode: str | None = None
     sequence: int | None = None
+    # Precomputed layout regions, attached by OcrStage when its input is a
+    # layout-*.parquet. Layout-aware backends use these instead of running a
+    # detector; whole-page backends ignore them. Empty for plain page sources.
+    regions: list[LayoutRegion] = Field(default_factory=list)
     extra: dict[str, Any] = Field(default_factory=dict)
 
     @contextmanager
@@ -357,6 +361,9 @@ class PipelineConfig(BaseModel):
     # the ``precomputed`` detector reading a layout-*.parquet) instead of the
     # one named in their profile YAML. Whole-page profiles ignore it.
     layout: AdapterRef | None = None
+    # Detector to run in the layout stage (name + args). Distinct from
+    # ``layout`` above, which injects precomputed regions into the ocr stage.
+    detector: AdapterRef | None = None
     export: AdapterRef
     reporter: AdapterRef | None = None
     sample: int | None = None

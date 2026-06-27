@@ -104,11 +104,11 @@ def apply(
     )
 
     try:
-        from ocrscout.cli.run import run_pipeline
-        run_pipeline(
+        from ocrscout.pipeline.engine import PipelineEngine
+        PipelineEngine().execute(
             cfg,
-            parallel_models=parallel_models,
             resume=resume,
+            parallel_models=parallel_models,
             batch_concurrency=batch_concurrency,
         )
     except ProfileNotFound as e:
