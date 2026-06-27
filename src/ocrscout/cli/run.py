@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import typer
+import yaml
 from rich import print as rprint
 from rich.table import Table
 
@@ -84,6 +85,12 @@ def run(
     )
     log.info("ocrscout run: %d model(s) [%s] → %s",
              len(model_list), ",".join(model_list), output_dir / "data")
+
+    # Persist the resolved config so the run reproduces via `ocrscout apply`.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "pipeline.yaml").write_text(
+        yaml.safe_dump(cfg.model_dump(mode="json"), sort_keys=False), encoding="utf-8"
+    )
 
     result = PipelineEngine().execute(
         cfg, resume=resume,
