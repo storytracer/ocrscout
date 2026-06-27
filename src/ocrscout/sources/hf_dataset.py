@@ -105,9 +105,16 @@ class HfDatasetSourceAdapter(SourceAdapter, BaseModel):
         # paths as source_uri and avoids materialising the whole prefix).
         if self.streaming is None:
             self.streaming = "://" in self.path
-        # Anonymous S3 access is the default for s3:// sources.
-        if self.storage_options is None and self._scheme(self.path) == "s3":
-            self.storage_options = {"anon": True}
+        # Anonymous S3 access is the default for s3:// sources. Default it
+        # even when storage_options is already a dict (e.g. an empty {} from a
+        # serialized config round-trip) — otherwise s3fs builds a *signed*
+        # client and a public anonymous bucket fails with NoCredentialsError.
+        # An explicit `anon: False` still wins via setdefault.
+        if self._scheme(self.path) == "s3":
+            if self.storage_options is None:
+                self.storage_options = {"anon": True}
+            else:
+                self.storage_options.setdefault("anon", True)
         return self
 
     # --- ABC contract ---
