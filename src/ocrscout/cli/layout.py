@@ -111,7 +111,7 @@ def layout_cmd(
     pages = [p for p in adapter.iter_pages() if p.page_id not in done]
 
     from ocrscout.backends._detector_pool import DetectorPool
-    pool = DetectorPool(prof, log_prefix="[layout]")
+    pool = DetectorPool.from_profile(prof, log_prefix="[layout]")
 
     writer = StageWriter(output_dir, LAYOUT_FEATURES, "layout")
     ok = failed = 0

@@ -646,6 +646,17 @@ def _detect_one_page(
         except (TypeError, ValueError):
             pass
 
+    # Precomputed regions (attached by OcrStage from a layout-*.parquet) skip
+    # detection entirely — the decoupled ``layout`` → ``ocr`` path.
+    precomputed = getattr(page, "regions", None)
+    if precomputed:
+        regions: list[LayoutRegion] = list(precomputed)
+        return _PageState(
+            page=page, page_idx=page_idx, ordered=_sort_reading_order(regions),
+            total_regions=len(regions), remaining=len(regions),
+            t_start=t_start, results=[None] * len(regions),
+        )
+
     try:
         regions = detector.detect(page)
     except Exception as e:  # noqa: BLE001

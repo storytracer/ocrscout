@@ -84,6 +84,19 @@ def _resolve_detector_workers(profile: ModelProfile) -> int:
     return max(1, budget // 2 or 1)
 
 
+def default_detector_workers() -> int:
+    """CPU-autosized worker count, independent of any profile (for the
+    explicit ``LayoutStage`` path)."""
+    budget = max(1, _available_cpus() - _DEFAULT_RESERVED_CPUS)
+    return max(1, budget // 2 or 1)
+
+
+def default_torch_threads(n_workers: int) -> int:
+    """CPU-autosized ``torch.set_num_threads`` budget per worker."""
+    budget = max(1, _available_cpus() - _DEFAULT_RESERVED_CPUS)
+    return max(1, budget // max(1, n_workers))
+
+
 def _resolve_torch_threads_per_op(profile: ModelProfile, n_workers: int) -> int:
     """``torch.set_num_threads(V)`` value. Profile override → env → auto.
 
@@ -185,25 +198,30 @@ class DetectorPool:
     ``(page, regions, detect_seconds, error)`` as each finishes.
     """
 
-    def __init__(self, profile: ModelProfile, *, log_prefix: str | None = None) -> None:
-        if not profile.layout_detector:
-            raise BackendError(
-                f"DetectorPool: profile {profile.name!r} has no layout_detector"
-            )
-        self.profile = profile
-        self.log_prefix = log_prefix or f"[{profile.name}]"
-        self.n_workers = _resolve_detector_workers(profile)
-        self.torch_threads = _resolve_torch_threads_per_op(profile, self.n_workers)
-        detector_cls = registry.get("layout_detectors", profile.layout_detector)
+    def __init__(
+        self,
+        *,
+        detector_name: str,
+        detector_args: dict[str, Any] | None = None,
+        n_workers: int,
+        torch_threads: int,
+        log_prefix: str = "[layout]",
+    ) -> None:
+        if not detector_name:
+            raise BackendError("DetectorPool: no detector_name")
+        self.detector_name = detector_name
+        self.log_prefix = log_prefix
+        self.n_workers = max(1, n_workers)
+        self.torch_threads = max(1, torch_threads)
+        detector_cls = registry.get("layout_detectors", detector_name)
         try:
             self.detectors = [
-                detector_cls(**(profile.layout_detector_args or {}))
-                for _ in range(self.n_workers)
+                detector_cls(**(detector_args or {})) for _ in range(self.n_workers)
             ]
         except Exception as e:  # noqa: BLE001
             raise BackendError(
                 f"DetectorPool: failed to instantiate layout detector "
-                f"{profile.layout_detector!r}: {e}"
+                f"{detector_name!r}: {e}"
             ) from e
         # Serial warm-up before any worker spawns — concurrent first-loads of
         # the same HF model race inside transformers/accelerate.
@@ -215,6 +233,25 @@ class DetectorPool:
                     f"DetectorPool: detector #{i} warm-up failed: {e}"
                 ) from e
 
+    @classmethod
+    def from_profile(
+        cls, profile: ModelProfile, *, log_prefix: str | None = None
+    ) -> DetectorPool:
+        """Build a pool from a layout-aware profile (resolves worker / torch
+        budgets from its backend_args + the CPU autosizer)."""
+        if not profile.layout_detector:
+            raise BackendError(
+                f"DetectorPool: profile {profile.name!r} has no layout_detector"
+            )
+        n_workers = _resolve_detector_workers(profile)
+        return cls(
+            detector_name=profile.layout_detector,
+            detector_args=profile.layout_detector_args,
+            n_workers=n_workers,
+            torch_threads=_resolve_torch_threads_per_op(profile, n_workers),
+            log_prefix=log_prefix or f"[{profile.name}]",
+        )
+
     def map(
         self, pages: list[PageImage]
     ) -> Iterator[tuple[PageImage, list[LayoutRegion], float, str | None]]:
@@ -222,7 +259,7 @@ class DetectorPool:
         total = len(pages)
         log.info(
             "%s detecting %d page(s) (detector=%s, workers=%d, torch threads/op=%d)",
-            self.log_prefix, total, self.profile.layout_detector,
+            self.log_prefix, total, self.detector_name,
             self.n_workers, self.torch_threads,
         )
         if total == 0:
