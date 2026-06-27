@@ -104,6 +104,24 @@ OCRSCOUT_VLLM_URL=http://my-proxy:4000/v1 uv run ocrscout run \
 
 The autoscaler sizes the vLLM KV-cache, region concurrency, and CPU detector pool from the detected GPU at launch, so layout-aware throughput scales across hardware without per-host tuning (e.g. `glm-ocr-layout` on a 240-page BHL sample: **0.50 s/page** on an H100, **2.18** on an L4). Override via `--gpu-budget`, `--batch-concurrency`, `--detector-workers`. Full sizing rules, daemon lifecycle, and Runner internals are in [CLAUDE.md](CLAUDE.md).
 
+## Run the stages independently
+
+`ocrscout run` is the fused path. Under the hood it's four stages — **sample → layout → ocr → normalize** — each reading a parquet and writing a parquet, that you can also run on their own:
+
+```bash
+ocrscout sample    --source ./images/ --sample 20 -o ./out   # → data/pages-*.parquet
+ocrscout layout    --detector pp-doclayout-v3       -o ./out  # → data/layout-*.parquet
+ocrscout ocr       --models glm-ocr-layout          -o ./out  # → data/raw-*.parquet
+ocrscout normalize --reference plain_text           -o ./out  # → data/train-*.parquet
+```
+
+Each artifact is a superset of the previous one, so any stage starts from the one before. That buys you:
+
+- **Re-normalize / re-compare for free** — swap the reference or comparisons and re-run `normalize` over existing OCR output. No GPU, no re-inference.
+- **Split CPU and GPU work** — run `layout` detection on a CPU box, ship `data/layout-*.parquet`, run `ocr` on a GPU box.
+- **Mix and match** — feed any detector's regions to any region-OCR model. `layout` writes the regions; `ocr` consumes them as data, no re-detection.
+- **Resume anywhere** — every stage skips the rows already in its output parquet.
+
 ## Looking at results
 
 - **`ocrscout inspect <out>`** — terminal summary table (with comparison metrics when present), zero extra deps. `--page <id>` dumps every model's output for a page; `--compare A,B [--comparison-type document]` shows a typed comparison (either side can be `reference`); add `--html` to serve a one-shot comparison page over your LAN.
@@ -111,7 +129,7 @@ The autoscaler sizes the vLLM KV-cache, region concurrency, and CPU detector poo
 
 ## Extending
 
-ocrscout discovers plugins via Python entry points — subclass an ABC, set a `name`, register in your own package without touching ocrscout's tree. Extension points: `SourceAdapter` (local/S3/GCS/HF/BHL built in), `ReferenceAdapter` (plain text, BHL OCR), `ModelBackend` (`litellm`, `layout_chat`, `tesseract`), `Runner` (`local`, `skypilot`, `hf`), `LayoutDetector` (PP-DocLayoutV3), `Normalizer`, `ExportAdapter` (parquet), `Comparison` + `ComparisonRenderer` (text / document / layout), `Benchmark`, `Reporter`. Full guide in [CLAUDE.md](CLAUDE.md).
+ocrscout discovers plugins via Python entry points — subclass an ABC, set a `name`, register in your own package without touching ocrscout's tree. Extension points: `SourceAdapter` (local/S3/GCS/HF/BHL built in), `ReferenceAdapter` (plain text, BHL OCR), `ModelBackend` (`litellm`, `layout_chat`, `tesseract`), `Runner` (`local`, `skypilot`, `hf`), `LayoutDetector` (PP-DocLayoutV3), `Normalizer`, `ExportAdapter` (parquet), `Comparison` + `ComparisonRenderer` (text / document / layout), `Benchmark`, `Reporter`. Each pipeline step is a `Stage` (sample / layout / ocr / normalize) over a typed parquet IO layer — add your own to slot a step into the pipeline. Full guide in [CLAUDE.md](CLAUDE.md).
 
 ## Logging
 
