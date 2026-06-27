@@ -28,6 +28,21 @@ class AutoscaleContext(BaseModel):
         return self.decisions.get(name, AutoscaleDecision())
 
     @classmethod
+    def from_backend_overrides(
+        cls, overrides: dict[str, dict[str, int]] | None
+    ) -> AutoscaleContext:
+        """Adapt ``state.yaml``'s ``backend_overrides`` (the submit→worker
+        handoff) into typed decisions."""
+        decisions: dict[str, AutoscaleDecision] = {}
+        for name, rec in (overrides or {}).items():
+            decisions[name] = AutoscaleDecision(
+                kv_cache_memory_bytes=rec.get("kv_cache_memory_bytes") or None,
+                concurrent_requests=rec.get("concurrent_requests") or None,
+                region_concurrency=rec.get("region_concurrency") or None,
+            )
+        return cls(decisions=decisions)
+
+    @classmethod
     def from_handle_extra(cls, extra: dict | None) -> AutoscaleContext:
         """Adapt the existing ``RunnerHandle.extra['autoscale']['profiles']``
         shape into typed decisions (bridge during the rewrite)."""

@@ -68,16 +68,21 @@ class PipelineEngine:
         config: PipelineConfig,
         *,
         resume: bool = False,
+        input_dir: Path | None = None,
+        detector_workers: int | None = None,
         storage_options: dict | None = None,
     ) -> ExecutionContext:
         return ExecutionContext(
             output_dir=config.output_dir,
             store=ParquetStore(config.output_dir),
+            input_dir=input_dir,
             resume=ResumeMode.PAGE_MODEL if resume else ResumeMode.OFF,
             models=tuple(config.models),
             source=config.source,
             reference=config.reference,
             comparison_names=config.comparisons,
+            detector=config.detector,
+            detector_workers=detector_workers,
             layout=config.layout,
             sample=config.sample,
             gpu=state_mod.read_config().gpu,
@@ -91,6 +96,8 @@ class PipelineEngine:
         stages: list[str] | None = None,
         with_layout: bool = False,
         resume: bool = False,
+        input_dir: Path | None = None,
+        detector_workers: int | None = None,
         parallel_models: int = 1,
         gpu_budget: float = 0.85,
         base_port: int = 8000,
@@ -103,7 +110,9 @@ class PipelineEngine:
             self.build_pipeline(stages) if stages is not None
             else fused_run(with_layout=with_layout)
         )
-        ctx = self.build_context(config, resume=resume)
+        ctx = self.build_context(
+            config, resume=resume, input_dir=input_dir, detector_workers=detector_workers,
+        )
 
         if not pipeline.requires_runner:
             return pipeline.execute(ctx)
@@ -116,3 +125,31 @@ class PipelineEngine:
             proxy_port=proxy_port, keep_up=keep_up, batch_concurrency=batch_concurrency,
         )
         return provisioner.run(pipeline, ctx, parallel_models=parallel_models)
+
+    def execute_on_proxy(
+        self,
+        config: PipelineConfig,
+        *,
+        proxy_url: str,
+        autoscale: object | None = None,
+        stages: list[str] | None = None,
+        with_layout: bool = False,
+        resume: bool = False,
+        input_dir: Path | None = None,
+        detector_workers: int | None = None,
+    ) -> PipelineResult:
+        """Run against an already-launched proxy (submit→worker, benchmark).
+
+        No Provisioner launch/teardown — the caller owns the runner lifecycle;
+        the stages run once against the supplied proxy URL.
+        """
+        from ocrscout.pipeline.context import RunnerContext
+
+        pipeline = (
+            self.build_pipeline(stages) if stages is not None
+            else fused_run(with_layout=with_layout)
+        )
+        ctx = self.build_context(
+            config, resume=resume, input_dir=input_dir, detector_workers=detector_workers,
+        ).with_runner(RunnerContext(proxy_url=proxy_url, autoscale=autoscale))
+        return pipeline.execute(ctx)

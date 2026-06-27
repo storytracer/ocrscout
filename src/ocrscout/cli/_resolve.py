@@ -9,10 +9,46 @@ parquet inputs the same way.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
+import typer
+
 from ocrscout.types import AdapterRef
+
+
+def parse_source_args(raw: list[str]) -> dict[str, Any]:
+    """Parse repeated ``--source-arg key=value`` strings into a kwargs dict.
+
+    Values are JSON-parsed when possible (so list/dict/int/bool literals work)
+    and fall back to plain strings otherwise.
+    """
+    parsed: dict[str, Any] = {}
+    for entry in raw:
+        if "=" not in entry:
+            raise typer.BadParameter(f"--source-arg expects 'key=value', got {entry!r}")
+        key, _, value = entry.partition("=")
+        key = key.strip()
+        if not key:
+            raise typer.BadParameter(f"--source-arg has empty key in {entry!r}")
+        try:
+            parsed[key] = json.loads(value)
+        except json.JSONDecodeError:
+            parsed[key] = value
+    return parsed
+
+
+def parse_comparisons_flag(raw: str | None) -> list[str] | None:
+    """Decode ``--comparisons``: ``None`` → default-on; ``"none"`` → opt-out
+    (``[]``); else a comma-separated whitelist."""
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw.lower() == "none":
+        return []
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    return names or None
 
 
 def is_stage_parquet(source: str | None) -> bool:

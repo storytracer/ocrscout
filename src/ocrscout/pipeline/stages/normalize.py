@@ -68,7 +68,7 @@ class NormalizeStage(Stage):
 
         with ctx.store.writer("train") as writer:
             row: RawRow
-            for row in ctx.store.reader("raw"):
+            for row in ctx.input_store().reader("raw"):
                 model = row.model
                 if resume.seen(row.page_id, model):
                     skipped += 1

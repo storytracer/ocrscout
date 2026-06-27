@@ -14,6 +14,8 @@ app = typer.Typer(
 
 # Side-effect imports register the sub-commands on `app`. Order is purely
 # cosmetic — typer surfaces commands in declaration order in --help.
+# Hidden subcommand spawned by LocalRunner.submit; never invoked directly.
+from ocrscout.cli import _worker as _worker  # noqa: E402, F401
 from ocrscout.cli import apply as _apply  # noqa: E402, F401
 from ocrscout.cli import benchmark as _benchmark  # noqa: E402, F401
 from ocrscout.cli import costs as _costs  # noqa: E402, F401
@@ -33,9 +35,6 @@ from ocrscout.cli import source as _source  # noqa: E402, F401
 from ocrscout.cli import status as _status  # noqa: E402, F401
 from ocrscout.cli import submit as _submit  # noqa: E402, F401
 from ocrscout.cli import viewer as _viewer  # noqa: E402, F401
-
-# Hidden subcommand spawned by LocalRunner.submit; never invoked directly.
-from ocrscout.cli import _worker as _worker  # noqa: E402, F401
 
 
 def main() -> None:

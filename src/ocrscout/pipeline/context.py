@@ -32,6 +32,10 @@ class RunnerContext:
 class ExecutionContext:
     output_dir: Path
     store: ParquetStore
+    # Where a stage reads its *input* artifact from, when that differs from the
+    # output dir (e.g. ``ocr --source <pages-dir> -o <out>``). ``None`` → read
+    # and write the same dir (the fused-run / accumulating-dir case).
+    input_dir: Path | None = None
     resume: ResumeMode = ResumeMode.OFF
     models: tuple[str, ...] = ()
     source: AdapterRef | None = None
@@ -49,6 +53,10 @@ class ExecutionContext:
     gpu: GpuConfig | None = None
     storage_options: dict[str, Any] | None = None
     runner: RunnerContext | None = None
+
+    def input_store(self) -> ParquetStore:
+        """The store a stage reads its input artifact from."""
+        return ParquetStore(self.input_dir) if self.input_dir is not None else self.store
 
     def with_runner(
         self, runner: RunnerContext, *, models: tuple[str, ...] | None = None

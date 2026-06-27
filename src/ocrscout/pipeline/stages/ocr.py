@@ -35,7 +35,8 @@ class OcrStage(Stage):
             raise BackendError("OcrStage requires a runner (no proxy in ExecutionContext)")
         # Read precomputed regions when a layout artifact is present (Phase 5
         # attaches them to PageImage.regions); else plain pages.
-        input_prefix = "layout" if ctx.store.has("layout") else "pages"
+        input_store = ctx.input_store()
+        input_prefix = "layout" if input_store.has("layout") else "pages"
         autoscale = ctx.runner.autoscale or AutoscaleContext()
 
         resume = ctx.store.resume(
@@ -57,7 +58,7 @@ class OcrStage(Stage):
                     continue
 
                 pages = []
-                for row in ctx.store.reader(input_prefix):
+                for row in input_store.reader(input_prefix):
                     if resume.seen(row.page_id, model):
                         skipped += 1
                         t.skipped += 1

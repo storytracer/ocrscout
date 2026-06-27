@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from datetime import UTC
 from pathlib import Path
 
 import typer
@@ -59,20 +60,22 @@ def _worker(
 
     # Inherit the active runner's proxy URL so backends can find it.
     state = state_mod.read_state()
-    if state is not None and state.proxy_url:
-        os.environ["OCRSCOUT_VLLM_URL"] = state.proxy_url
+    proxy_url = state.proxy_url if state is not None else None
+    if proxy_url:
+        os.environ["OCRSCOUT_VLLM_URL"] = proxy_url
 
     _write_job_state(job_dir, status="running")
 
-    # Local import avoids a circular dependency at module import time:
-    # cli.__init__ pulls every cli.* subcommand including this one, and
-    # cli.run pulls LocalRunner which transitively pulls this worker.
-    from ocrscout.cli.run import _construct_source, _execute
+    from ocrscout.orchestration.autoscale import AutoscaleContext
+    from ocrscout.pipeline.engine import PipelineEngine
 
-    parallel_models = 1
+    autoscale = AutoscaleContext.from_backend_overrides(
+        state.backend_overrides if state is not None else None
+    )
     try:
-        source = _construct_source(cfg)
-        _execute(cfg, source=source, parallel_models=parallel_models)
+        PipelineEngine().execute_on_proxy(
+            cfg, proxy_url=proxy_url or "", autoscale=autoscale,
+        )
     except SystemExit:
         _write_job_state(job_dir, status="failed")
         raise
@@ -85,12 +88,12 @@ def _worker(
 
 def _write_job_state(job_dir: Path, *, status: str) -> None:
     """Persist the worker's progress to ``<job_dir>/state.yaml``."""
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     job_state_path = job_dir / "state.yaml"
     payload = {
         "status": status,
-        "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     try:
         job_state_path.write_text(

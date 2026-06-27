@@ -47,7 +47,7 @@ class LayoutStage(Stage):
         )
         pages = [
             page
-            for row in ctx.store.reader("pages")
+            for row in ctx.input_store().reader("pages")
             if not resume.seen(row.page_id)
             and (page := row.to_page(ctx.storage_options)) is not None
         ]

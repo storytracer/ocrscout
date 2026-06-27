@@ -9,6 +9,7 @@ chunk's launched proxy.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 
@@ -22,6 +23,31 @@ from ocrscout.pipeline.stage import Stage, StageResult
 log = logging.getLogger(__name__)
 
 _PROXY_ENV = "OCRSCOUT_VLLM_URL"
+_OVERRIDES_ENV = "OCRSCOUT_BACKEND_OVERRIDES"
+
+
+def _publish_overrides(autoscale: AutoscaleContext) -> None:
+    """Bridge: backends still read per-profile concurrency from this env var
+    (``litellm._state_override``). Mirror the autoscaler's typed decisions into
+    it so they fire the right concurrency. Removed when backends take the
+    decision via ``BackendInvocation``."""
+    payload: dict[str, dict[str, int]] = {}
+    for name, d in autoscale.decisions.items():
+        entry = {
+            k: v
+            for k, v in (
+                ("concurrent_requests", d.concurrent_requests),
+                ("region_concurrency", d.region_concurrency),
+                ("kv_cache_memory_bytes", d.kv_cache_memory_bytes),
+            )
+            if v
+        }
+        if entry:
+            payload[name] = entry
+    if payload:
+        os.environ[_OVERRIDES_ENV] = json.dumps(payload)
+    else:
+        os.environ.pop(_OVERRIDES_ENV, None)
 
 
 class Provisioner:
@@ -79,16 +105,16 @@ class Provisioner:
         # the stage itself reads ctx.runner.proxy_url. (Env bridge removed when
         # backends are reworked to take the proxy via BackendInvocation.)
         os.environ[_PROXY_ENV] = handle.proxy_url
+        autoscale = AutoscaleContext.from_handle_extra(handle.extra)
+        _publish_overrides(autoscale)
         rctx = ctx.with_runner(
-            RunnerContext(
-                proxy_url=handle.proxy_url,
-                autoscale=AutoscaleContext.from_handle_extra(handle.extra),
-            ),
+            RunnerContext(proxy_url=handle.proxy_url, autoscale=autoscale),
             models=chunk.models,
         )
         try:
             return stage.execute(rctx)
         finally:
+            os.environ.pop(_OVERRIDES_ENV, None)
             if not self.keep_up:
                 try:
                     self.runner.down()
