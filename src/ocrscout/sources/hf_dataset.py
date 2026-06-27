@@ -463,5 +463,12 @@ def read_path_or_url(
             f"fsspec needed to fetch {path!r}: {e}. "
             "Install the relevant extra (e.g. `pip install ocrscout[cloud]` for S3)."
         ) from e
-    with fsspec.open(path, "rb", **(storage_options or {})) as f:
+    # Anonymous S3 read is the default for s3:// sources (BHL, Common Crawl,
+    # …) so callers that don't pass storage_options — notably the publish
+    # image-bundling path — don't build a *signed* client and fail with
+    # NoCredentialsError against a public bucket. An explicit anon wins.
+    opts = dict(storage_options) if storage_options else {}
+    if path.startswith("s3://"):
+        opts.setdefault("anon", True)
+    with fsspec.open(path, "rb", **opts) as f:
         return f.read()
