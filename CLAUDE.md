@@ -23,15 +23,48 @@ LiteLLM proxy (localhost:4000) ────────────────�
     │  litellm.completion(model=..., metadata={"page_id": …})
     ▼
 LiteLLMBackend → cost.recorder ← litellm.success_callback (in-process)
-                       │
-                       ▼
-            incremental Parquet (data/train-NNNNN.parquet)
-              + progress.json checkpoint
 ```
 
-Every OCR call flows through the LiteLLM proxy. This gives ocrscout a uniform cost-callback hook (`ocrscout.cost`) regardless of whether the model is vLLM-served locally or a hosted API, and the same code path scales from a workstation to a Kubernetes pool to HF-sponsored compute.
+The CLI never drives this stack directly. It builds a `Pipeline` of `Stage`s and
+hands it to the `Provisioner`, which stands up the Runner only for the stage that
+needs one (OCR):
+
+```
+PipelineEngine (cli builds PipelineConfig → engine)
+    ▼
+Provisioner ── launch Runner per model-chunk ──▶ [stack above]
+    │  passes each Stage a typed ExecutionContext (proxy URL, autoscale, store)
+    ▼
+SampleStage ─▶ LayoutStage ─▶ OcrStage ─▶ NormalizeStage     (each parquet-in → parquet-out)
+  data/pages-*   data/layout-*   data/raw-*    data/train-*
+```
+
+See "Staged pipeline architecture" below. Every OCR call flows through the LiteLLM proxy. This gives ocrscout a uniform cost-callback hook (`ocrscout.cost`) regardless of whether the model is vLLM-served locally or a hosted API, and the same code path scales from a workstation to a Kubernetes pool to HF-sponsored compute.
 
 **Loopback-only bind.** Both the LiteLLM proxy and every `vllm serve` child are spawned with `--host 127.0.0.1`. vLLM and LiteLLM both default to `0.0.0.0`, which on a public-IP cloud GPU (Scaleway / Lambda / Vast / any K8s pod with a public ingress) lets anyone in the world submit inference requests for free and pollutes the cost callback with foreign traffic. The flags are hard-coded in [_vllm_serve_cmd / _litellm_proxy_cmd](src/ocrscout/runners/local.py): all ocrscout consumers reach the daemons through `OCRSCOUT_VLLM_URL` (loopback), and SkyPilot / HF workers run a worker-local LocalRunner stack on the worker pod, so the loopback bind is functionally equivalent everywhere we ship.
+
+## Staged pipeline architecture
+
+The pipeline is **four independent stages, each reading a parquet and writing a parquet**, so any stage can start from the previous stage's output. The fused `ocrscout run` is just the composition of all four; the standalone `sample` / `layout` / `ocr` / `normalize` commands run one stage each.
+
+```
+sample    source            → data/pages-*.parquet    (page identity + source_uri, no image bytes)
+layout    pages parquet     → data/layout-*.parquet   (pages cols + detected regions)
+ocr       pages|layout pq   → data/raw-*.parquet      (pages cols + RawOutput + cost columns)
+normalize raw parquet       → data/train-*.parquet    (+ document / markdown / text / comparisons)
+```
+
+Each artifact is a **superset of the previous** (carries page identity + `source_uri`), so it's a self-describing input to the next stage. Images stay **reference-only** — re-fetched/re-decoded on demand from `source_uri` (`io/images.py`).
+
+Three layers, each its own package, imports pointing downward only:
+
+- **`io/`** — the one typed parquet layer. A nested row-model family ([io/rows.py](src/ocrscout/io/rows.py)): `PageRow ⊂ LayoutRow`, `PageRow ⊂ RawRow ⊂ ResultRow`, plus `VolumeRow`; columns are defined once via inheritance and rich fields (`extra`, `regions`, `comparisons`, …) auto-encode to `*_json`. The Arrow schema is **derived** from the row models ([io/schema.py](src/ocrscout/io/schema.py)) — there is no hand-maintained `Features` dict. A generic `ShardWriter`/`ShardReader` ([io/shards.py](src/ocrscout/io/shards.py)), a per-output-dir `ParquetStore` facade ([io/store.py](src/ocrscout/io/store.py)), and a `ResumeTracker` ([io/resume.py](src/ocrscout/io/resume.py)) read straight from the output shards (parquet is the only resume source of truth; `progress.json` is gone). A stage asks the store for an artifact; it never globs parquet or names a schema.
+- **`pipeline/`** — the `Stage` ABC ([pipeline/stage.py](src/ocrscout/pipeline/stage.py)): `execute(ctx) -> StageResult`, `requires_runner` (only `OcrStage` is true). The four stages live in [pipeline/stages/](src/ocrscout/pipeline/stages/). Each stage reads everything it needs off an immutable `ExecutionContext` ([pipeline/context.py](src/ocrscout/pipeline/context.py)) — the proxy URL, the typed autoscale decisions, the store, the resume mode — so stages read **no env vars and no `state.yaml`** in the hot path. `Pipeline` composes stages; `normalize_ops.py` holds the pure `(page, raw) → ResultRow` normalize+compare. The `PipelineEngine` ([pipeline/engine.py](src/ocrscout/pipeline/engine.py)) turns a `PipelineConfig` + flags into a `Pipeline` + context and dispatches; `execute_on_proxy()` runs against an already-up stack (submit→worker, benchmark).
+- **`orchestration/`** — the `Provisioner` ([orchestration/provisioner.py](src/ocrscout/orchestration/provisioner.py)) owns runner launch/teardown and model-major chunking (via `RunnerPlan`, [orchestration/plan.py](src/ocrscout/orchestration/plan.py)), separated from stage execution. It launches the Runner only when the pipeline `requires_runner`, binds each chunk's proxy URL + typed `AutoscaleContext` onto the context, runs the OCR stage, and tears down. Non-runner stages (sample/layout/normalize) never touch it.
+
+**Precomputed-region decoupling.** `ocrscout layout` writes regions to `layout-*.parquet`; when OcrStage's input is a layout parquet, the regions ride on `PageImage.regions` as **data** (attached by `LayoutRow.to_page`). `layout_chat` skips detection when `page.regions` is present; whole-page backends ignore them. There is no profile mutation and no synthetic detector — a detector and a region-OCR VLM compose freely (the VLM just needs `backend: layout_chat`).
+
+This replaced a 1500-line `cli/run.py` god module (`run_pipeline` / `_execute` / `_run_one_model` / `_process_one`) and the two divergent parquet writers; the CLI commands are now thin wrappers that build a `PipelineConfig` and call `PipelineEngine`.
 
 ## How to add a new component
 
@@ -45,7 +78,7 @@ ocrscout is extended through Abstract Base Classes and Python entry points.
    - `Runner` — orchestrates the compute stack (LiteLLM proxy + N vLLM backends) on whatever infrastructure the user picks. Built-ins: `local` (daemonised processes via [src/ocrscout/runners/local.py](src/ocrscout/runners/local.py)), `skypilot` (Kubernetes pool via [src/ocrscout/runners/skypilot.py](src/ocrscout/runners/skypilot.py)), `hf` (HuggingFace Jobs API via [src/ocrscout/runners/hf.py](src/ocrscout/runners/hf.py)). See "Runners" below.
    - `LayoutDetector` — emits typed `LayoutRegion`s (bbox + native category) for a `PageImage`. Consumed by layout-aware backends like `LayoutChatBackend`. Built-in: `pp-doclayout-v3` (uses `transformers` + `torch`, both core deps). See "Layout-aware OCR" below.
    - `Normalizer` — converts a `RawOutput` + `PageImage` into a `DoclingDocument`.
-   - `ExportAdapter` — writes a stream of `ExportRecord` objects to a destination. The built-in `parquet` adapter does incremental shard writes (one file per `batch_size` rows, default 1000); `--resume` is powered by reading the shards' `(page_id, model)` columns directly (see "Incremental Parquet + checkpoint/resume" below).
+   - `ExportAdapter` — writes a stream of `ExportRecord` objects to a destination. The built-in `parquet` adapter ([exports/parquet.py](src/ocrscout/exports/parquet.py)) is now a thin wrapper over `io/` (maps `ExportRecord` → `ResultRow` → the train shard writer), kept for the registry contract and out-of-pipeline use; the pipeline's `NormalizeStage` writes through `io/` directly. To add a *pipeline* stage (a new parquet-in → parquet-out step), subclass `Stage` in [pipeline/stage.py](src/ocrscout/pipeline/stage.py) — see "Staged pipeline architecture" above.
    - `Comparison` — one analytic axis (text / document / layout / future semantic). Takes typed `PredictionView` + `BaselineView`, returns a typed `ComparisonResult` subclass. See "Comparisons subsystem" below.
    - `ComparisonRenderer` — terminal/HTML/Gradio surfaces for one `ComparisonResult` subclass. Same registry pattern as comparisons themselves.
    - `Benchmark` — bundles a source, reference adapter, and a list of comparisons with a canonical summary protocol.
@@ -149,7 +182,7 @@ The ephemeral path writes **nothing** under `~/.ocrscout/state.yaml` or `~/.ocrs
 
 This bifurcation closes a class of bugs where Ctrl-C during a `ocrscout run` left orphaned vLLM children holding GPU memory: with PDEATHSIG, the leaf vllm-serve dies regardless of which intermediate `uv run` wrapper Python recorded as the immediate child.
 
-**Model-major chunked dispatch** (ephemeral only). `run_pipeline()` in [src/ocrscout/cli/run.py](src/ocrscout/cli/run.py) partitions the requested models by `runtime` (`vllm` / `hosted` / `cpu`) and, for the ephemeral path, walks the vLLM list in chunks of `--parallel-models` (default 1): each chunk = one fresh `EphemeralStack` launch + `_execute` over that chunk's models + `runner.down()` before the next chunk. `LocalRunner._launch_ephemeral` guards against re-entry by erroring if `self._ephemeral_stack` is non-None and not closed — defense in depth; the chunk loop always tears down first. Hosted profiles trail in one final proxy-only launch (no vLLM upstreams); CPU profiles run in-process with no proxy at all. `--keep-up` opts out of chunking entirely and uses the original single-launch parallel-spawn path so a follow-up `submit` against the persistent stack pays no relaunch cost. A persistent stack already up at the top of `run_pipeline()` (`state_mod.read_state()` matches `local`) also bypasses chunking — reuse the existing stack via the standard `_matches_existing` model-set check, error cleanly on mismatch.
+**Model-major chunked dispatch** (ephemeral only). The `Provisioner` ([orchestration/provisioner.py](src/ocrscout/orchestration/provisioner.py)) drives this via `RunnerPlan` ([orchestration/plan.py](src/ocrscout/orchestration/plan.py)), which partitions the requested models by `runtime` (`vllm` / `hosted` / `cpu`) and walks the vLLM list in chunks of `--parallel-models` (default 1): each chunk = one fresh `EphemeralStack` launch + the `OcrStage` over that chunk's models + `runner.down()` before the next chunk. `LocalRunner._launch_ephemeral` guards against re-entry by erroring if `self._ephemeral_stack` is non-None and not closed — defense in depth; the chunk loop always tears down first. Hosted profiles trail in one final proxy-only launch (no vLLM upstreams); CPU profiles run in-process with no proxy at all. `--keep-up` opts out of chunking entirely and uses the original single-launch parallel-spawn path so a follow-up `submit` against the persistent stack pays no relaunch cost. The submit→worker and benchmark paths reuse an already-launched stack via `PipelineEngine.execute_on_proxy()` (no Provisioner launch/teardown — the caller owns the runner lifecycle).
 
 **Reuse**: `LocalRunner.launch(models=…)` reads `state.yaml` first. If a persistent stack is already up and matches the requested models + proxy port (and `phase == "ready"`), it returns the existing handle without spawning anything — for both the persistent and ephemeral branches. `ocrscout run` skips its `finally` teardown via `reused_existing` so a `launch` followed by `run` doesn't leave the stack down. A mismatch errors out with a hint to call `ocrscout down`.
 
@@ -169,7 +202,7 @@ The autoscaler's decisions surface in three places:
 - **`<output_dir>/runtime.yaml`** (typed [`RuntimeContext`](src/ocrscout/runtime.py)) — sibling to the existing `pipeline.yaml`; records GPU snapshot, runner flags, and per-profile decisions. Read by [`ocrscout inspect`](src/ocrscout/cli/inspect.py) to render a Run-context header.
 - **Per-row Parquet columns** `kv_cache_memory_bytes`, `concurrent_requests`, `region_concurrency` on every `runtime: vllm` row, so DuckDB / `ocrscout costs` queries can correlate throughput and $/page with concurrency across runs and hardware.
 
-The submit → worker handoff uses two complementary channels: `state.yaml`'s `backend_overrides: dict[str, dict[str, int]]` field for cross-process inheritance (workers re-resolve profiles fresh from YAML so in-memory mutations don't survive), and the in-process `OCRSCOUT_BACKEND_OVERRIDES` env var set by `run_pipeline()` after each ephemeral launch. The backends' `_state_override` helper consults env var first, state.yaml second, then falls back to the module default.
+The submit → worker handoff uses two complementary channels: `state.yaml`'s `backend_overrides: dict[str, dict[str, int]]` field for cross-process inheritance (workers re-resolve profiles fresh from YAML so in-memory mutations don't survive), and the in-process `OCRSCOUT_BACKEND_OVERRIDES` env var, which the `Provisioner` republishes from the typed `AutoscaleContext` after each ephemeral launch (a bridge for the as-yet-unmodified backends, which read the decision from the env / state via `_state_override`; the OCR stage itself reads it typed off `ExecutionContext.runner.autoscale`). The backends' `_state_override` helper consults env var first, state.yaml second, then falls back to the module default.
 
 ### GPU budget preflight
 
@@ -207,7 +240,7 @@ ocrscout's preflight is sizing-blind to image dimensions: it sizes KV/overhead f
 
 LiteLLM is in the request path for every backend call (whether the model is a local vLLM-served VLM or a hosted API). [src/ocrscout/cost.py](src/ocrscout/cost.py) registers an in-process `success_callback` on first use; backends pass `metadata={"page_id": page_id, "model_name": profile.name}` to `litellm.completion(...)` so the callback can correlate each request to its page. `cost.recorder` is a thread-safe per-page accumulator (a page that issues multiple requests — e.g. `layout_chat`'s per-region fan-out — sums into one record).
 
-After a model's `_execute` loop finishes a page, `cli/run.py` calls `cost.recorder.close_page(page_id)` and stamps the result onto the `ExportRecord` along with the active `GpuConfig` (gpu_type / provider / cost_per_hour from `~/.ocrscout/config.yaml` or env vars). The Parquet schema carries these as flat top-level columns (see [src/ocrscout/exports/schema.py](src/ocrscout/exports/schema.py)):
+After a model finishes a page, the `OcrStage` calls `finalize_cost_columns(page_id, …)` ([pipeline/cost.py](src/ocrscout/pipeline/cost.py)) — which closes `cost.recorder` for the page and projects its tokens / dollars / elapsed plus the active `GpuConfig` (gpu_type / provider / cost_per_hour from `~/.ocrscout/config.yaml` or env vars) and the typed autoscale decision into a `CostColumns`. Those columns are written verbatim onto the `raw-*.parquet` row and carried through into `train-*.parquet` by `NormalizeStage` (never recomputed). The columns are derived from the row models ([io/rows.py](src/ocrscout/io/rows.py)):
 
 | Column | Source |
 |---|---|
@@ -221,9 +254,9 @@ After a model's `_execute` loop finishes a page, `cli/run.py` calls `cost.record
 
 ## Incremental Parquet + checkpoint/resume
 
-[src/ocrscout/exports/parquet.py](src/ocrscout/exports/parquet.py) auto-flushes the row buffer every `batch_size` rows (default 1000) to `data/train-NNNNN.parquet`. A sibling `<output>/progress.json` records every flushed `page_id` atomically (tmp + rename) — still written for run-level metadata (source, models, batch index continuity), but **no longer load-bearing for resume**. Partial output is always readable; a crash loses at most one un-flushed batch.
+Every stage writes through `io`'s `ShardWriter` ([io/shards.py](src/ocrscout/io/shards.py)), which auto-flushes the row buffer every `batch_size` rows (default 1000) to `data/<prefix>-NNNNN.parquet` (`pages` / `layout` / `raw` / `train`). Shard numbering continues after any shards already present, so a resumed stage never clobbers prior output. Partial output is always readable; a crash loses at most one un-flushed batch. There is no `progress.json` — the parquet shards are the only resume source of truth.
 
-`--resume` (now exposed on `ocrscout run`, `ocrscout submit`, and `ocrscout apply`) reads the per-model done-set straight from the parquet shards via `done_pairs_from_parquet(output_dir)` — pyarrow with `columns=["page_id", "model"]` so only those two columns hit disk. The result is a `dict[model_name, set[page_id]]` that `_execute` consults per model: a page already done for model A is still attempted for model B if B hadn't processed it yet. The single source of truth is the parquet itself; the resume cursor cannot drift from what's actually on disk, which the older `progress.json`-keyed-by-page-id scheme could under multi-model runs.
+`--resume` (on every stage command + `run` / `apply`) is a `ResumeTracker` ([io/resume.py](src/ocrscout/io/resume.py)) built from the output shards: `ResumeMode.PAGE` keys on `page_id` (sample/layout — one row per page), `ResumeMode.PAGE_MODEL` keys on `(page_id, model)` (ocr/normalize — a page done for model A is still attempted for model B). The cursor cannot drift from what's on disk. Resume tracking is split out of the writer (the old `ParquetExportAdapter` fused the two).
 
 Existing readers (inspect, viewer, publish) already glob `data/train-*.parquet` so they see all shards transparently.
 
@@ -341,7 +374,7 @@ Reference vs prediction agreement is a first-class concept, with three coupled a
 
 **Storage.** Per-page `ExportRecord.comparisons: dict[str, ComparisonResult]` round-trips through the parquet's `comparisons_json` column; canonical metrics also lift into flat top-level columns (`text_similarity`, `text_cer`, `text_wer`, `document_*_delta`, `layout_iou_mean`) for SQL ergonomics. `reference_provenance_json` carries the typed provenance.
 
-**Auto-firing.** When a reference adapter is configured and `--comparisons` is unset, the run loop runs every registered comparison whose `requires` set is satisfied. Pass `--comparisons text,layout` to whitelist or `--comparisons none` to skip. CER/WER (via `jiwer`) and word-level text similarity are both always available — both are core deps.
+**Auto-firing.** When a reference adapter is configured and `--comparisons` is unset, the `NormalizeStage` (via `pipeline/normalize_ops.py`) runs every registered comparison whose `requires` set is satisfied. Pass `--comparisons text,layout` to whitelist or `--comparisons none` to skip. CER/WER (via `jiwer`) and word-level text similarity are both always available — both are core deps.
 
 **Entry-point groups**: `ocrscout.comparisons`, `ocrscout.comparison_renderers`. Built-ins are registered in [src/ocrscout/registry.py](src/ocrscout/registry.py); third-party packages add via these groups without touching ocrscout's source tree.
 
@@ -402,15 +435,17 @@ The project is in rapid-prototyping mode. The previous test suite was deleted (r
 2. **Single + multi-model scouting**: `LiteLLMBackend` over a LiteLLM proxy, layout-aware OCR via `layout_chat`, per-page metrics + comparison subsystem.
 3. **Runner abstraction**: `Runner` ABC; `LocalRunner` with proper daemonisation; `SkyPilotRunner` for K8s pools; `HuggingFaceRunner` for HF Jobs.
 4. **Cost tracking**: in-process LiteLLM `success_callback` → per-page `litellm_cost` / `gpu_time_cost` / tokens / `elapsed_seconds` columns; `ocrscout costs` for DuckDB aggregation.
-5. **Incremental Parquet + checkpoint/resume**: `data/train-NNNNN.parquet` shards are the source of truth; `--resume` reads `(page_id, model)` pairs from the shards via `done_pairs_from_parquet` and filters per-model.
-6. **Flat CLI**: `launch / submit / status / down / logs / run / benchmark / costs / apply` plus the existing `inspect / viewer / introspect / publish`. **Two-level for source admin**: `source <name> <verb>` (`setup`, `refresh`, `info`, `clear`, …) — see "Source admin subsystem".
+5. **Incremental Parquet + checkpoint/resume**: `data/<stage>-NNNNN.parquet` shards are the source of truth; `--resume` is an `io.ResumeTracker` read from the output shards (`PAGE` / `PAGE_MODEL`), filtering per stage.
+6. **Staged pipeline architecture**: sample / layout / ocr / normalize as first-class `Stage`s over a typed `io/` layer, composed by `PipelineEngine` and provisioned by `orchestration.Provisioner` (replaced the `cli/run.py` `run_pipeline` god module).
+7. **Flat CLI**: `run / sample / layout / ocr / normalize / launch / submit / status / down / logs / benchmark / costs / apply` plus the existing `inspect / viewer / introspect / publish`. **Two-level for source admin**: `source <name> <verb>` (`setup`, `refresh`, `info`, `clear`, …) — see "Source admin subsystem".
 
 **Open:**
 
-7. **Reference comparison ecosystem**: ALTO/hOCR adapters; corpus-level improvement/regression aggregation in a Reporter.
-8. **Benchmarks**: MDPBench plugin (source + reference + comparisons + canonical score), an opinionated `ocrscout benchmark` matrix that fans out across cloud GPU pools via `SkyPilotRunner`.
-9. **Additional backends**: Tesseract polishing.
-10. **Ecosystem**: HF Hub publishing of results, VLM-judge evaluator with ELO, more reporters (HTML, terminal, web).
+8. **Reference comparison ecosystem**: ALTO/hOCR adapters; corpus-level improvement/regression aggregation in a Reporter.
+9. **Benchmarks**: MDPBench plugin (source + reference + comparisons + canonical score), an opinionated `ocrscout benchmark` matrix that fans out across cloud GPU pools via `SkyPilotRunner`.
+10. **Additional backends**: Tesseract polishing.
+11. **Ecosystem**: HF Hub publishing of results, VLM-judge evaluator with ELO, more reporters (HTML, terminal, web).
+12. **God-module decomposition** (deferred): split `sources/bhl.py` and `runners/local.py` into sub-packages — re-house verbatim, best done where the S3 / GPU paths can be exercised.
 
 ## What NOT to do
 
